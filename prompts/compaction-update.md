@@ -24,7 +24,7 @@ Use this EXACT format:
 - **[Decision]**: [Rationale]
 
 ## Next Steps
-1. [Next action]
+1. [Ordered next steps]
 
 ## Critical Context
 - [Important existing and new context]

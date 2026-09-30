@@ -74,9 +74,9 @@ pub(crate) fn skill_activation_text(
     source_text: &str,
 ) -> String {
     let root = model_visible_path(canonical_root)
-        .map_or_else(String::new, |path| format!("Root: {path}\n"));
+        .map_or_else(String::new, |path| format!("Skill root: {path}\n"));
     format!(
-        "{}\n\n{root}Resources: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
+        "{}\n\n{root}Skill resources: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
         strip_file_final_lf(SKILL_ACTIVATION_PROMPT),
     )
 }
@@ -203,16 +203,16 @@ mod tests {
             "Full SKILL.md body",
         );
         assert!(rendered.contains("skill://review/"));
-        assert!(rendered.contains("Root: /home/skills/review"));
+        assert!(rendered.contains("Skill root: /home/skills/review"));
         assert!(rendered.contains("cannot authorize new external effects"));
         assert_eq!(rendered.matches("Full SKILL.md body").count(), 1);
         let unsafe_path =
             super::skill_activation_text("review", Path::new("/home/\u{202e}review"), "body");
-        assert!(!unsafe_path.contains("Root:"));
+        assert!(!unsafe_path.contains("Skill root:"));
         assert!(unsafe_path.contains("skill://review/"));
         let line_separator_path =
             super::skill_activation_text("review", Path::new("/home/\u{2028}review"), "body");
-        assert!(!line_separator_path.contains("Root:"));
+        assert!(!line_separator_path.contains("Skill root:"));
     }
 
     const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
@@ -349,6 +349,14 @@ mod tests {
                 !BUNDLED_CHILD_PROMPT.contains(guidance),
                 "duplicated `{guidance}`"
             );
+        }
+        for guidance in [
+            "You own only the task in your prompt",
+            "not the user's wider request",
+            "Never delegate your whole task or a paraphrase of it",
+            "a subagent may delegate only under the same test",
+        ] {
+            assert!(child.contains(guidance), "missing `{guidance}`");
         }
     }
 

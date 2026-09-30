@@ -690,7 +690,7 @@ fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> Str
         " Run project-local, one-shot commands."
     };
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. To keep sibling results when some calls may fail, wrap each call in an `async def` with `try`/`except`. {availability_guidance} The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. To keep sibling results when some calls may fail, wrap each call in an `async def` with `try`/`except`.{availability_guidance} The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
