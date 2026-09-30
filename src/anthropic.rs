@@ -1315,7 +1315,7 @@ mod tests {
             constants::{
                 ACCEPTED_MODEL_CONTENT_LIMIT, PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT,
             },
-            models::{OPUS_5_5, SOL},
+            models::{OPUS_5_5, SOL, SONNET_5_5},
             settings::{CacheTtl, CrossProviderReasoning},
         },
         model::{
@@ -1603,6 +1603,36 @@ mod tests {
             )
             .unwrap();
         history
+    }
+
+    #[test]
+    fn constructs_sonnet_requests_and_summaries_at_every_supported_effort() {
+        let model = AnthropicModel::new(
+            "system prompt",
+            KEY,
+            CacheTtl::FiveMinutes,
+            CrossProviderReasoning::Inline,
+        );
+        for &thinking in SONNET_5_5.thinking_levels {
+            let selection = ModelSelection::new(&SONNET_5_5, thinking).unwrap();
+            let request = model.request(selection, &history("inspect")).unwrap();
+            assert_eq!(request["model"], json!("claude-sonnet-5-5"));
+            assert_eq!(request["max_tokens"], json!(128_000));
+            assert_eq!(request["output_config"]["effort"], json!(thinking));
+            assert_eq!(request["tool_choice"]["type"], json!("auto"));
+            assert_eq!(request["thinking"]["type"], json!("adaptive"));
+            assert_eq!(request["thinking"]["display"], json!("summarized"));
+            assert_eq!(
+                request["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                json!("drop_block")
+            );
+
+            let summary = model.summary_request(&summary_request(selection)).unwrap();
+            assert_eq!(summary["model"], json!("claude-sonnet-5-5"));
+            assert_eq!(summary["output_config"]["effort"], json!(thinking));
+            assert_eq!(summary["thinking"]["type"], json!("adaptive"));
+            assert!(summary.get("tools").is_none());
+        }
     }
 
     fn expected_request(messages: Value) -> Value {

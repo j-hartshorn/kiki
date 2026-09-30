@@ -199,7 +199,10 @@ mod tests {
     use crate::{
         config::{
             DEFAULT_MODEL,
-            models::{ASTRA, CATALOGUE, FABLE_5_1, LUNA, OPUS_5_5, Provider, SOL, TERRA},
+            models::{
+                ASTRA, CATALOGUE, FABLE_5_1, GPT6_1_SOL, LUNA, OPUS_5_5, Provider, SOL, SONNET_5_5,
+                TERRA,
+            },
         },
         model::{AttemptAccounting, ModelUsage},
     };
@@ -320,9 +323,29 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_1_sol_cache_rates_and_long_context_boundary_are_applied_exactly() {
+        for (input, expected_amount) in [(272_000, 1_404_000_000), (272_001, 2_308_004_000)] {
+            let estimate = estimate_usage(&usage_for(
+                GPT6_1_SOL.id,
+                input,
+                100_000,
+                100_000,
+                100_000,
+                0,
+            ))
+            .unwrap();
+            assert_eq!(amount(estimate), expected_amount);
+            assert_eq!(estimate.pricing(), GPT6_1_SOL.pricing.identity);
+        }
+    }
+
+    #[test]
     fn prices_anthropic_1h_cache_writes_at_the_1h_rate_and_the_rest_at_the_5m_rate() {
-        for (model, expected_amount) in [(OPUS_5_5.id, 684_000_000), (FABLE_5_1.id, 1_705_000_000)]
-        {
+        for (model, expected_amount) in [
+            (OPUS_5_5.id, 684_000_000),
+            (SONNET_5_5.id, 344_000_000),
+            (FABLE_5_1.id, 1_705_000_000),
+        ] {
             let usage = ModelUsage {
                 service_tier: Some("standard".to_owned()),
                 cache_write_1h_input_tokens: 10_000,
