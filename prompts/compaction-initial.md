@@ -30,10 +30,10 @@ Use this EXACT format:
 - [Or "(none)" if not applicable]
 
 ## Arena State
-- `<name>` (`<latest known type>`) — <purpose and useful contents>
+- `<name>` (`<type>`) — <purpose and useful contents>
 - Include useful persistent variables, functions, classes, and datasets.
-- Mark uncertain availability or type as unverified.
-- Do not claim this is a complete live-variable inventory.
+- Take names and types from `<arena-inventory>`, the live Arena's top-level bindings, when it is present; describe purpose only from the conversation.
+- Without an inventory, mark uncertain availability or type as unverified.
 - State "(none identified)" if no useful Arena state is evidenced.
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.

@@ -663,13 +663,22 @@ impl<M: Model> Agent<M> {
             return Ok(CompactionResult::NoOp);
         };
 
+        let inventory = self
+            .arena
+            .current_bindings(cancellation)
+            .await
+            .filter(|bindings| !bindings.is_empty())
+            .map(|bindings| render_arena_inventory(&bindings));
         let mut attempts = Vec::new();
         let mut outputs = Vec::new();
         let mut failure = None;
         let mut provider_started = false;
-        for request in preparation.requests().iter().cloned() {
+        for mut request in preparation.requests().iter().cloned() {
             if cancellation.is_cancelled() {
                 break;
+            }
+            if let Some(inventory) = &inventory {
+                request.input.insert_str(0, inventory);
             }
             let mut attempt_started = || {
                 if !provider_started {
@@ -1629,6 +1638,22 @@ fn execution_feedback(execution: &Execution) -> String {
     frames.join("\n")
 }
 
+fn render_arena_inventory(bindings: &[ArenaBinding]) -> String {
+    let mut rendered = "<arena-inventory>\n".to_owned();
+    for binding in bindings.iter().take(INVENTORIED_BINDINGS) {
+        rendered.push_str(&format!("- `{}` (`{}`)\n", binding.name, binding.type_name));
+    }
+    if bindings.len() > INVENTORIED_BINDINGS {
+        rendered.push_str(&format!(
+            "- ({} more)\n",
+            bindings.len() - INVENTORIED_BINDINGS
+        ));
+    }
+    rendered.push_str("</arena-inventory>\n\n");
+    rendered
+}
+
+const INVENTORIED_BINDINGS: usize = 200;
 const LISTED_BINDINGS: usize = 50;
 
 fn render_changed_bindings(bindings: &[ArenaBinding]) -> String {
@@ -2243,6 +2268,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_requests_lead_with_the_live_arena_inventory() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(Vec::new()).with_summary_responses(vec![
+                "first summary".to_owned(),
+                "second summary".to_owned(),
+            ]),
+        )
+        .await;
+        agent
+            .arena
+            .execute("rows = [1]\ntotal = 1", &CancellationToken::new())
+            .await
+            .expect("seed arena state");
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let policy = CompactionSettings::new(16_384, 20_000);
+        let prepared = writer
+            .prepare_compaction(
+                policy,
+                selection,
+                CrossProviderReasoning::Inline,
+                String::new(),
+                crate::session::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("compaction should remove a prefix")
+            .requests()
+            .to_vec();
+
+        agent
+            .compact(
+                CompactionReason::Manual,
+                policy,
+                selection,
+                CrossProviderReasoning::Inline,
+                String::new(),
+                &CancellationToken::new(),
+                &writer,
+                &mut || {},
+            )
+            .await
+            .expect("settle compaction");
+
+        let sent = agent.model.summary_requests();
+        assert_eq!(sent.len(), prepared.len());
+        for (sent, prepared) in sent.iter().zip(&prepared) {
+            assert_eq!(
+                sent.input,
+                format!(
+                    "<arena-inventory>\n- `rows` (`list`)\n- `total` (`int`)\n</arena-inventory>\n\n{}",
+                    prepared.input
+                )
+            );
+        }
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
     async fn manual_compaction_uses_the_prepared_summary_calls_and_commits_once() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -2701,7 +2794,9 @@ mod tests {
         assert_eq!(
             code.result(),
             &CodeResult::Execution {
-                feedback: String::new(),
+                feedback:
+                    "<kiki_arena_bindings changed=\"1\">\npayload: str\n</kiki_arena_bindings>"
+                        .to_owned(),
             }
         );
         assert!(
@@ -4626,7 +4721,9 @@ mod tests {
         assert_eq!(
             feedback,
             &CodeResult::Execution {
-                feedback: String::new()
+                feedback:
+                    "<kiki_arena_bindings changed=\"1\">\nresult: dict\n</kiki_arena_bindings>"
+                        .to_owned()
             }
         );
     }

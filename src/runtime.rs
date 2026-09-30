@@ -16417,7 +16417,11 @@ mod tests {
                 "<kiki_result truncated=\"false\" total_lines=\"1\" total_bytes=\"9\">\n",
                 "<kiki_output_head lines=\"1\" bytes=\"9\" ends_mid_line=\"false\">\n",
                 "'missing'</kiki_output_head>\n",
-                "</kiki_result>"
+                "</kiki_result>\n",
+                "<kiki_arena_bindings changed=\"6\">\n",
+                "descendant: SubagentTask\nfailed: SubagentTask\nparent: SubagentTask\n",
+                "parent_result: dict\nrecoverable: SubagentTask\nrecoverable_result: dict\n",
+                "</kiki_arena_bindings>"
             )
         );
         let context_debug = format!("{contexts:#?}");

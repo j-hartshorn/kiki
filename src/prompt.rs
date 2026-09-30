@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn compaction_resources_contain_the_required_arena_section() {
-        const ARENA_SECTION: &str = "## Arena State\n- `<name>` (`<latest known type>`) — <purpose and useful contents>\n- Include useful persistent variables, functions, classes, and datasets.\n- Mark uncertain availability or type as unverified.\n- Do not claim this is a complete live-variable inventory.\n- State \"(none identified)\" if no useful Arena state is evidenced.";
+        const ARENA_SECTION: &str = "## Arena State\n- `<name>` (`<type>`) — <purpose and useful contents>\n- Include useful persistent variables, functions, classes, and datasets.\n- Take names and types from `<arena-inventory>`, the live Arena's top-level bindings, when it is present; describe purpose only from the conversation.\n- Without an inventory, mark uncertain availability or type as unverified.\n- State \"(none identified)\" if no useful Arena state is evidenced.";
 
         let resources = [
             (

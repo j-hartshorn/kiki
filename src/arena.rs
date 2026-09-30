@@ -58,9 +58,11 @@ const RESULT_VALUES_ERROR_BYTES: usize = 4 * 1024;
 const RESULT_VALUES_BINDING: &str = "result_values";
 const MAX_TRANSFER_DEPTH: usize = 100;
 const RESULT_REPR_MAX_BYTES: usize = 16 * 1024 * 1024;
-// Private aliases keep the inventory working when model code rebinds `id` or `type`.
-const BINDING_ALIASES: &str = "_kiki_locals, _kiki_type, _kiki_id = locals, type, id";
-const BINDING_INVENTORY: &str = "{name: [_kiki_type(value).__name__, _kiki_id(value)] for name, value in _kiki_locals().items() if not name.startswith('_kiki_')}";
+// Private aliases keep the inventory working when model code rebinds `id` or `type`;
+// the inventory leaves out host-provided bindings.
+const BINDING_ALIASES: &str =
+    "_kiki_locals, _kiki_type, _kiki_id = locals, type, id\n_kiki_host_names = set(_kiki_locals())";
+const BINDING_INVENTORY: &str = "{name: [_kiki_type(value).__name__, _kiki_id(value)] for name, value in _kiki_locals().items() if not name.startswith('_kiki_') and name not in _kiki_host_names}";
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
@@ -1185,6 +1187,43 @@ impl Arena {
 
     pub fn checkpoint(&self) -> Checkpoint {
         self.checkpoint.clone()
+    }
+
+    /// The live top-level bindings, or `None` when they cannot be read now.
+    pub(crate) async fn current_bindings(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Option<Vec<ArenaBinding>> {
+        if self.bindings.is_none() {
+            let read = async {
+                self.restore_current_checkpoint_if_needed().await?;
+                let checkout = self.checkout.as_mut().expect("restored checkout");
+                read_bindings(checkout).await
+            };
+            let read = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                read = read => read.ok(),
+            };
+            match read {
+                Some(bindings) => self.bindings = Some(bindings),
+                None => {
+                    // An interrupted or failed feed leaves the worker untrusted.
+                    self.checkout.take();
+                    return None;
+                }
+            }
+        }
+        let bindings = self.bindings.as_ref().expect("bindings were read");
+        Some(
+            bindings
+                .iter()
+                .map(|(name, (type_name, _))| ArenaBinding {
+                    name: name.clone(),
+                    type_name: type_name.clone(),
+                })
+                .collect(),
+        )
     }
 
     #[cfg(test)]
