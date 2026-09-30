@@ -5,7 +5,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
-    Arena, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
+    Arena, ArenaBinding, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
     InterruptedExecution, Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
 use crate::config::{
@@ -1623,7 +1623,24 @@ fn execution_feedback(execution: &Execution) -> String {
             }
         }
     }
+    if !execution.changed_bindings.is_empty() {
+        frames.push(render_changed_bindings(&execution.changed_bindings));
+    }
     frames.join("\n")
+}
+
+const LISTED_BINDINGS: usize = 50;
+
+fn render_changed_bindings(bindings: &[ArenaBinding]) -> String {
+    let mut rendered = format!("<kiki_arena_bindings changed=\"{}\">\n", bindings.len());
+    for binding in bindings.iter().take(LISTED_BINDINGS) {
+        rendered.push_str(&format!("{}: {}\n", binding.name, binding.type_name));
+    }
+    if bindings.len() > LISTED_BINDINGS {
+        rendered.push_str(&format!("({} more)\n", bindings.len() - LISTED_BINDINGS));
+    }
+    rendered.push_str("</kiki_arena_bindings>");
+    rendered
 }
 
 fn append_output(frames: &mut Vec<String>, stream: &str, observation: &Observation) {
@@ -1713,8 +1730,8 @@ mod tests {
         GenerationEvidenceBuilder, OverflowRecovery, TerminalEvidence,
     };
     use crate::arena::{
-        Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
-        ToolCallSummary, ToolName,
+        Arena, ArenaBinding, ArenaError, Execution, ExecutionOutcome, Observation, PythonError,
+        ToolCall, ToolCallSummary, ToolName,
     };
     use crate::config::settings::CrossProviderReasoning;
     use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection};
@@ -5994,6 +6011,48 @@ mod tests {
     }
 
     #[test]
+    fn agent_lists_changed_arena_bindings_after_the_outcome() {
+        let mut execution = Execution {
+            stdout: super::empty_observation(),
+            stderr: super::empty_observation(),
+            outcome: ExecutionOutcome::PythonError(PythonError {
+                text: "ValueError: late".to_owned(),
+                omitted_bytes: 0,
+            }),
+            tool_calls: Vec::new(),
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
+            changed_bindings: vec![
+                ArenaBinding {
+                    name: "rows".to_owned(),
+                    type_name: "list".to_owned(),
+                },
+                ArenaBinding {
+                    name: "total".to_owned(),
+                    type_name: "int".to_owned(),
+                },
+            ],
+        };
+
+        let feedback = super::execution_feedback(&execution);
+        assert!(feedback.ends_with(
+            "<kiki_arena_bindings changed=\"2\">\nrows: list\ntotal: int\n</kiki_arena_bindings>"
+        ));
+        assert!(feedback.find("ValueError") < feedback.find("<kiki_arena_bindings"));
+
+        execution.changed_bindings = (0..60)
+            .map(|index| ArenaBinding {
+                name: format!("value_{index:02}"),
+                type_name: "int".to_owned(),
+            })
+            .collect();
+        let feedback = super::execution_feedback(&execution);
+        assert!(feedback.contains("<kiki_arena_bindings changed=\"60\">\nvalue_00: int\n"));
+        assert!(feedback.contains("value_49: int\n(10 more)\n</kiki_arena_bindings>"));
+        assert!(!feedback.contains("value_50"));
+    }
+
+    #[test]
     fn agent_frames_stdout_stderr_and_result_in_order_without_escaping_raw_content() {
         let execution = Execution {
             stdout: observation(
@@ -6043,6 +6102,7 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: vec![PathBuf::from("private/effect-sentinel")],
             modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
+            changed_bindings: Vec::new(),
         };
 
         let feedback = super::execution_feedback(&execution);
@@ -6168,6 +6228,7 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
+            changed_bindings: Vec::new(),
         };
 
         assert_eq!(

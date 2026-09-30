@@ -1855,6 +1855,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 read_paths: vec![PathBuf::from("private/effect-sentinel")],
                 modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
+                changed_bindings: Vec::new(),
             }),
         };
         let catalogue = catalogue(
@@ -3427,6 +3428,7 @@ mod tests {
                 tool_calls,
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
+                changed_bindings: Vec::new(),
             }),
         }
     }
@@ -3480,6 +3482,7 @@ mod tests {
                     .collect(),
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
+                changed_bindings: Vec::new(),
             }),
         }
     }

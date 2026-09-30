@@ -1319,6 +1319,8 @@ fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, Code
             .collect::<Result<Vec<_>, _>>()?,
         read_paths: decode_effect_paths(&execution.read_paths)?,
         modified_paths: decode_effect_paths(&execution.modified_paths)?,
+        // Only model feedback reads these, and it is stored as rendered text.
+        changed_bindings: Vec::new(),
     })
 }
 
@@ -2135,6 +2137,7 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
+            changed_bindings: Vec::new(),
         };
 
         for outcome in [
@@ -2356,6 +2359,7 @@ mod tests {
             }],
             read_paths: vec![PathBuf::from("nested/read")],
             modified_paths: vec![PathBuf::from("nested/modified")],
+            changed_bindings: Vec::new(),
         };
         let attempts = vec![
             crate::model::AttemptAccounting::KnownUsageWithUntrackedRetries(
@@ -3079,6 +3083,7 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: vec![PathBuf::from("nested/read")],
             modified_paths: vec![PathBuf::from("nested/modified")],
+            changed_bindings: Vec::new(),
         }
     }
 

@@ -327,6 +327,7 @@ mod tests {
             "Built-in methods generally work only as direct calls",
             "annotate globals you may reassign",
             "never repeat side-effecting calls merely to satisfy a diagnostic",
+            "top-level bindings the execution created or rebound",
         ] {
             assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
         }

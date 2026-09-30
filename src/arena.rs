@@ -58,6 +58,9 @@ const RESULT_VALUES_ERROR_BYTES: usize = 4 * 1024;
 const RESULT_VALUES_BINDING: &str = "result_values";
 const MAX_TRANSFER_DEPTH: usize = 100;
 const RESULT_REPR_MAX_BYTES: usize = 16 * 1024 * 1024;
+// Private aliases keep the inventory working when model code rebinds `id` or `type`.
+const BINDING_ALIASES: &str = "_kiki_locals, _kiki_type, _kiki_id = locals, type, id";
+const BINDING_INVENTORY: &str = "{name: [_kiki_type(value).__name__, _kiki_id(value)] for name, value in _kiki_locals().items() if not name.startswith('_kiki_')}";
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
@@ -152,6 +155,14 @@ pub struct Execution {
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) read_paths: Vec<PathBuf>,
     pub(crate) modified_paths: Vec<PathBuf>,
+    /// Top-level bindings created or rebound, not objects mutated in place.
+    pub(crate) changed_bindings: Vec<ArenaBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArenaBinding {
+    pub(crate) name: String,
+    pub(crate) type_name: String,
 }
 
 impl fmt::Debug for Execution {
@@ -162,6 +173,7 @@ impl fmt::Debug for Execution {
             .field("stderr", &self.stderr)
             .field("outcome", &self.outcome)
             .field("tool_calls", &self.tool_calls)
+            .field("changed_bindings", &self.changed_bindings)
             .finish()
     }
 }
@@ -817,6 +829,7 @@ impl ArenaChildSource {
                 state,
                 authorisations: checkpoint.authorisations.clone(),
             },
+            bindings: None,
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
             model_type_check_disabled: self.model_type_check_disabled,
@@ -848,6 +861,8 @@ pub struct Arena {
     checkout: Option<Checkout>,
     tool_host: ToolHost,
     checkpoint: Checkpoint,
+    /// The checkpoint's top-level bindings, when already read.
+    bindings: Option<Bindings>,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     model_type_check_disabled: bool,
@@ -954,6 +969,7 @@ impl Arena {
             checkout: Some(checkout),
             tool_host,
             checkpoint,
+            bindings: None,
             runtime,
             repl_config,
             model_type_check_disabled: false,
@@ -1112,6 +1128,7 @@ impl Arena {
             &mut checkout,
             &self.tool_host,
             code,
+            self.bindings.take(),
             skip_type_check,
             context.as_ref(),
             max_memory,
@@ -1125,7 +1142,12 @@ impl Arena {
         .await;
 
         match attempt {
-            Ok((outcome, state)) => {
+            Ok(ExecutedCheckout {
+                outcome,
+                state,
+                changed_bindings,
+                bindings,
+            }) => {
                 let skill_activations = if matches!(&outcome, ExecutionOutcome::Complete { .. }) {
                     skill_ledger.into_captured()
                 } else {
@@ -1137,6 +1159,7 @@ impl Arena {
                     state,
                     authorisations,
                 };
+                self.bindings = Some(bindings);
                 let (tool_calls, read_paths, modified_paths) = interruption.tools.into_parts();
                 Ok((
                     Execution {
@@ -1146,6 +1169,7 @@ impl Arena {
                         tool_calls,
                         read_paths,
                         modified_paths,
+                        changed_bindings,
                     },
                     skill_activations,
                 ))
@@ -1236,6 +1260,7 @@ impl Arena {
         let checkout = self.checkout_from_checkpoint(&checkpoint).await?;
         self.checkout = Some(checkout);
         self.checkpoint = checkpoint;
+        self.bindings = None;
         Ok(())
     }
 
@@ -1603,7 +1628,7 @@ fn pool_failure(error: PoolError) -> ArenaError {
 }
 
 async fn bootstrap(checkout: &mut Checkout) -> Result<(), ArenaError> {
-    let source = bootstrap_source();
+    let source = format!("{}\n{BINDING_ALIASES}", bootstrap_source());
     let mut on_print = on_print_sync(|_, _| {});
     match checkout
         .feed(&source, vec![], vec![], true, &mut on_print)
@@ -1622,6 +1647,7 @@ async fn execute_checkout(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
     code: &str,
+    bindings: Option<Bindings>,
     skip_type_check: bool,
     context: Option<&TrustedExecutionContext>,
     max_memory: Option<usize>,
@@ -1631,7 +1657,11 @@ async fn execute_checkout(
     budget: &mut ChargeableBudget,
     cancellation: &CancellationToken,
     skill_ledger: &mut SkillLoadLedger,
-) -> Result<(ExecutionOutcome, Vec<u8>), AttemptFailure> {
+) -> Result<ExecutedCheckout, AttemptFailure> {
+    let before = match bindings {
+        Some(bindings) => bindings,
+        None => read_bindings_within_budget(checkout, budget, cancellation).await?,
+    };
     let result = drive(
         checkout,
         tool_host,
@@ -1673,6 +1703,11 @@ async fn execute_checkout(
         Err(DriverError::Cancelled) => return Err(AttemptFailure::Cancelled),
         Err(DriverError::TimedOut) => return Err(AttemptFailure::TimedOut),
     };
+    let after = if unsafe_memory || matches!(outcome, ExecutionOutcome::TypeCheckError(_)) {
+        before.clone()
+    } else {
+        read_bindings_within_budget(checkout, budget, cancellation).await?
+    };
     let state = budget
         .wait(cancellation, checkout.dump())
         .await
@@ -1694,7 +1729,85 @@ async fn execute_checkout(
             execution: None,
         }));
     }
-    Ok((outcome, state))
+    Ok(ExecutedCheckout {
+        outcome,
+        state,
+        changed_bindings: changed_bindings(&before, &after),
+        bindings: after,
+    })
+}
+
+struct ExecutedCheckout {
+    outcome: ExecutionOutcome,
+    state: Vec<u8>,
+    changed_bindings: Vec<ArenaBinding>,
+    bindings: Bindings,
+}
+
+/// Each top-level binding's type name and object identity.
+type Bindings = BTreeMap<String, (String, i64)>;
+
+fn changed_bindings(before: &Bindings, after: &Bindings) -> Vec<ArenaBinding> {
+    after
+        .iter()
+        .filter(|(name, binding)| before.get(*name) != Some(*binding))
+        .map(|(name, (type_name, _))| ArenaBinding {
+            name: name.clone(),
+            type_name: type_name.clone(),
+        })
+        .collect()
+}
+
+async fn read_bindings_within_budget(
+    checkout: &mut Checkout,
+    budget: &mut ChargeableBudget,
+    cancellation: &CancellationToken,
+) -> Result<Bindings, AttemptFailure> {
+    budget
+        .wait(cancellation, read_bindings(checkout))
+        .await
+        .map_err(AttemptFailure::from)?
+        .map_err(AttemptFailure::Driver)
+}
+
+async fn read_bindings(checkout: &mut Checkout) -> Result<Bindings, ArenaError> {
+    let failed = |detail: String| ArenaError::Infrastructure {
+        message: format!("Arena binding inventory failed: {detail}"),
+        execution: None,
+    };
+    let mut on_print = on_print_sync(|_, _| {});
+    let value = match checkout
+        .feed(BINDING_INVENTORY, vec![], vec![], true, &mut on_print)
+        .await
+    {
+        Ok(TurnEvent::Complete(value)) => value,
+        Ok(event) => return Err(failed(format!("unexpected suspension {event:?}"))),
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    let Transfer::Dict(entries) = Transfer::of(value.as_ref()) else {
+        return Err(failed("not a dictionary".to_owned()));
+    };
+    entries
+        .into_iter()
+        .map(|(name, entry)| {
+            let binding = match Transfer::of(entry) {
+                Transfer::List(entry) => match entry.as_slice() {
+                    [type_name, id] => match (Transfer::of(*type_name), Transfer::of(*id)) {
+                        (Transfer::String(type_name), Transfer::Int(id)) => {
+                            Some((type_name.to_owned(), id))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            match (name.as_str(), binding) {
+                (Some(name), Some(binding)) => Ok((name.to_owned(), binding)),
+                _ => Err(failed("malformed entry".to_owned())),
+            }
+        })
+        .collect()
 }
 
 fn is_unsafe_memory_error(error: &MontyException, max_memory: Option<usize>) -> bool {
@@ -7400,6 +7513,72 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn bindings(execution: &Execution) -> Vec<(&str, &str)> {
+        execution
+            .changed_bindings
+            .iter()
+            .map(|binding| (binding.name.as_str(), binding.type_name.as_str()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn executions_report_the_top_level_bindings_they_create_or_rebind() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let created = execute_checked(&mut arena, "a = 1\nb = [1]").await.unwrap();
+        assert_eq!(bindings(&created), [("a", "int"), ("b", "list")]);
+
+        let rebound = execute_checked(
+            &mut arena,
+            "b.append(2)\na: int = 2\nc = await read('file')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(bindings(&rebound), [("a", "int"), ("c", "str")]);
+
+        let definitions = execute_checked(&mut arena, "import json\ndef f() -> None:\n    pass")
+            .await
+            .unwrap();
+        assert_eq!(
+            bindings(&definitions),
+            [("f", "function"), ("json", "module")]
+        );
+
+        let raised = execute_checked(&mut arena, "d = 1\nraise ValueError('late')")
+            .await
+            .unwrap();
+        assert!(matches!(raised.outcome, ExecutionOutcome::PythonError(_)));
+        assert_eq!(bindings(&raised), [("d", "int")]);
+
+        let rejected = execute_checked(&mut arena, "e: int = 'text'")
+            .await
+            .unwrap();
+        assert!(matches!(
+            rejected.outcome,
+            ExecutionOutcome::TypeCheckError(_)
+        ));
+        assert!(rejected.changed_bindings.is_empty());
+
+        let unchanged = execute_checked(&mut arena, "a + 1").await.unwrap();
+        assert!(unchanged.changed_bindings.is_empty());
+
+        let shadowed = execute_checked(&mut arena, "id = 'task'\ntype = 'kind'\nlocals = None")
+            .await
+            .unwrap();
+        assert_eq!(
+            bindings(&shadowed),
+            [("id", "str"), ("locals", "NoneType"), ("type", "str")]
+        );
+
+        let checkpoint = arena.checkpoint();
+        execute_checked(&mut arena, "g = 1").await.unwrap();
+        arena.restore(checkpoint).await.unwrap();
+        let after_restore = execute_checked(&mut arena, "g = 2").await.unwrap();
+        assert_eq!(bindings(&after_restore), [("g", "int")]);
     }
 
     #[tokio::test]
