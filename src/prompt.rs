@@ -316,6 +316,8 @@ mod tests {
             "f-strings",
             "`format()`, `str.format()` and `%` formatting",
             "Importable modules (complete list): `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing`, `unicodedata`",
+            "`asyncio` has only `run`/`gather`/`sleep`",
+            "Sleeps pause the whole execution and use its chargeable time",
             "`functools` only `reduce`/`partial`",
             "`json` has `loads`/`dumps`/`JSONDecodeError`",
             "No ambient file, network or process access",

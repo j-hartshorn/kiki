@@ -11,8 +11,8 @@ use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
 use monty_types::{
-    ExcType, MontyException, MontyObject, ObjectRef, PrintStream, ResourceLimits,
-    TypeCheckingConfig, TypeCheckingFormat,
+    ExcType, MontyException, MontyObject, ObjectRef, OsPolicy, PrintStream, ResourceLimits,
+    SleepMode, TypeCheckingConfig, TypeCheckingFormat,
     unstable::{self, MontyNode},
 };
 use thiserror::Error;
@@ -947,6 +947,11 @@ impl Arena {
                 max_suspensions: usize::MAX,
                 ..ResourceLimits::default()
             }),
+            // Monty caps each sleep; let the execution deadline bound it instead.
+            os_policy: OsPolicy {
+                sleep: SleepMode::System(execution_timeout),
+                ..OsPolicy::default()
+            },
             type_check: true,
             type_check_stubs: Some(type_check_stubs()),
             type_check_config: TypeCheckingConfig {
@@ -2048,6 +2053,24 @@ async fn drive(
                         None
                     };
                     turn!('drive, on_print => checkout.resume_name_lookup(value, &mut on_print))
+                }
+                TurnEvent::OsCall {
+                    system_sleep: Some(delay),
+                    ..
+                } => {
+                    // Answering inline pauses the whole execution, so gathered sleeps do not overlap.
+                    match budget.wait(cancellation, tokio::time::sleep(delay)).await {
+                        Ok(()) => turn!('drive, on_print => checkout.resume(
+                            ResumeValue::Return(MontyObject::none()),
+                            &mut on_print,
+                        )),
+                        Err(BudgetInterruption::Cancelled) => {
+                            break 'drive Err(DriverError::Cancelled);
+                        }
+                        Err(BudgetInterruption::TimedOut) => {
+                            break 'drive Err(DriverError::TimedOut);
+                        }
+                    }
                 }
                 TurnEvent::OsCall { .. } => {
                     turn!('drive, on_print => checkout.resume(ResumeValue::NotHandled, &mut on_print))
@@ -7618,6 +7641,54 @@ mod tests {
         arena.restore(checkpoint).await.unwrap();
         let after_restore = execute_checked(&mut arena, "g = 2").await.unwrap();
         assert_eq!(bindings(&after_restore), [("g", "int")]);
+    }
+
+    #[tokio::test]
+    async fn sleeps_wait_for_their_full_delay() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let started = Instant::now();
+
+        let execution = execute_checked(
+            &mut arena,
+            "import asyncio\nimport time\ntime.sleep(0.05)\nawait asyncio.gather(asyncio.sleep(0.02), asyncio.sleep(0.03))\nawait asyncio.sleep(0.05, 'woken')",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "'woken'");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn sleeps_are_charged_to_the_execution_deadline_and_cancellable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut limited = arena_with_limits(&workspace, Duration::from_millis(200), None).await;
+        let started = Instant::now();
+        let timed_out =
+            execute_without_cancellation(&mut limited, "import time\ntime.sleep(30)").await;
+        assert!(
+            matches!(timed_out, Err(ArenaError::TimedOut { .. })),
+            "{timed_out:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let mut arena = arena(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let cancelled = arena
+            .execute("import asyncio\nawait asyncio.sleep(30)", &cancellation)
+            .await;
+        assert!(
+            matches!(cancelled, Err(ArenaError::Cancelled { .. })),
+            "{cancelled:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
