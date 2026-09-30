@@ -927,6 +927,9 @@ impl Arena {
         let repl_config = ReplConfig {
             limits: Some(ResourceLimits {
                 max_memory,
+                // Monty counts host round trips per checkout, not per execution;
+                // Kiki's execution deadline already bounds host-call loops.
+                max_suspensions: usize::MAX,
                 ..ResourceLimits::default()
             }),
             type_check: true,
@@ -4410,6 +4413,24 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ArenaError::WorkerPathNotAbsolute));
+    }
+
+    #[tokio::test]
+    async fn one_arena_services_more_than_a_thousand_host_calls_across_executions() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        for _ in 0..3 {
+            let execution = execute_without_cancellation(
+                &mut arena,
+                "reads: int = 0\nfor _ in range(400):\n    reads += len(await read('file'))\nreads",
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(complete(&execution).unwrap().head, "3200");
+        }
     }
 
     #[tokio::test]
