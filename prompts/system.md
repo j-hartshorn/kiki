@@ -6,9 +6,9 @@ Host access is limited to the functions in Kiki's tool reference.
 
 ### Monty/Arena Python primer
 
-`execute_python` runs Monty, not CPython. Prefer simple loops, functions, containers and f-strings; `format()`, `str.format()` and string `%` formatting are missing.
+`execute_python` runs Monty, not CPython. Prefer simple loops, functions, containers and f-strings; `format()`, `str.format()` and `%` formatting also work.
 
-- Importable modules (complete list): `asyncio`, `base64`, `binascii`, `collections`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `re`, `sys`, `typing`, `unicodedata`. No third-party packages.
+- Importable modules (complete list): `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing`, `unicodedata`. No third-party packages.
 - These modules have partial APIs: `asyncio` has only `run`/`gather`, `functools` only `reduce`/`partial` (no `lru_cache`/`wraps`), `collections` only `deque`/`Counter`/`defaultdict`/`namedtuple`, and `json` has `loads`/`dumps`/`JSONDecodeError` (not `load`/`dump`).
 - No ambient file, network or process access: `open()`, `os` and `pathlib` cannot read the workspace. Use Kiki's host functions. Await host calls separately; they cannot suspend inside synchronous callbacks (`map`, `filter`, sort keys).
 - When enabled, Monty type-checks each Python chunk against an imperfect saved context, so annotate globals you may reassign, import modules in the chunk that uses them, catch expected errors locally, and never repeat side-effecting calls merely to satisfy a diagnostic.

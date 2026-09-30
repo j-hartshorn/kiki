@@ -922,7 +922,7 @@ impl Arena {
     ) -> Result<Self, ArenaError> {
         let worker_identity = validate_worker(&worker_path).await?;
         // Monty dumps retain type checking and its host stubs.
-        let runtime = RuntimeIdentity(format!("{}+type-check-v2", worker_identity.0));
+        let runtime = RuntimeIdentity(format!("{}+type-check-v3", worker_identity.0));
         let pool = Self::open_pool(worker_path.clone()).await?;
         let repl_config = ReplConfig {
             limits: Some(ResourceLimits {
@@ -3421,10 +3421,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            rejected.outcome,
-            ExecutionOutcome::TypeCheckError(_)
-        ));
+        assert!(
+            matches!(rejected.outcome, ExecutionOutcome::TypeCheckError(_)),
+            "{rejected:?}"
+        );
         assert!(!workspace.path().join("rejected.txt").exists());
 
         arena.disable_model_type_check();
@@ -4424,7 +4424,7 @@ mod tests {
         for _ in 0..3 {
             let execution = execute_without_cancellation(
                 &mut arena,
-                "reads: int = 0\nfor _ in range(400):\n    reads += len(await read('file'))\nreads",
+                "reads = 0\nfor _ in range(400):\n    reads += len(await read('file'))\nreads",
             )
             .await
             .unwrap();
@@ -6886,6 +6886,23 @@ mod tests {
 
             assert_eq!(complete(&execution).unwrap().head, "'TypeError'");
         }
+    }
+
+    #[tokio::test]
+    async fn type_checked_code_can_call_the_format_builtin() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let formatted = execute_checked(&mut arena, "format(3.14159, '.2f')")
+            .await
+            .unwrap();
+        assert_eq!(complete(&formatted).unwrap().head, "'3.14'");
+
+        let rejected = execute_checked(&mut arena, "format(1, 2)").await.unwrap();
+        assert!(
+            matches!(rejected.outcome, ExecutionOutcome::TypeCheckError(_)),
+            "{rejected:?}"
+        );
     }
 
     #[tokio::test]
