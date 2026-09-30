@@ -638,7 +638,7 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::Grep,
         parameters: GREP_PARAMETERS,
         result: ToolResultShape::RecordList(&GREP_MATCH),
-        description: "Search workspace file contents with a regular expression.",
+        description: "Regex-search workspace file contents.",
     },
     ToolDefinition {
         name: ToolName::Run,
@@ -690,7 +690,7 @@ fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> Str
         " Run project-local, one-shot commands."
     };
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. To keep sibling results when some calls may fail, wrap each call in an `async def` with `try`/`except`. Keep large files and intermediate data in Python variables.{availability_guidance} Keep model-visible output focused. The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. To keep sibling results when some calls may fail, wrap each call in an `async def` with `try`/`except`. {availability_guidance} The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
@@ -795,7 +795,7 @@ fn invocation_source(reference: bool) -> String {
         "    return SubagentTask(await _kiki_get_subagent(id))"
     };
     format!(
-        "@dataclass\nclass SubagentStatus:\n{}\n\nclass SubagentTask:\n{}{}\n\n    async def refresh(self) -> SubagentStatus:\n{refresh}\n\n    async def wait(self) -> dict:\n{wait}\n\n    async def cancel(self) -> SubagentStatus:\n{cancel}\n\nasync def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n    \"\"\"Start a subagent and return its task handle.\"\"\"\n{start}\n\nasync def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n    \"\"\"Start a subagent and wait for its result.\"\"\"\n{run}\n\nasync def get_subagent(id: str) -> SubagentTask:\n    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n{get}",
+        "@dataclass\nclass SubagentStatus:\n{}\n\nclass SubagentTask:\n{}{}\n\n    async def refresh(self) -> SubagentStatus:\n{refresh}\n\n    async def wait(self) -> dict:\n{wait}\n\n    async def cancel(self) -> SubagentStatus:\n{cancel}\n\nasync def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n{start}\n\nasync def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n    \"\"\"Start a subagent and wait for its result.\"\"\"\n{run}\n\nasync def get_subagent(id: str) -> SubagentTask:\n    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n{get}",
         interface_fields_source(SUBAGENT_STATUS_FIELDS),
         interface_fields_source(SUBAGENT_TASK_FIELDS),
         constructor.unwrap_or_default(),
@@ -7776,7 +7776,6 @@ mod tests {
             "    async def cancel(self) -> SubagentStatus:\n",
             "        ...\n\n",
             "async def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n",
-            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n",
             "    ...\n\n",
             "async def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n",
             "    \"\"\"Start a subagent and wait for its result.\"\"\"\n",
@@ -7798,8 +7797,8 @@ mod tests {
             "    async def cancel(self) -> SubagentStatus:\n        self.status = SubagentStatus(**await _kiki_cancel_subagent(self.id))\n        return self.status",
         )
         .replace(
-            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n    ...",
-            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n    return SubagentTask(await _kiki_start_subagent(prompt, model, read_only))",
+            "read_only: bool = False) -> SubagentTask:\n    ...",
+            "read_only: bool = False) -> SubagentTask:\n    return SubagentTask(await _kiki_start_subagent(prompt, model, read_only))",
         )
         .replace(
             "    \"\"\"Start a subagent and wait for its result.\"\"\"\n    ...",
@@ -7872,7 +7871,7 @@ mod tests {
                     "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
                     "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]\n\n",
                     "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:\n",
-                    "    \"\"\"Search workspace file contents with a regular expression.\"\"\"\n",
+                    "    \"\"\"Regex-search workspace file contents.\"\"\"\n",
                     "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]\n\n",
                     "async def run(command: str, cwd: str = \".\") -> CommandResult:\n",
                     "    \"\"\"Run one project-local shell command.\"\"\"\n",

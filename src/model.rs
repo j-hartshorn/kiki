@@ -456,7 +456,7 @@ pub(crate) enum ForeignPart<'a> {
 
 pub(crate) fn canonical_compaction_summary(summary: &str) -> String {
     format!(
-        "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\n{summary}\n</summary>"
+        "Earlier history is summarised below. Arena variables, functions, classes and data survive compaction unchanged. Treat unverified Arena details as historical evidence; inspect them before relying on them.\n\n<summary>\n{summary}\n</summary>"
     )
 }
 
@@ -1149,7 +1149,7 @@ mod tests {
         assert_eq!(summary.compaction_summary(), Some("saved summary"));
         assert_eq!(
             canonical_compaction_summary(summary.compaction_summary().unwrap()),
-            "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\nsaved summary\n</summary>"
+            "Earlier history is summarised below. Arena variables, functions, classes and data survive compaction unchanged. Treat unverified Arena details as historical evidence; inspect them before relying on them.\n\n<summary>\nsaved summary\n</summary>"
         );
         assert_eq!(history.user_request_count(), 1);
         let call_id = ModelCallId::new("call");

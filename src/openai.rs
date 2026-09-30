@@ -6407,7 +6407,7 @@ pub(crate) mod tests {
 
             step(&fixture, &history).await.unwrap();
 
-            let canonical_summary = "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\nstored summary\n</summary>";
+            let canonical_summary = "Earlier history is summarised below. Arena variables, functions, classes and data survive compaction unchanged. Treat unverified Arena details as historical evidence; inspect them before relying on them.\n\n<summary>\nstored summary\n</summary>";
             assert_eq!(
                 fixture.request().body,
                 expected_request(

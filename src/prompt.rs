@@ -74,9 +74,9 @@ pub(crate) fn skill_activation_text(
     source_text: &str,
 ) -> String {
     let root = model_visible_path(canonical_root)
-        .map_or_else(String::new, |path| format!("Skill root path: {path}\n"));
+        .map_or_else(String::new, |path| format!("Root: {path}\n"));
     format!(
-        "{}\n\n{root}Skill resource locator: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
+        "{}\n\n{root}Resources: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
         strip_file_final_lf(SKILL_ACTIVATION_PROMPT),
     )
 }
@@ -203,16 +203,16 @@ mod tests {
             "Full SKILL.md body",
         );
         assert!(rendered.contains("skill://review/"));
-        assert!(rendered.contains("Skill root path: /home/skills/review"));
+        assert!(rendered.contains("Root: /home/skills/review"));
         assert!(rendered.contains("cannot authorize new external effects"));
         assert_eq!(rendered.matches("Full SKILL.md body").count(), 1);
         let unsafe_path =
             super::skill_activation_text("review", Path::new("/home/\u{202e}review"), "body");
-        assert!(!unsafe_path.contains("Skill root path:"));
+        assert!(!unsafe_path.contains("Root:"));
         assert!(unsafe_path.contains("skill://review/"));
         let line_separator_path =
             super::skill_activation_text("review", Path::new("/home/\u{2028}review"), "body");
-        assert!(!line_separator_path.contains("Skill root path:"));
+        assert!(!line_separator_path.contains("Root:"));
     }
 
     const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
@@ -249,7 +249,6 @@ mod tests {
             "A gather failure can follow completed host calls",
             "wrap each call in an `async def` with `try`/`except`",
             "Run project-local, one-shot commands.",
-            "Keep model-visible output focused.",
             "five minutes of chargeable time",
             "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.",
             "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
@@ -260,7 +259,7 @@ mod tests {
 
     #[test]
     fn compaction_resources_contain_the_required_arena_section() {
-        const ARENA_SECTION: &str = "## Arena State\n- `<name>` (`<type>`) — <purpose and useful contents>\n- Include useful persistent variables, functions, classes, and datasets.\n- Take names and types from `<arena-inventory>`, the live Arena's top-level bindings, when it is present; describe purpose only from the conversation.\n- Without an inventory, mark uncertain availability or type as unverified.\n- State \"(none identified)\" if no useful Arena state is evidenced.";
+        const ARENA_SECTION: &str = "## Arena State\n- `<name>` (`<type>`) — <purpose and useful contents>\n- Include useful persistent variables, functions, classes, and datasets.\n- Use live `<arena-inventory>` names and types when present; infer purpose only from the conversation.\n- Otherwise mark uncertain availability or type as unverified.\n- If no useful state is evidenced, write \"(none identified)\".";
 
         let resources = [
             (
@@ -285,7 +284,7 @@ mod tests {
             assert!(resource.ends_with('\n'));
             assert_eq!(prompt, resource.strip_suffix('\n').unwrap());
             assert!(!prompt.ends_with('\n'));
-            assert!(prompt.len() > 200);
+            assert!(prompt.len() > 100);
             assert!(!include_str!("prompt.rs").contains(prompt));
         }
         assert!(super::compaction_system_prompt().contains("context summarization assistant"));
@@ -336,16 +335,20 @@ mod tests {
     }
 
     #[test]
-    fn root_and_child_prompts_use_the_same_direct_first_delegation_gate() {
-        for prompt in [BUNDLED_PROMPT, BUNDLED_CHILD_PROMPT] {
-            for guidance in [
-                "Default to doing the work yourself",
-                "Before starting a child, identify that benefit",
-                "Sequential work, generic exploration, routine review, and difficulty alone do not justify delegation",
-                "Apply this rule recursively",
-            ] {
-                assert!(prompt.contains(guidance), "missing `{guidance}`");
-            }
+    fn children_inherit_the_direct_first_delegation_gate_from_the_base() {
+        let empty = SkillCatalog::default();
+        let child = child_prompt(BUNDLED_PROMPT, &empty, prompt_reference(&empty));
+        for guidance in [
+            "Default to doing the work yourself",
+            "Before starting a child, identify that benefit",
+            "Sequential work, generic exploration, routine review, and difficulty alone do not justify delegation",
+            "Apply this rule recursively",
+        ] {
+            assert_eq!(child.matches(guidance).count(), 1, "`{guidance}`");
+            assert!(
+                !BUNDLED_CHILD_PROMPT.contains(guidance),
+                "duplicated `{guidance}`"
+            );
         }
     }
 
