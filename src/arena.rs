@@ -7911,6 +7911,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asyncio_gather_routes_each_failed_tool_to_its_own_handler() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("present"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "import asyncio\nasync def settle(path: str) -> str:\n    try:\n        return await read(path)\n    except FileNotFoundError:\n        return 'missing ' + path\nawait asyncio.gather(settle('a'), settle('b'), settle('present'))",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "['missing a', 'missing b', 'contents']"
+        );
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "try:\n    await asyncio.gather(read('a'), read('b'))\nexcept FileNotFoundError:\n    caught = True\ncaught",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+    }
+
+    #[tokio::test]
     async fn asyncio_gather_correlates_reversed_host_settlement_to_trace_rows() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("first"), "first").unwrap();

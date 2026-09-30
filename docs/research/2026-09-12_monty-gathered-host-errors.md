@@ -1,6 +1,6 @@
 # Monty gathered host-error scheduler stall
 
-**Status:** Deferred. No Kiki workaround is planned unless the issue becomes materially disruptive.
+**Status:** Resolved by Monty 1.0.0 ([pydantic/monty#875](https://github.com/pydantic/monty/pull/875)). Each failed host future now raises inside its own coroutine; `asyncio_gather_routes_each_failed_tool_to_its_own_handler` covers it. The rest of this note records the 0.0.22 behaviour.
 
 ## Summary
 
