@@ -118,6 +118,41 @@ pub static ASTRA: ModelConfiguration = ModelConfiguration {
     },
 };
 
+pub static GPT6_1_SOL: ModelConfiguration = ModelConfiguration {
+    id: "openai/gpt-6.1-sol",
+    thinking_levels: THINKING_LEVELS,
+    default_thinking: "medium",
+    service_tier: "default",
+    context_window_tokens: 1_050_000,
+    context_window_display: "1.05m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "openai/gpt-6.1-sol",
+            service_tier: "default",
+            version: "2026-09-30",
+            source: "https://developers.openai.com/api/docs/pricing",
+        },
+        long_context_threshold: 272_000,
+        long_context_threshold_display: "272k",
+        short_context: Rates {
+            uncached_input_nanos: 2_000,
+            cached_input_nanos: 100,
+            cache_write_nanos: 2_500,
+            cache_write_1h_nanos: 2_500,
+            output_nanos: 10_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 4_000,
+            cached_input_nanos: 200,
+            cache_write_nanos: 5_000,
+            cache_write_1h_nanos: 5_000,
+            output_nanos: 15_000,
+        },
+    },
+};
+
 pub static GPT6_SOL: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-6-sol",
     thinking_levels: THINKING_LEVELS,
@@ -328,6 +363,41 @@ pub static OPUS_5_5: ModelConfiguration = ModelConfiguration {
     },
 };
 
+pub static SONNET_5_5: ModelConfiguration = ModelConfiguration {
+    id: "anthropic/claude-sonnet-5-5",
+    thinking_levels: THINKING_LEVELS,
+    default_thinking: "high",
+    service_tier: "standard",
+    context_window_tokens: 1_000_000,
+    context_window_display: "1m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "anthropic/claude-sonnet-5-5",
+            service_tier: "standard",
+            version: "2026-09-30",
+            source: "https://platform.claude.com/docs/en/about-claude/pricing",
+        },
+        long_context_threshold: 1_000_000,
+        long_context_threshold_display: "1m",
+        short_context: Rates {
+            uncached_input_nanos: 2_000,
+            cached_input_nanos: 200,
+            cache_write_nanos: 2_500,
+            cache_write_1h_nanos: 4_000,
+            output_nanos: 10_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 2_000,
+            cached_input_nanos: 200,
+            cache_write_nanos: 2_500,
+            cache_write_1h_nanos: 4_000,
+            output_nanos: 10_000,
+        },
+    },
+};
+
 pub static FABLE_5_1: ModelConfiguration = ModelConfiguration {
     id: "anthropic/claude-fable-5-1",
     thinking_levels: THINKING_LEVELS,
@@ -363,8 +433,17 @@ pub static FABLE_5_1: ModelConfiguration = ModelConfiguration {
     },
 };
 
-pub static CATALOGUE: [&ModelConfiguration; 8] = [
-    &ASTRA, &GPT6_SOL, &GPT6_LUNA, &SOL, &TERRA, &LUNA, &OPUS_5_5, &FABLE_5_1,
+pub static CATALOGUE: [&ModelConfiguration; 10] = [
+    &ASTRA,
+    &GPT6_1_SOL,
+    &GPT6_SOL,
+    &GPT6_LUNA,
+    &SOL,
+    &TERRA,
+    &LUNA,
+    &OPUS_5_5,
+    &SONNET_5_5,
+    &FABLE_5_1,
 ];
 pub static DEFAULT_MODEL: &ModelConfiguration = &SOL;
 
@@ -405,18 +484,20 @@ mod tests {
             CATALOGUE.iter().map(|m| m.id).collect::<Vec<_>>(),
             [
                 "openai/gpt-6-astra",
+                "openai/gpt-6.1-sol",
                 "openai/gpt-6-sol",
                 "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
                 "openai/gpt-5.6-terra",
                 "openai/gpt-5.6-luna",
                 "anthropic/claude-opus-5-5",
+                "anthropic/claude-sonnet-5-5",
                 "anthropic/claude-fable-5-1"
             ]
         );
         assert_eq!(
             CATALOGUE.iter().map(|m| m.id).collect::<HashSet<_>>().len(),
-            8
+            10
         );
         assert!(std::ptr::eq(DEFAULT_MODEL, &SOL));
     }
@@ -430,6 +511,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("openai/gpt-6-astra", Provider::OpenAi, "gpt-6-astra"),
+                ("openai/gpt-6.1-sol", Provider::OpenAi, "gpt-6.1-sol"),
                 ("openai/gpt-6-sol", Provider::OpenAi, "gpt-6-sol"),
                 ("openai/gpt-6-luna", Provider::OpenAi, "gpt-6-luna"),
                 ("openai/gpt-5.6-sol", Provider::OpenAi, "gpt-5.6-sol"),
@@ -439,6 +521,11 @@ mod tests {
                     "anthropic/claude-opus-5-5",
                     Provider::Anthropic,
                     "claude-opus-5-5"
+                ),
+                (
+                    "anthropic/claude-sonnet-5-5",
+                    Provider::Anthropic,
+                    "claude-sonnet-5-5"
                 ),
                 (
                     "anthropic/claude-fable-5-1",
@@ -520,6 +607,68 @@ mod tests {
             assert_eq!(model.pricing.short_context, rates);
             assert_eq!(model.pricing.long_context, rates);
         }
+    }
+
+    #[test]
+    fn gpt_6_1_sol_and_sonnet_5_5_match_published_metadata_and_rates() {
+        for (id, default_thinking, source, short_context, long_context) in [
+            (
+                "openai/gpt-6.1-sol",
+                "medium",
+                "https://developers.openai.com/api/docs/pricing",
+                Rates {
+                    uncached_input_nanos: 2_000,
+                    cached_input_nanos: 100,
+                    cache_write_nanos: 2_500,
+                    cache_write_1h_nanos: 2_500,
+                    output_nanos: 10_000,
+                },
+                Rates {
+                    uncached_input_nanos: 4_000,
+                    cached_input_nanos: 200,
+                    cache_write_nanos: 5_000,
+                    cache_write_1h_nanos: 5_000,
+                    output_nanos: 15_000,
+                },
+            ),
+            (
+                "anthropic/claude-sonnet-5-5",
+                "high",
+                "https://platform.claude.com/docs/en/about-claude/pricing",
+                Rates {
+                    uncached_input_nanos: 2_000,
+                    cached_input_nanos: 200,
+                    cache_write_nanos: 2_500,
+                    cache_write_1h_nanos: 4_000,
+                    output_nanos: 10_000,
+                },
+                Rates {
+                    uncached_input_nanos: 2_000,
+                    cached_input_nanos: 200,
+                    cache_write_nanos: 2_500,
+                    cache_write_1h_nanos: 4_000,
+                    output_nanos: 10_000,
+                },
+            ),
+        ] {
+            let model = model_by_id(id).expect("new model is in the catalogue");
+            assert_eq!(model.default_thinking, default_thinking);
+            assert_eq!(model.pricing.identity.version, "2026-09-30");
+            assert_eq!(model.pricing.identity.source, source);
+            assert_eq!(model.pricing.short_context, short_context);
+            assert_eq!(model.pricing.long_context, long_context);
+            for &thinking in THINKING_LEVELS {
+                assert_eq!(
+                    ModelSelection::new(model, thinking).unwrap().thinking(),
+                    thinking
+                );
+            }
+        }
+        let sonnet = model_by_id("anthropic/claude-sonnet-5-5").unwrap();
+        assert_eq!(
+            (sonnet.context_window_tokens, sonnet.context_window_display),
+            (1_000_000, "1m")
+        );
     }
 
     #[test]

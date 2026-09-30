@@ -1749,6 +1749,25 @@ mod tests {
     }
 
     #[test]
+    fn new_models_are_selectable_in_settings_and_favourites() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        for id in ["openai/gpt-6.1-sol", "anthropic/claude-sonnet-5-5"] {
+            write_settings(
+                project.path(),
+                &format!(
+                    "model = \"{id}\"\nfavourites = [\"{id}\"]\n[thinking]\n\"{id}\" = \"max\"\n"
+                ),
+            );
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+            assert!(resolution.problems().is_empty());
+            assert_eq!(resolution.model().id, id);
+            assert_eq!(resolution.thinking(), "max");
+            assert_eq!(resolution.context().favourites().unwrap()[0].id, id);
+        }
+    }
+
+    #[test]
     fn ordered_favourites_override_as_one_setting_without_changing_foreground_model() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();

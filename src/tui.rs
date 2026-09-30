@@ -6428,6 +6428,7 @@ mod tests {
                 "openai/gpt-6-sol",
                 "OpenAI",
                 "openai/gpt-6-astra",
+                "openai/gpt-6.1-sol",
                 "openai/gpt-6-sol",
                 "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
@@ -6435,6 +6436,7 @@ mod tests {
                 "openai/gpt-5.6-luna",
                 "Anthropic",
                 "anthropic/claude-opus-5-5",
+                "anthropic/claude-sonnet-5-5",
                 "anthropic/claude-fable-5-1",
             ]
         );
@@ -6455,6 +6457,7 @@ mod tests {
                 "openai/gpt-6-sol",
                 "OpenAI",
                 "openai/gpt-6-astra",
+                "openai/gpt-6.1-sol",
                 "openai/gpt-6-sol",
                 "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
@@ -6512,6 +6515,22 @@ mod tests {
             assert!(screen.contains(level));
         }
         assert!(!screen.contains("none"));
+    }
+
+    #[test]
+    fn new_model_commands_apply_their_default_thinking() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        for (id, thinking) in [
+            ("openai/gpt-6.1-sol", "medium"),
+            ("anthropic/claude-sonnet-5-5", "high"),
+        ] {
+            let update = enter_at(&mut app, &format!("/model {id}"), now);
+            let (selection, _) = applied_settings(&update);
+            assert_eq!(selection.model().id, id);
+            assert_eq!(selection.thinking(), thinking);
+            assert!(app.prompt.is_empty());
+        }
     }
 
     #[test]

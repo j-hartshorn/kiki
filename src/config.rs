@@ -1433,6 +1433,23 @@ mod tests {
     }
 
     #[test]
+    fn new_models_are_selectable_from_the_environment() {
+        for (id, thinking) in [
+            ("openai/gpt-6.1-sol", "medium"),
+            ("anthropic/claude-sonnet-5-5", "high"),
+        ] {
+            let mut input = ready_input("openai-key");
+            input.anthropic_api_key = Some(OsString::from("anthropic-key"));
+            input.model = Some(OsString::from(id));
+            let configuration = resolve_startup(input);
+            let ready = configuration.ready().expect("new model is selectable");
+            assert_eq!(ready.model().id, id);
+            assert_eq!(ready.thinking(), thinking);
+            assert!(configuration.snapshot().problems().is_empty());
+        }
+    }
+
+    #[test]
     fn hierarchical_settings_flow_into_snapshot_and_ready_startup() {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
@@ -1560,7 +1577,7 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
             );
             assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
             assert_eq!(
@@ -1596,7 +1613,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.problems()[0].remediation(),
-            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
+            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
         );
         assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
