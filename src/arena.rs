@@ -7383,6 +7383,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn worker_stderr_reaches_the_stderr_observation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_checked(
+            &mut arena,
+            "import sys\nprint('out')\nprint('warning', file=sys.stderr)",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.stdout.head, "out\n");
+        assert_eq!(execution.stderr.head, "warning\n");
+    }
+
     #[test]
     fn routes_stderr_to_its_own_accumulator() {
         let mut streams = StreamAccumulators::new(TEST_LIMITS);
