@@ -13,6 +13,7 @@ use monty_pool::{
 use monty_types::{
     ExcType, MontyException, MontyObject, ObjectRef, OsPolicy, PrintStream, ResourceLimits,
     SleepMode, TypeCheckingConfig, TypeCheckingFormat,
+    format::string_repr_fmt,
     unstable::{self, MontyNode},
 };
 use thiserror::Error;
@@ -28,7 +29,7 @@ use crate::{
         ModelSelection,
         constants::{
             ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES, COLLECTION_MAX_ITEMS,
-            COLLECTION_MAX_PAYLOAD_BYTES,
+            COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES,
         },
     },
     model::SkillActivation,
@@ -58,11 +59,13 @@ const RESULT_VALUES_ERROR_BYTES: usize = 4 * 1024;
 const RESULT_VALUES_BINDING: &str = "result_values";
 const MAX_TRANSFER_DEPTH: usize = 100;
 const RESULT_REPR_MAX_BYTES: usize = 16 * 1024 * 1024;
+// Above any valid call, such as an edit's two file-sized strings.
+const HOST_ARGUMENT_MAX_BYTES: usize = 4 * FILE_MAX_BYTES;
 // Private aliases keep the inventory working when model code rebinds `id` or `type`;
 // the inventory leaves out host-provided bindings.
 const BINDING_ALIASES: &str =
     "_kiki_locals, _kiki_type, _kiki_id = locals, type, id\n_kiki_host_names = set(_kiki_locals())";
-const BINDING_INVENTORY: &str = "{name: [_kiki_type(value).__name__, _kiki_id(value)] for name, value in _kiki_locals().items() if not name.startswith('_kiki_') and name not in _kiki_host_names}";
+const BINDING_INVENTORY: &str = "{name: [_kiki_type(value).__name__, f'{_kiki_id(value)}'] for name, value in _kiki_locals().items() if not name.startswith('_kiki_') and name not in _kiki_host_names}";
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
@@ -1788,8 +1791,9 @@ struct ExecutedCheckout {
     bindings: Bindings,
 }
 
-/// Each top-level binding's type name and object identity.
-type Bindings = BTreeMap<String, (String, i64)>;
+/// Each top-level binding's type name and object identity, which Monty can
+/// reuse after an object is freed, so a rebinding can go unreported.
+type Bindings = BTreeMap<String, (String, String)>;
 
 fn changed_bindings(before: &Bindings, after: &Bindings) -> Vec<ArenaBinding> {
     after
@@ -1837,8 +1841,8 @@ async fn read_bindings(checkout: &mut Checkout) -> Result<Bindings, ArenaError> 
             let binding = match Transfer::of(entry) {
                 Transfer::List(entry) => match entry.as_slice() {
                     [type_name, id] => match (Transfer::of(*type_name), Transfer::of(*id)) {
-                        (Transfer::String(type_name), Transfer::Int(id)) => {
-                            Some((type_name.to_owned(), id))
+                        (Transfer::String(type_name), Transfer::String(id)) => {
+                            Some((type_name.to_owned(), id.to_owned()))
                         }
                         _ => None,
                     },
@@ -2003,9 +2007,10 @@ async fn drive(
                             &mut on_print,
                         ))
                     } else {
+                        let mut budget = HostValueBudget::default();
                         let arguments = match args
                             .args()
-                            .map(tool_value_from_monty)
+                            .map(|argument| budget.convert(argument, 0))
                             .collect::<Result<Vec<_>, _>>()
                         {
                             Ok(arguments) => ToolValue::List(arguments),
@@ -2373,51 +2378,66 @@ fn matches_pending_batch(calls: &[PendingToolCall], pending_call_ids: &[u32]) ->
         && admitted == requested
 }
 
-fn tool_value_from_monty(value: ObjectRef<'_>) -> Result<ToolValue, ToolError> {
-    tool_value_within_bounds(value, 0, &mut 0)
+/// Values cross as a graph that can share nodes, so bound what Kiki expands
+/// across all of one call's arguments.
+#[derive(Default)]
+struct HostValueBudget {
+    items: usize,
+    bytes: usize,
 }
 
-/// Values cross as a graph that can share nodes, so bound what Kiki expands.
-fn tool_value_within_bounds(
-    value: ObjectRef<'_>,
-    depth: usize,
-    items: &mut usize,
-) -> Result<ToolValue, ToolError> {
-    *items += 1;
-    if depth > MAX_TRANSFER_DEPTH || *items > COLLECTION_MAX_ITEMS {
-        return Err(ToolError::type_error(format!(
-            "host values exceed {MAX_TRANSFER_DEPTH} levels or {COLLECTION_MAX_ITEMS} items"
-        )));
+impl HostValueBudget {
+    fn convert(&mut self, value: ObjectRef<'_>, depth: usize) -> Result<ToolValue, ToolError> {
+        self.items += 1;
+        if depth > MAX_TRANSFER_DEPTH || self.items > COLLECTION_MAX_ITEMS {
+            return Err(Self::exceeded());
+        }
+        match Transfer::of(value) {
+            Transfer::None => Ok(ToolValue::None),
+            Transfer::Bool(value) => Ok(ToolValue::Bool(value)),
+            Transfer::Int(value) => Ok(ToolValue::Integer(value)),
+            Transfer::Float(value) => Ok(ToolValue::Float(value)),
+            Transfer::String(value) => {
+                self.add_bytes(value.len())?;
+                Ok(ToolValue::String(value.to_owned()))
+            }
+            Transfer::List(values) => values
+                .into_iter()
+                .map(|value| self.convert(value, depth + 1))
+                .collect::<Result<Vec<_>, _>>()
+                .map(ToolValue::List),
+            Transfer::Dict(values) => values
+                .into_iter()
+                .map(|(key, value)| {
+                    let Some(key) = key.as_str() else {
+                        return Err(ToolError::type_error(
+                            "host dictionaries require string keys",
+                        ));
+                    };
+                    self.add_bytes(key.len())?;
+                    Ok((key.to_owned(), self.convert(value, depth + 1)?))
+                })
+                .collect::<Result<_, _>>()
+                .map(ToolValue::Dictionary),
+            Transfer::Unsupported(type_name) => Err(ToolError::type_error(format!(
+                "host functions do not accept {type_name} values"
+            ))),
+        }
     }
-    match Transfer::of(value) {
-        Transfer::None => Ok(ToolValue::None),
-        Transfer::Bool(value) => Ok(ToolValue::Bool(value)),
-        Transfer::Int(value) => Ok(ToolValue::Integer(value)),
-        Transfer::Float(value) => Ok(ToolValue::Float(value)),
-        Transfer::String(value) => Ok(ToolValue::String(value.to_owned())),
-        Transfer::List(values) => values
-            .into_iter()
-            .map(|value| tool_value_within_bounds(value, depth + 1, items))
-            .collect::<Result<Vec<_>, _>>()
-            .map(ToolValue::List),
-        Transfer::Dict(values) => values
-            .into_iter()
-            .map(|(key, value)| {
-                let Some(key) = key.as_str() else {
-                    return Err(ToolError::type_error(
-                        "host dictionaries require string keys",
-                    ));
-                };
-                Ok((
-                    key.to_owned(),
-                    tool_value_within_bounds(value, depth + 1, items)?,
-                ))
-            })
-            .collect::<Result<_, _>>()
-            .map(ToolValue::Dictionary),
-        Transfer::Unsupported(type_name) => Err(ToolError::type_error(format!(
-            "host functions do not accept {type_name} values"
-        ))),
+
+    fn add_bytes(&mut self, bytes: usize) -> Result<(), ToolError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > HOST_ARGUMENT_MAX_BYTES {
+            return Err(Self::exceeded());
+        }
+        Ok(())
+    }
+
+    fn exceeded() -> ToolError {
+        ToolError::type_error(format!(
+            "host values exceed {MAX_TRANSFER_DEPTH} levels, {COLLECTION_MAX_ITEMS} items or {} MiB",
+            HOST_ARGUMENT_MAX_BYTES / (1024 * 1024)
+        ))
     }
 }
 
@@ -2985,20 +3005,20 @@ fn result_observation(value: &MontyObject) -> Observation {
 
     let value = value.as_ref();
     let mut accumulator = ObservationAccumulator::new(OBSERVATION_LIMITS);
-    if value.as_str().is_some() {
-        accumulator.push(&value.py_repr());
-    } else {
-        let mut repr = BoundedRepr {
-            accumulator: &mut accumulator,
-            remaining: RESULT_REPR_MAX_BYTES,
-        };
-        // Display is the repr for everything except a bare string.
-        if fmt::write(&mut repr, format_args!("{value}")).is_err() {
-            accumulator.push(&format!(
-                "\n[result repr stopped after {} MiB]",
-                RESULT_REPR_MAX_BYTES / (1024 * 1024)
-            ));
-        }
+    let mut repr = BoundedRepr {
+        accumulator: &mut accumulator,
+        remaining: RESULT_REPR_MAX_BYTES,
+    };
+    // Display is the repr for everything except a bare string.
+    let written = match value.as_str() {
+        Some(text) => string_repr_fmt(text, &mut repr),
+        None => fmt::write(&mut repr, format_args!("{value}")),
+    };
+    if written.is_err() {
+        accumulator.push(&format!(
+            "\n[result repr stopped after {} MiB]",
+            RESULT_REPR_MAX_BYTES / (1024 * 1024)
+        ));
     }
     accumulator.finish()
 }
@@ -7131,6 +7151,18 @@ mod tests {
             .head,
             "'quoted'"
         );
+        let escaped = execute_without_cancellation(&mut arena, "'\\x00' * (5 * 1024 * 1024)")
+            .await
+            .unwrap();
+        let escaped = complete(&escaped).unwrap();
+        assert!(escaped.head.starts_with("'\\x00\\x00"), "{escaped:?}");
+        assert!(
+            escaped
+                .tail
+                .as_deref()
+                .unwrap()
+                .ends_with("[result repr stopped after 16 MiB]")
+        );
     }
 
     #[tokio::test]
@@ -7141,6 +7173,7 @@ mod tests {
         for setup in [
             "value = 'file'\nfor _ in range(900):\n    value = [value]",
             "value = ['file']\nfor _ in range(60):\n    value = [value, value]",
+            "blob = 'x' * 1_000_000\nvalue = [blob] * 9_999",
         ] {
             let execution = execute_without_cancellation(
                 &mut arena,
@@ -7591,8 +7624,18 @@ mod tests {
         fs::write(workspace.path().join("file"), "contents").unwrap();
         let mut arena = arena(&workspace).await;
 
-        let created = execute_checked(&mut arena, "a = 1\nb = [1]").await.unwrap();
-        assert_eq!(bindings(&created), [("a", "int"), ("b", "list")]);
+        let created = execute_checked(&mut arena, "a = 1\nb = [1]\nratio = 3.14\nhuge = 2 ** 80")
+            .await
+            .unwrap();
+        assert_eq!(
+            bindings(&created),
+            [
+                ("a", "int"),
+                ("b", "list"),
+                ("huge", "int"),
+                ("ratio", "float")
+            ]
+        );
 
         let rebound = execute_checked(
             &mut arena,
