@@ -17591,7 +17591,7 @@ mod tests {
         };
         assert_eq!(
             feedback,
-            "<kiki_execution state=\"cancelled\" began=\"false\">\nExecution did not begin.\nExecution cancelled; Python Arena changes discarded. Completed external effects may remain; pending actions were cancelled.\n</kiki_execution>"
+            "<kiki_execution state=\"cancelled\" began=\"false\" arena_state=\"unchanged\">\nExecution did not begin.\nExecution cancelled; Python Arena changes discarded. Completed external effects may remain; pending actions were cancelled.\n</kiki_execution>"
         );
         assert!(matches!(
             restore.records.last().map(|record| &record.kind),

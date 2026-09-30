@@ -470,7 +470,7 @@ mod tests {
             .await
             .unwrap()
             .for_child(true)
-            .prompt_reference();
+            .prompt_reference(true);
         let empty = SkillCatalog::default();
         let root = root_prompt("canonical base", &empty);
         let child_instructions = child_prompt("canonical base", &empty, reference);

@@ -1586,8 +1586,13 @@ fn contains_cancellation(error: &ArenaError) -> bool {
 
 fn interruption_feedback(evidence: &ExecutionEvidence, state: &str) -> String {
     let mut frames = vec![format!(
-        "<kiki_execution state=\"{state}\" began=\"{}\">",
-        evidence.began
+        "<kiki_execution state=\"{state}\" began=\"{}\" arena_state=\"{}\">",
+        evidence.began,
+        if evidence.began {
+            "rolled_back"
+        } else {
+            "unchanged"
+        },
     )];
     if !evidence.began {
         frames.push("Execution did not begin.".to_owned());
@@ -5738,6 +5743,7 @@ mod tests {
         let feedback = evidence.feedback();
         assert!(!feedback.contains("tool calls"));
         assert!(feedback.contains("before\n"));
+        assert!(feedback.contains("began=\"true\" arena_state=\"rolled_back\""));
         assert!(feedback.contains(
             "Execution cancelled; Python Arena changes discarded. Completed external effects may remain; pending actions were cancelled."
         ));

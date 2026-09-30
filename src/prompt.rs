@@ -249,8 +249,8 @@ mod tests {
             "A gather failure can follow completed host calls",
             "wrap each call in an `async def` with `try`/`except`",
             "Run project-local, one-shot commands.",
-            "five minutes of chargeable time",
-            "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.",
+            "five minutes of charged time, including commands and sleeps",
+            "The clock stops only while every pending call is a subagent `wait()` or `cancel()`.",
             "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
         ] {
             assert!(reference.contains(guidance), "missing `{guidance}`");
@@ -329,6 +329,8 @@ mod tests {
             "annotate globals you may reassign",
             "never repeat side-effecting calls merely to satisfy a diagnostic",
             "top-level bindings the execution created or rebound",
+            "`<kiki_execution arena_state=\"rolled_back\">`) discards its Arena changes",
+            "Before your final reply, wait for or cancel every child you started.",
         ] {
             assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
         }
@@ -355,6 +357,8 @@ mod tests {
             "not the user's wider request",
             "Never delegate your whole task or a paraphrase of it",
             "a subagent may delegate only under the same test",
+            "including verifying your own result",
+            "`result_values` is a global dict",
         ] {
             assert!(child.contains(guidance), "missing `{guidance}`");
         }
@@ -494,7 +498,7 @@ mod tests {
             .with_skill_catalog(catalog.clone());
         for base in [BUNDLED_PROMPT, "custom override base"] {
             let root = root_prompt(base, &catalog);
-            let child = child_prompt(base, &catalog, host.for_child(true).prompt_reference());
+            let child = child_prompt(base, &catalog, host.for_child(true).prompt_reference(true));
             for full in [&root, &child] {
                 assert!(full.starts_with(base));
                 assert_eq!(full.matches(super::skills_catalog_header()).count(), 1);
@@ -556,7 +560,11 @@ mod tests {
                 .with_skill_catalog(catalog.clone());
             for full in [
                 root_prompt("base", &catalog),
-                child_prompt("base", &catalog, host.for_child(true).prompt_reference()),
+                child_prompt(
+                    "base",
+                    &catalog,
+                    host.for_child(true).prompt_reference(true),
+                ),
             ] {
                 for absent in [
                     super::skills_catalog_header(),
@@ -579,7 +587,11 @@ mod tests {
             .with_skill_catalog(catalog.clone());
         [
             root_prompt("base", &catalog),
-            child_prompt("base", &catalog, host.for_child(true).prompt_reference()),
+            child_prompt(
+                "base",
+                &catalog,
+                host.for_child(true).prompt_reference(true),
+            ),
         ]
     }
 
@@ -674,7 +686,7 @@ mod tests {
             .await
             .unwrap()
             .for_child(true)
-            .prompt_reference();
+            .prompt_reference(true);
         let prompt = child_prompt("canonical base", &SkillCatalog::default(), reference);
 
         assert_eq!(prompt.matches("## Kiki tool reference").count(), 1);

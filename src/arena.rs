@@ -851,8 +851,10 @@ impl ArenaChildSource {
         })
     }
 
-    pub(crate) fn prompt_reference(&self, read_only: bool) -> String {
-        self.tool_host.for_child(read_only).prompt_reference()
+    pub(crate) fn prompt_reference(&self, read_only: bool, can_delegate: bool) -> String {
+        self.tool_host
+            .for_child(read_only)
+            .prompt_reference(can_delegate)
     }
 
     pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
@@ -4763,7 +4765,7 @@ mod tests {
 
         let mut child = parent.child(&checkpoint, false).await.unwrap();
         assert_eq!(
-            child.tool_host.prompt_reference(),
+            child.tool_host.prompt_reference(true),
             crate::tools::prompt_reference(&SkillCatalog::default())
         );
         assert!(
