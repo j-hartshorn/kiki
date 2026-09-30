@@ -10,7 +10,7 @@ Install the `kiki` command into `~/.cargo/bin` (make sure that directory is on y
 just install   # or: cargo install --path . --locked
 ```
 
-The Monty worker is embedded: `kiki` runs itself as `kiki subprocess` for its Python arena, so no separate `monty-runtime` install is needed. `kiki --version` prints `kiki <version> (monty-runtime 0.0.22)`. Setting `MONTY_BIN` to the absolute path of another `kiki` or a `monty-runtime` 0.0.22 executable overrides the embedded worker.
+The Monty worker is embedded: `kiki` runs itself as `kiki subprocess` for its Python arena, so no separate `monty-runtime` install is needed. `kiki --version` prints `kiki <version> (monty-runtime 1.0.0)`. Setting `MONTY_BIN` to the absolute path of another `kiki` or a `monty-runtime` 0.0.22 executable overrides the embedded worker.
 
 Store an API key for each provider you use:
 
@@ -82,7 +82,7 @@ Warning: session relocated; retained paths, data, and external effects were not 
 
 It does not rewrite retained paths, Arena data, or external effects. On normal exit or a handled runtime failure after a session opens, Kiki restores the terminal and completes session cleanup before printing `Session: <id>`. A failure before opening the session and forced termination cannot guarantee that output.
 
-On resume, unfinished foreground work and children are settled from committed state; unfinished work is never replayed. Terminal child results are retained, but no child execution resumes. Required malformed or incompatible executable state is not reconstructed; if its history remains readable, Kiki shows it in the disabled TUI. Checkpoints saved before Monty type checking was enabled, or with earlier type-check stubs, cannot be resumed because loading them would bypass checks or retain outdated stubs. Start a new session for executable work. Unsupported session-format versions are rejected without migration. Kiki never undoes external effects already completed by commands or other tools.
+On resume, unfinished foreground work and children are settled from committed state; unfinished work is never replayed. Terminal child results are retained, but no child execution resumes. Required malformed or incompatible executable state is not reconstructed; if its history remains readable, Kiki shows it in the disabled TUI. Checkpoints saved before Monty type checking was enabled, or with earlier type-check stubs, cannot be resumed because loading them would bypass checks or retain outdated stubs. Checkpoints saved with Monty 0.0.22 cannot be resumed by Monty 1.0.0 either. Start a new session for executable work. Unsupported session-format versions are rejected without migration. Kiki never undoes external effects already completed by commands or other tools.
 
 Each session persists its `/name`, selected model, and accepted thinking values per model. Saved session preferences override ordinary user and project settings on resume, while explicit `KIKI_MODEL` and `KIKI_THINKING` still win. After a successful executable restore, Kiki saves the effective choice, including an environment override, for a later resume. `Ctrl-S` in a picker saves a user default separately from the active session's accepted setting.
 

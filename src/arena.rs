@@ -11,8 +11,9 @@ use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
 use monty_types::{
-    ExcType, MontyException, MontyObject, PrintStream, ResourceLimits, TypeCheckingConfig,
-    TypeCheckingFormat,
+    ExcType, MontyException, MontyObject, ObjectRef, PrintStream, ResourceLimits,
+    TypeCheckingConfig, TypeCheckingFormat,
+    unstable::{self, MontyNode},
 };
 use thiserror::Error;
 use tokio::process::Command;
@@ -47,14 +48,16 @@ pub(crate) use crate::tools::ToolName;
 
 /// Identity of the Monty worker runtime. A standalone `monty` prints exactly
 /// this for `--version`; `kiki --version` (the embedded worker, see
-/// `crate::worker`) prints `kiki <version> (monty-runtime 0.0.22)`. Both run the
+/// `crate::worker`) prints `kiki <version> (monty-runtime 1.0.0)`. Both run the
 /// same pinned Monty, so both map to this identity and share checkpoints.
-pub(crate) const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.22";
+pub(crate) const RUNTIME_IDENTITY: &str = "monty-runtime 1.0.0";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
 const RESULT_VALUES_ERROR_BYTES: usize = 4 * 1024;
 const RESULT_VALUES_BINDING: &str = "result_values";
+const MAX_TRANSFER_DEPTH: usize = 100;
+const RESULT_REPR_MAX_BYTES: usize = 16 * 1024 * 1024;
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
@@ -1343,7 +1346,7 @@ async fn reset_result_values(checkout: &mut Checkout) -> Result<(), ArenaError> 
         .await
         .map_err(pool_failure)?
     {
-        TurnEvent::Complete(MontyObject::None) => Ok(()),
+        TurnEvent::Complete(value) if is_none(&value) => Ok(()),
         event => Err(ArenaError::unsupported_suspension(format!(
             "result_values initialisation did not complete: {event:?}"
         ))),
@@ -1424,7 +1427,7 @@ impl ResultValueBounds {
 fn result_values_from_monty(
     value: MontyObject,
 ) -> Result<BTreeMap<String, ToolValue>, ResultValuesError> {
-    let MontyObject::Dict(values) = value else {
+    let Transfer::Dict(values) = Transfer::of(value.as_ref()) else {
         return Err(ResultValuesError::export(
             "result_values must be a dictionary",
         ));
@@ -1433,14 +1436,14 @@ fn result_values_from_monty(
     let mut converted = BTreeMap::new();
     for (key, value) in values {
         bounds.add_item()?;
-        let MontyObject::String(key) = key else {
+        let Some(key) = key.as_str() else {
             return Err(ResultValuesError::export(
                 "result_values dictionaries require string keys",
             ));
         };
         bounds.add_payload(key.len())?;
-        let value = result_value_from_monty(value, &mut bounds)?;
-        if converted.insert(key, value).is_some() {
+        let value = result_value_from_monty(value, &mut bounds, 1)?;
+        if converted.insert(key.to_owned(), value).is_some() {
             return Err(ResultValuesError::export(
                 "result_values dictionaries cannot contain duplicate keys",
             ));
@@ -1450,38 +1453,44 @@ fn result_values_from_monty(
 }
 
 fn result_value_from_monty(
-    value: MontyObject,
+    value: ObjectRef<'_>,
     bounds: &mut ResultValueBounds,
+    depth: usize,
 ) -> Result<ToolValue, ResultValuesError> {
-    match value {
-        MontyObject::None => Ok(ToolValue::None),
-        MontyObject::Bool(value) => Ok(ToolValue::Bool(value)),
-        MontyObject::Int(value) => Ok(ToolValue::Integer(value)),
-        MontyObject::Float(value) => Ok(ToolValue::Float(value)),
-        MontyObject::String(value) => {
+    if depth > MAX_TRANSFER_DEPTH {
+        return Err(ResultValuesError::export(format!(
+            "export exceeds the {MAX_TRANSFER_DEPTH}-level nesting limit"
+        )));
+    }
+    match Transfer::of(value) {
+        Transfer::None => Ok(ToolValue::None),
+        Transfer::Bool(value) => Ok(ToolValue::Bool(value)),
+        Transfer::Int(value) => Ok(ToolValue::Integer(value)),
+        Transfer::Float(value) => Ok(ToolValue::Float(value)),
+        Transfer::String(value) => {
             bounds.add_payload(value.len())?;
-            Ok(ToolValue::String(value))
+            Ok(ToolValue::String(value.to_owned()))
         }
-        MontyObject::List(values) => {
+        Transfer::List(values) => {
             let mut converted = Vec::new();
             for value in values {
                 bounds.add_item()?;
-                converted.push(result_value_from_monty(value, bounds)?);
+                converted.push(result_value_from_monty(value, bounds, depth + 1)?);
             }
             Ok(ToolValue::List(converted))
         }
-        MontyObject::Dict(values) => {
+        Transfer::Dict(values) => {
             let mut converted = BTreeMap::new();
             for (key, value) in values {
                 bounds.add_item()?;
-                let MontyObject::String(key) = key else {
+                let Some(key) = key.as_str() else {
                     return Err(ResultValuesError::export(
                         "result_values dictionaries require string keys",
                     ));
                 };
                 bounds.add_payload(key.len())?;
-                let value = result_value_from_monty(value, bounds)?;
-                if converted.insert(key, value).is_some() {
+                let value = result_value_from_monty(value, bounds, depth + 1)?;
+                if converted.insert(key.to_owned(), value).is_some() {
                     return Err(ResultValuesError::export(
                         "result_values dictionaries cannot contain duplicate keys",
                     ));
@@ -1489,10 +1498,36 @@ fn result_value_from_monty(
             }
             Ok(ToolValue::Dictionary(converted))
         }
-        value => Err(ResultValuesError::export(format!(
-            "result_values contains unsupported {}",
-            value.type_name()
+        Transfer::Unsupported(type_name) => Err(ResultValuesError::export(format!(
+            "result_values contains unsupported {type_name}"
         ))),
+    }
+}
+
+/// The JSON-like shape Kiki transfers, viewed from a Monty value.
+enum Transfer<'a> {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(&'a str),
+    List(Vec<ObjectRef<'a>>),
+    Dict(Vec<(ObjectRef<'a>, ObjectRef<'a>)>),
+    Unsupported(&'a str),
+}
+
+impl<'a> Transfer<'a> {
+    fn of(value: ObjectRef<'a>) -> Self {
+        match unstable::node(value) {
+            MontyNode::None => Self::None,
+            MontyNode::Bool(value) => Self::Bool(*value),
+            MontyNode::Int(value) => Self::Int(*value),
+            MontyNode::Float(value) => Self::Float(*value),
+            MontyNode::String(value) => Self::String(value),
+            MontyNode::List(_) => Self::List(value.items().expect("a list node has items")),
+            MontyNode::Dict(_) => Self::Dict(value.pairs().expect("a dict node has pairs")),
+            _ => Self::Unsupported(value.type_name()),
+        }
     }
 }
 
@@ -1556,7 +1591,7 @@ async fn bootstrap(checkout: &mut Checkout) -> Result<(), ArenaError> {
         .await
         .map_err(pool_failure)?
     {
-        TurnEvent::Complete(MontyObject::None) => Ok(()),
+        TurnEvent::Complete(value) if is_none(&value) => Ok(()),
         event => Err(ArenaError::unsupported_suspension(format!(
             "tool bootstrap did not complete: {event:?}"
         ))),
@@ -1596,8 +1631,7 @@ async fn execute_checkout(
     let (outcome, unsafe_memory, error_text) = match result {
         Ok(value) => (
             ExecutionOutcome::Complete {
-                result: (!matches!(value, MontyObject::None))
-                    .then(|| observation_from_text(value.py_repr())),
+                result: (!is_none(&value)).then(|| result_observation(&value)),
             },
             false,
             None,
@@ -1774,9 +1808,9 @@ async fn drive(
                 TurnEvent::FunctionCall {
                     function_name,
                     args,
-                    kwargs,
                     call_id,
                     object_id,
+                    ..
                 } => {
                     let invocation = InvocationOperation::from_private_name(&function_name);
                     let Some(tool) = ToolName::from_private_name(&function_name)
@@ -1785,7 +1819,7 @@ async fn drive(
                         event = turn!('drive, on_print => checkout.resume(ResumeValue::NotFound, &mut on_print));
                         continue;
                     };
-                    if object_id.is_some() || !kwargs.is_empty() {
+                    if object_id.is_some() || args.kwargs().len() > 0 {
                         turn!('drive, on_print => checkout.resume(
                             ResumeValue::Error(tool_error(ToolError::type_error(
                                 "host functions accept positional arguments only",
@@ -1794,7 +1828,7 @@ async fn drive(
                         ))
                     } else {
                         let arguments = match args
-                            .into_iter()
+                            .args()
                             .map(tool_value_from_monty)
                             .collect::<Result<Vec<_>, _>>()
                         {
@@ -1829,17 +1863,16 @@ async fn drive(
                         turn!('drive, on_print => checkout.resume(ResumeValue::Future, &mut on_print))
                     }
                 }
-                TurnEvent::NameLookup { name, object_id } => {
+                TurnEvent::NameLookup {
+                    name, object_id, ..
+                } => {
                     let value = if object_id.is_none() {
                         ToolName::from_private_name(&name)
                             .map(|tool| tool.private_name())
                             .or_else(|| {
                                 InvocationOperation::from_private_name(&name).map(|_| name.as_str())
                             })
-                            .map(|name| MontyObject::Function {
-                                name: name.to_owned(),
-                                docstring: None,
-                            })
+                            .map(|name| MontyObject::function(name, None))
                     } else {
                         None
                     };
@@ -1848,7 +1881,9 @@ async fn drive(
                 TurnEvent::OsCall { .. } => {
                     turn!('drive, on_print => checkout.resume(ResumeValue::NotHandled, &mut on_print))
                 }
-                TurnEvent::ResolveFutures { pending_call_ids } => {
+                TurnEvent::ResolveFutures {
+                    pending_call_ids, ..
+                } => {
                     let pending = std::mem::take(&mut pending_calls);
                     if !matches_pending_batch(&pending, &pending_call_ids) {
                         break 'drive Err(DriverError::Fatal(ArenaError::unsupported_suspension(
@@ -2144,52 +2179,66 @@ fn matches_pending_batch(calls: &[PendingToolCall], pending_call_ids: &[u32]) ->
         && admitted == requested
 }
 
-fn tool_value_from_monty(value: MontyObject) -> Result<ToolValue, ToolError> {
-    match value {
-        MontyObject::None => Ok(ToolValue::None),
-        MontyObject::Bool(value) => Ok(ToolValue::Bool(value)),
-        MontyObject::Int(value) => Ok(ToolValue::Integer(value)),
-        MontyObject::Float(value) => Ok(ToolValue::Float(value)),
-        MontyObject::String(value) => Ok(ToolValue::String(value)),
-        MontyObject::List(values) => values
+fn tool_value_from_monty(value: ObjectRef<'_>) -> Result<ToolValue, ToolError> {
+    tool_value_within_bounds(value, 0, &mut 0)
+}
+
+/// Values cross as a graph that can share nodes, so bound what Kiki expands.
+fn tool_value_within_bounds(
+    value: ObjectRef<'_>,
+    depth: usize,
+    items: &mut usize,
+) -> Result<ToolValue, ToolError> {
+    *items += 1;
+    if depth > MAX_TRANSFER_DEPTH || *items > COLLECTION_MAX_ITEMS {
+        return Err(ToolError::type_error(format!(
+            "host values exceed {MAX_TRANSFER_DEPTH} levels or {COLLECTION_MAX_ITEMS} items"
+        )));
+    }
+    match Transfer::of(value) {
+        Transfer::None => Ok(ToolValue::None),
+        Transfer::Bool(value) => Ok(ToolValue::Bool(value)),
+        Transfer::Int(value) => Ok(ToolValue::Integer(value)),
+        Transfer::Float(value) => Ok(ToolValue::Float(value)),
+        Transfer::String(value) => Ok(ToolValue::String(value.to_owned())),
+        Transfer::List(values) => values
             .into_iter()
-            .map(tool_value_from_monty)
+            .map(|value| tool_value_within_bounds(value, depth + 1, items))
             .collect::<Result<Vec<_>, _>>()
             .map(ToolValue::List),
-        MontyObject::Dict(values) => values
+        Transfer::Dict(values) => values
             .into_iter()
             .map(|(key, value)| {
-                let MontyObject::String(key) = key else {
+                let Some(key) = key.as_str() else {
                     return Err(ToolError::type_error(
                         "host dictionaries require string keys",
                     ));
                 };
-                Ok((key, tool_value_from_monty(value)?))
+                Ok((
+                    key.to_owned(),
+                    tool_value_within_bounds(value, depth + 1, items)?,
+                ))
             })
             .collect::<Result<_, _>>()
             .map(ToolValue::Dictionary),
-        value => Err(ToolError::type_error(format!(
-            "host functions do not accept {} values",
-            value.type_name()
+        Transfer::Unsupported(type_name) => Err(ToolError::type_error(format!(
+            "host functions do not accept {type_name} values"
         ))),
     }
 }
 
 fn tool_value_to_monty(value: ToolValue) -> MontyObject {
     match value {
-        ToolValue::None => MontyObject::None,
-        ToolValue::Bool(value) => MontyObject::Bool(value),
-        ToolValue::Integer(value) => MontyObject::Int(value),
-        ToolValue::Float(value) => MontyObject::Float(value),
-        ToolValue::String(value) => MontyObject::String(value),
-        ToolValue::List(values) => {
-            MontyObject::List(values.into_iter().map(tool_value_to_monty).collect())
-        }
+        ToolValue::None => MontyObject::none(),
+        ToolValue::Bool(value) => MontyObject::bool(value),
+        ToolValue::Integer(value) => MontyObject::int(value),
+        ToolValue::Float(value) => MontyObject::float(value),
+        ToolValue::String(value) => MontyObject::string(value),
+        ToolValue::List(values) => MontyObject::list(values.into_iter().map(tool_value_to_monty)),
         ToolValue::Dictionary(values) => MontyObject::dict(
             values
                 .into_iter()
-                .map(|(key, value)| (MontyObject::String(key), tool_value_to_monty(value)))
-                .collect::<Vec<_>>(),
+                .map(|(key, value)| (MontyObject::string(key), tool_value_to_monty(value))),
         ),
     }
 }
@@ -2721,9 +2770,42 @@ impl LineCounter {
     }
 }
 
-fn observation_from_text(text: String) -> Observation {
+fn is_none(value: &MontyObject) -> bool {
+    matches!(unstable::node(value.as_ref()), MontyNode::None)
+}
+
+/// Results cross as a graph whose shared nodes can expand without bound, so
+/// stream the repr into the observation and stop at a fixed size.
+fn result_observation(value: &MontyObject) -> Observation {
+    struct BoundedRepr<'a> {
+        accumulator: &'a mut ObservationAccumulator,
+        remaining: usize,
+    }
+    impl fmt::Write for BoundedRepr<'_> {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.remaining = self.remaining.checked_sub(text.len()).ok_or(fmt::Error)?;
+            self.accumulator.push(text);
+            Ok(())
+        }
+    }
+
+    let value = value.as_ref();
     let mut accumulator = ObservationAccumulator::new(OBSERVATION_LIMITS);
-    accumulator.push(&text);
+    if value.as_str().is_some() {
+        accumulator.push(&value.py_repr());
+    } else {
+        let mut repr = BoundedRepr {
+            accumulator: &mut accumulator,
+            remaining: RESULT_REPR_MAX_BYTES,
+        };
+        // Display is the repr for everything except a bare string.
+        if fmt::write(&mut repr, format_args!("{value}")).is_err() {
+            accumulator.push(&format!(
+                "\n[result repr stopped after {} MiB]",
+                RESULT_REPR_MAX_BYTES / (1024 * 1024)
+            ));
+        }
+    }
     accumulator.finish()
 }
 
@@ -2843,7 +2925,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use monty_types::{MontyObject, MontyType, PrintStream};
+    use monty_types::{MontyObject, PrintStream};
     use tempfile::TempDir;
     use tokio::sync::{Semaphore, mpsc, oneshot, watch};
     use tokio_util::sync::CancellationToken;
@@ -2882,7 +2964,7 @@ mod tests {
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
-            .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
+            .expect("MONTY_BIN must point to the monty-runtime 1.0.0 worker")
     }
 
     async fn arena(workspace: &TempDir) -> Arena {
@@ -3783,33 +3865,44 @@ mod tests {
     #[test]
     fn result_value_converter_rejects_unrepresentable_transport_values_without_partial_exports() {
         let values = [
-            (
-                "function",
-                MontyObject::Function {
-                    name: "external".to_owned(),
-                    docstring: None,
-                },
-            ),
+            ("function", MontyObject::function("external", None)),
             (
                 "class",
-                MontyObject::Type(MontyType::Instance(Box::new(monty_types::MontyClassType {
-                    name: "Unsupported".to_owned(),
-                    id: monty_types::MontyUuid::from_u128(1),
-                    host_defined: true,
-                    is_dataclass: false,
-                    attrs: Vec::new().into(),
-                }))),
+                MontyObject::class_type(
+                    "Unsupported",
+                    monty_types::MontyUuid::from_u128(1),
+                    true,
+                    false,
+                    [],
+                ),
             ),
-            ("bytes", MontyObject::Bytes(b"bytes".to_vec())),
-            ("big integer", MontyObject::BigInt(Default::default())),
-            ("repr", MontyObject::Repr("unsupported".to_owned())),
-            ("cycle", MontyObject::Cycle(1, "[...]".to_owned())),
+            (
+                "class named dict",
+                MontyObject::class_instance(
+                    MontyObject::class_type(
+                        "dict",
+                        monty_types::MontyUuid::from_u128(2),
+                        false,
+                        false,
+                        [],
+                    ),
+                    monty_types::MontyUuid::from_u128(3),
+                    [],
+                ),
+            ),
+            ("bytes", MontyObject::bytes(b"bytes".to_vec())),
+            (
+                "big integer",
+                MontyObject::bigint("18446744073709551614".parse().unwrap()),
+            ),
+            ("repr", MontyObject::repr("unsupported")),
+            ("cycle", MontyObject::cycle("[...]")),
         ];
 
         for (kind, value) in values {
             let error = result_values_from_monty(MontyObject::dict(vec![
-                (MontyObject::String("valid".to_owned()), MontyObject::Int(1)),
-                (MontyObject::String("invalid".to_owned()), value),
+                (MontyObject::string("valid"), MontyObject::int(1)),
+                (MontyObject::string("invalid"), value),
             ]))
             .unwrap_err();
             assert!(
@@ -4333,7 +4426,8 @@ mod tests {
             arena.execution_timeout,
             crate::config::constants::ARENA_EXECUTION_TIMEOUT
         );
-        assert_eq!(limits.max_duration, None);
+        assert_eq!(limits.max_feed_duration, None);
+        assert_eq!(limits.max_turn_duration, None);
         assert_eq!(
             limits.max_memory,
             Some(crate::config::constants::ARENA_MAX_MEMORY_BYTES)
@@ -6770,6 +6864,68 @@ mod tests {
             .unwrap();
 
             assert_eq!(complete(&execution).unwrap().head, "'TypeError'");
+        }
+    }
+
+    #[tokio::test]
+    async fn widely_shared_results_render_a_bounded_observation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "value = ['a']\nfor _ in range(60):\n    value = [value, value]\nvalue",
+        )
+        .await
+        .unwrap();
+
+        let result = complete(&execution).unwrap();
+        assert!(result.head.starts_with("[[["), "{result:?}");
+        assert!(
+            result
+                .tail
+                .as_deref()
+                .unwrap()
+                .ends_with("[result repr stopped after 16 MiB]"),
+            "{result:?}"
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "'quoted'")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
+            "'quoted'"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_host_calls_reject_deep_and_widely_shared_arguments_as_type_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        for setup in [
+            "value = 'file'\nfor _ in range(900):\n    value = [value]",
+            "value = ['file']\nfor _ in range(60):\n    value = [value, value]",
+        ] {
+            let execution = execute_without_cancellation(
+                &mut arena,
+                &format!(
+                    "{setup}\nresult = 'allowed'\ntry:\n    await _kiki_read(value)\nexcept TypeError as error:\n    result = str(error)\nresult"
+                ),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                complete(&execution)
+                    .unwrap()
+                    .head
+                    .contains("host values exceed"),
+                "{execution:?}"
+            );
         }
     }
 
@@ -9351,19 +9507,17 @@ mod worker_identity_tests {
 
     #[test]
     fn accepts_standalone_monty_and_embedded_kiki_workers_only() {
-        assert!(is_supported_worker_identity("monty-runtime 0.0.22"));
+        assert!(is_supported_worker_identity("monty-runtime 1.0.0"));
         assert!(is_supported_worker_identity(
-            "kiki 0.1.0 (monty-runtime 0.0.22)"
+            "kiki 0.1.0 (monty-runtime 1.0.0)"
         ));
         assert!(!is_supported_worker_identity("monty-runtime 9.9.9"));
         assert!(!is_supported_worker_identity(
             "kiki 0.1.0 (monty-runtime 9.9.9)"
         ));
+        assert!(!is_supported_worker_identity("kiki  (monty-runtime 1.0.0)"));
         assert!(!is_supported_worker_identity(
-            "kiki  (monty-runtime 0.0.22)"
-        ));
-        assert!(!is_supported_worker_identity(
-            "other 0.1.0 (monty-runtime 0.0.22)"
+            "other 0.1.0 (monty-runtime 1.0.0)"
         ));
     }
 }

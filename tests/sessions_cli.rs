@@ -980,11 +980,7 @@ fn version_reports_the_embedded_monty_runtime() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        concat!(
-            "kiki ",
-            env!("CARGO_PKG_VERSION"),
-            " (monty-runtime 0.0.22)"
-        )
+        concat!("kiki ", env!("CARGO_PKG_VERSION"), " (monty-runtime 1.0.0)")
     );
 }
 

@@ -4242,7 +4242,7 @@ mod tests {
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
-            .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
+            .expect("MONTY_BIN must point to the monty-runtime 1.0.0 worker")
     }
 
     async fn arena(workspace: &TempDir) -> Arena {

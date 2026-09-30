@@ -5,7 +5,7 @@
 //! the `kiki` executable doubles as its own worker, so an installation is a
 //! single binary and `MONTY_BIN` is only an override.
 //!
-//! The loop is adapted from `monty-runtime` 0.0.22 `src/subprocess.rs`
+//! The loop is adapted from `monty-runtime` 1.0.0 `src/subprocess.rs`
 //! (MIT licence, Samuel Colvin / Pydantic). Keep it protocol-identical to
 //! `monty subprocess`, and keep `monty-proto`/`monty-alloc` pinned to the same
 //! version as `monty-pool`.
@@ -15,13 +15,14 @@
 //! crashed, which is how stack overflows and allocator aborts are reported.
 
 use std::ffi::OsStr;
-use std::{io, panic, process::ExitCode};
+use std::{io, panic, process::ExitCode, thread};
 
 use monty_proto::{
     FrameError, FrameReader, pb,
     worker::{Child, EventSink, HandleOutcome, fatal_error_event, protocol_violation},
     write_frame,
 };
+use monty_types::memory_limit_with_headroom;
 
 /// The argument monty-pool passes when it spawns a worker.
 const SUBCOMMAND: &str = "subprocess";
@@ -35,8 +36,24 @@ pub(crate) fn requested() -> bool {
     arguments.next().as_deref() == Some(OsStr::new(SUBCOMMAND)) && arguments.next().is_none()
 }
 
+/// The interpreter's container `repr`, `==` and value exporter recurse once
+/// per nesting level up to the 1000-frame recursion limit; give every OS the
+/// same reserved stack rather than relying on the main thread's.
+const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Runs the worker loop until EOF, `Shutdown`, or a fatal error.
 pub(crate) fn run() -> ExitCode {
+    thread::Builder::new()
+        .name("monty-worker".to_owned())
+        .stack_size(WORKER_STACK_SIZE)
+        .spawn(serve)
+        .expect("failed to spawn the worker thread")
+        .join()
+        // A panic has already written its `FatalError` frame in the panic hook.
+        .unwrap_or(ExitCode::from(101))
+}
+
+fn serve() -> ExitCode {
     install_panic_hook();
     let mut reader = FrameReader::new(io::stdin().lock());
     let mut child = Child::default();
@@ -98,7 +115,8 @@ pub(crate) fn run() -> ExitCode {
 /// `Configure`s, `Load`s and `Reset`s honest.
 fn apply_memory_limit(child: &Child) {
     let budget = child.session_budget();
-    monty_alloc::set_limit(budget.max_memory, budget.type_check)
+    let hard_memory_limit = memory_limit_with_headroom(budget.max_memory, budget.type_check);
+    monty_alloc::set_hard_limit(hard_memory_limit)
         .expect("kiki must install monty_alloc::LimitedAllocator as its global allocator");
 }
 

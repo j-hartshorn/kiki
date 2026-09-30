@@ -6453,9 +6453,9 @@ pub(crate) mod tests {
     const LIVE_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
     const LIVE_SETUP_OPENAI: &str =
-        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_ANTHROPIC: &str =
-        "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+        "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_MODEL: &str =
         "live test effective model is not the required model; set KIKI_MODEL to select it";
     const LIVE_SETUP_READ_TOOL: &str =
