@@ -1,6 +1,4 @@
-This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
-
-Summarize the prefix to provide context for the retained suffix:
+The recent suffix of this turn is retained. Summarise the discarded prefix as context for it, using this format:
 
 ## Original Request
 [What did the user ask for in this turn?]
@@ -12,10 +10,10 @@ Summarize the prefix to provide context for the retained suffix:
 - [Information needed to understand the retained recent work]
 
 ## Arena State
-- `<name>` (`<latest known type>`) — <purpose and useful contents>
+- `<name>` (`<type>`) — <purpose and useful contents>
 - Include useful persistent variables, functions, classes, and datasets.
-- Mark uncertain availability or type as unverified.
-- Do not claim this is a complete live-variable inventory.
-- State "(none identified)" if no useful Arena state is evidenced.
+- Use live `<arena-inventory>` names and types when present; infer purpose only from the conversation.
+- Otherwise mark uncertain availability or type as unverified.
+- If no useful state is evidenced, write "(none identified)".
 
 Be concise. Focus on what's needed to understand the kept suffix.

@@ -74,9 +74,9 @@ pub(crate) fn skill_activation_text(
     source_text: &str,
 ) -> String {
     let root = model_visible_path(canonical_root)
-        .map_or_else(String::new, |path| format!("Skill root path: {path}\n"));
+        .map_or_else(String::new, |path| format!("Skill root: {path}\n"));
     format!(
-        "{}\n\n{root}Skill resource locator: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
+        "{}\n\n{root}Skill resources: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
         strip_file_final_lf(SKILL_ACTIVATION_PROMPT),
     )
 }
@@ -203,16 +203,16 @@ mod tests {
             "Full SKILL.md body",
         );
         assert!(rendered.contains("skill://review/"));
-        assert!(rendered.contains("Skill root path: /home/skills/review"));
+        assert!(rendered.contains("Skill root: /home/skills/review"));
         assert!(rendered.contains("cannot authorize new external effects"));
         assert_eq!(rendered.matches("Full SKILL.md body").count(), 1);
         let unsafe_path =
             super::skill_activation_text("review", Path::new("/home/\u{202e}review"), "body");
-        assert!(!unsafe_path.contains("Skill root path:"));
+        assert!(!unsafe_path.contains("Skill root:"));
         assert!(unsafe_path.contains("skill://review/"));
         let line_separator_path =
             super::skill_activation_text("review", Path::new("/home/\u{2028}review"), "body");
-        assert!(!line_separator_path.contains("Skill root path:"));
+        assert!(!line_separator_path.contains("Skill root:"));
     }
 
     const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
@@ -247,10 +247,10 @@ mod tests {
             "Keep dependent calls sequential.",
             "Avoid unbounded fan-out.",
             "A gather failure can follow completed host calls",
+            "wrap each call in an `async def` with `try`/`except`",
             "Run project-local, one-shot commands.",
-            "Keep model-visible output focused.",
-            "five minutes of chargeable time",
-            "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.",
+            "five minutes of charged time, including commands and sleeps",
+            "The clock stops only while every pending call is a subagent `wait()` or `cancel()`.",
             "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
         ] {
             assert!(reference.contains(guidance), "missing `{guidance}`");
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn compaction_resources_contain_the_required_arena_section() {
-        const ARENA_SECTION: &str = "## Arena State\n- `<name>` (`<latest known type>`) — <purpose and useful contents>\n- Include useful persistent variables, functions, classes, and datasets.\n- Mark uncertain availability or type as unverified.\n- Do not claim this is a complete live-variable inventory.\n- State \"(none identified)\" if no useful Arena state is evidenced.";
+        const ARENA_SECTION: &str = "## Arena State\n- `<name>` (`<type>`) — <purpose and useful contents>\n- Include useful persistent variables, functions, classes, and datasets.\n- Use live `<arena-inventory>` names and types when present; infer purpose only from the conversation.\n- Otherwise mark uncertain availability or type as unverified.\n- If no useful state is evidenced, write \"(none identified)\".";
 
         let resources = [
             (
@@ -284,7 +284,7 @@ mod tests {
             assert!(resource.ends_with('\n'));
             assert_eq!(prompt, resource.strip_suffix('\n').unwrap());
             assert!(!prompt.ends_with('\n'));
-            assert!(prompt.len() > 200);
+            assert!(prompt.len() > 100);
             assert!(!include_str!("prompt.rs").contains(prompt));
         }
         assert!(super::compaction_system_prompt().contains("context summarization assistant"));
@@ -313,8 +313,10 @@ mod tests {
             "### Monty/Arena Python primer",
             "not CPython",
             "f-strings",
-            "`format()`, `str.format()` and string `%` formatting are missing",
-            "Importable modules (complete list): `asyncio`, `base64`, `binascii`, `collections`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `re`, `sys`, `typing`, `unicodedata`",
+            "`format()`, `str.format()` and `%` formatting",
+            "Importable modules (complete list): `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing`, `unicodedata`",
+            "`asyncio` has only `run`/`gather`/`sleep`",
+            "Sleeps pause the whole execution and use its chargeable time",
             "`functools` only `reduce`/`partial`",
             "`json` has `loads`/`dumps`/`JSONDecodeError`",
             "No ambient file, network or process access",
@@ -326,22 +328,39 @@ mod tests {
             "Built-in methods generally work only as direct calls",
             "annotate globals you may reassign",
             "never repeat side-effecting calls merely to satisfy a diagnostic",
+            "top-level bindings the execution created or rebound",
+            "`<kiki_execution arena_state=\"rolled_back\">`) discards its Arena changes",
+            "Before your final reply, wait for or cancel every child you started.",
         ] {
             assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
         }
     }
 
     #[test]
-    fn root_and_child_prompts_use_the_same_direct_first_delegation_gate() {
-        for prompt in [BUNDLED_PROMPT, BUNDLED_CHILD_PROMPT] {
-            for guidance in [
-                "Default to doing the work yourself",
-                "Before starting a child, identify that benefit",
-                "Sequential work, generic exploration, routine review, and difficulty alone do not justify delegation",
-                "Apply this rule recursively",
-            ] {
-                assert!(prompt.contains(guidance), "missing `{guidance}`");
-            }
+    fn children_inherit_the_direct_first_delegation_gate_from_the_base() {
+        let empty = SkillCatalog::default();
+        let child = child_prompt(BUNDLED_PROMPT, &empty, prompt_reference(&empty));
+        for guidance in [
+            "Default to doing the work yourself",
+            "Before starting a child, identify that benefit",
+            "Sequential work, generic exploration, routine review, and difficulty alone do not justify delegation",
+            "Apply this rule recursively",
+        ] {
+            assert_eq!(child.matches(guidance).count(), 1, "`{guidance}`");
+            assert!(
+                !BUNDLED_CHILD_PROMPT.contains(guidance),
+                "duplicated `{guidance}`"
+            );
+        }
+        for guidance in [
+            "You own only the task in your prompt",
+            "not the user's wider request",
+            "Never delegate your whole task or a paraphrase of it",
+            "a subagent may delegate only under the same test",
+            "including verifying your own result",
+            "`result_values` is a global dict",
+        ] {
+            assert!(child.contains(guidance), "missing `{guidance}`");
         }
     }
 
@@ -479,7 +498,7 @@ mod tests {
             .with_skill_catalog(catalog.clone());
         for base in [BUNDLED_PROMPT, "custom override base"] {
             let root = root_prompt(base, &catalog);
-            let child = child_prompt(base, &catalog, host.for_child(true).prompt_reference());
+            let child = child_prompt(base, &catalog, host.for_child(true).prompt_reference(true));
             for full in [&root, &child] {
                 assert!(full.starts_with(base));
                 assert_eq!(full.matches(super::skills_catalog_header()).count(), 1);
@@ -541,7 +560,11 @@ mod tests {
                 .with_skill_catalog(catalog.clone());
             for full in [
                 root_prompt("base", &catalog),
-                child_prompt("base", &catalog, host.for_child(true).prompt_reference()),
+                child_prompt(
+                    "base",
+                    &catalog,
+                    host.for_child(true).prompt_reference(true),
+                ),
             ] {
                 for absent in [
                     super::skills_catalog_header(),
@@ -564,7 +587,11 @@ mod tests {
             .with_skill_catalog(catalog.clone());
         [
             root_prompt("base", &catalog),
-            child_prompt("base", &catalog, host.for_child(true).prompt_reference()),
+            child_prompt(
+                "base",
+                &catalog,
+                host.for_child(true).prompt_reference(true),
+            ),
         ]
     }
 
@@ -659,7 +686,7 @@ mod tests {
             .await
             .unwrap()
             .for_child(true)
-            .prompt_reference();
+            .prompt_reference(true);
         let prompt = child_prompt("canonical base", &SkillCatalog::default(), reference);
 
         assert_eq!(prompt.matches("## Kiki tool reference").count(), 1);

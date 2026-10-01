@@ -1,45 +1,39 @@
-The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+Update the existing structured summary in `<previous-summary>` with the new messages above.
 
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
+Preserve existing information unless it is no longer relevant. Add new progress, decisions and context; move completed items from In Progress to Done; update Next Steps.
 
 Use this EXACT format:
 
 ## Goal
-[Preserve existing goals, add new ones if the task expanded]
+[Existing and new goals]
 
 ## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
+- [Existing and new constraints/preferences]
 
 ## Progress
 ### Done
-- [x] [Include previously done items AND newly completed items]
+- [x] [Previous and newly completed tasks]
 
 ### In Progress
-- [ ] [Current work - update based on progress]
+- [ ] [Current work]
 
 ### Blocked
-- [Current blockers - remove if resolved]
+- [Current blockers]
 
 ## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+- **[Decision]**: [Rationale]
 
 ## Next Steps
-1. [Update based on current state]
+1. [Ordered next steps]
 
 ## Critical Context
-- [Preserve important context, add new if needed]
+- [Important existing and new context]
 
 ## Arena State
-- `<name>` (`<latest known type>`) — <purpose and useful contents>
+- `<name>` (`<type>`) — <purpose and useful contents>
 - Include useful persistent variables, functions, classes, and datasets.
-- Mark uncertain availability or type as unverified.
-- Do not claim this is a complete live-variable inventory.
-- State "(none identified)" if no useful Arena state is evidenced.
+- Use live `<arena-inventory>` names and types when present; infer purpose only from the conversation.
+- Otherwise mark uncertain availability or type as unverified.
+- If no useful state is evidenced, write "(none identified)".
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.

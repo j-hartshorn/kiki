@@ -614,13 +614,13 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::Write,
         parameters: WRITE_PARAMETERS,
         result: ToolResultShape::None,
-        description: "Create or replace one complete UTF-8 workspace file.",
+        description: "Create or replace one complete UTF-8 workspace file. Replacing an existing file requires reading its current contents first.",
     },
     ToolDefinition {
         name: ToolName::Edit,
         parameters: EDIT_PARAMETERS,
         result: ToolResultShape::None,
-        description: "Replace one exact occurrence in a UTF-8 workspace file.",
+        description: "Replace text that occurs exactly once in a UTF-8 workspace file.",
     },
     ToolDefinition {
         name: ToolName::ListDir,
@@ -638,7 +638,7 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::Grep,
         parameters: GREP_PARAMETERS,
         result: ToolResultShape::RecordList(&GREP_MATCH),
-        description: "Search workspace file contents with a regular expression.",
+        description: "Regex-search workspace file contents.",
     },
     ToolDefinition {
         name: ToolName::Run,
@@ -660,16 +660,20 @@ pub(crate) fn bootstrap_source() -> String {
 
 pub(crate) fn type_check_stubs() -> String {
     format!(
-        "{}\n\nclass FileNotFoundError(OSError): ...\nclass IsADirectoryError(OSError): ...\nclass NotADirectoryError(OSError): ...\nclass PermissionError(OSError): ...\n\nresult_values: dict[str, object] = {{}}",
-        type_reference_source(&ACTIVE_TOOLS.iter().collect::<Vec<_>>())
+        "{}\n\nclass FileNotFoundError(OSError): ...\nclass IsADirectoryError(OSError): ...\nclass NotADirectoryError(OSError): ...\nclass PermissionError(OSError): ...\n\ndef format(value: object, format_spec: str = '', /) -> str: ...\n\nresult_values: dict[str, object] = {{}}",
+        type_reference_source(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), true)
     )
 }
 
 pub(crate) fn prompt_reference(catalog: &SkillCatalog) -> String {
-    prompt_reference_with_visibility(catalog.rendered_catalog().is_some(), false)
+    prompt_reference_with_visibility(catalog.rendered_catalog().is_some(), false, true)
 }
 
-fn prompt_reference_with_visibility(load_skill_visible: bool, read_only: bool) -> String {
+fn prompt_reference_with_visibility(
+    load_skill_visible: bool,
+    read_only: bool,
+    subagents_visible: bool,
+) -> String {
     prompt_reference_for(
         &ACTIVE_TOOLS
             .iter()
@@ -679,22 +683,32 @@ fn prompt_reference_with_visibility(load_skill_visible: bool, read_only: bool) -
             })
             .collect::<Vec<_>>(),
         read_only,
+        subagents_visible,
     )
 }
 
-fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> String {
-    let source = type_reference_source(definitions);
+fn prompt_reference_for(
+    definitions: &[&ToolDefinition],
+    read_only: bool,
+    subagents_visible: bool,
+) -> String {
+    let source = type_reference_source(definitions, subagents_visible);
+    let delegation_guidance = if subagents_visible {
+        ""
+    } else {
+        " Subagents are unavailable to you."
+    };
     let availability_guidance = if read_only {
-        " This Arena is read-only; write, edit, and run are unavailable."
+        " The workspace is read-only for you and any children; write, edit, and run are unavailable."
     } else {
         " Run project-local, one-shot commands."
     };
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{availability_guidance} Keep model-visible output focused. The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. To keep sibling results when some calls may fail, wrap each call in an `async def` with `try`/`except`.{availability_guidance}{delegation_guidance} Each `execute_python` call must finish within five minutes of charged time, including commands and sleeps. The clock stops only while every pending call is a subagent `wait()` or `cancel()`.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
-fn type_reference_source(definitions: &[&ToolDefinition]) -> String {
+fn type_reference_source(definitions: &[&ToolDefinition], subagents_visible: bool) -> String {
     let records = record_definitions(definitions)
         .into_iter()
         .map(ToolRecord::bootstrap_definition)
@@ -707,7 +721,7 @@ fn type_reference_source(definitions: &[&ToolDefinition]) -> String {
         Some("from dataclasses import dataclass".to_owned()),
         (!records.is_empty()).then(|| records.join("\n\n")),
         (!definitions.is_empty()).then(|| definitions.join("\n\n")),
-        Some(invocation_source(true)),
+        subagents_visible.then(|| invocation_source(true)),
     ]
     .into_iter()
     .flatten()
@@ -739,14 +753,17 @@ fn tool_source(reference: bool) -> String {
 
 const SUBAGENT_STATUS_FIELDS: &[(&str, &str)] = &[
     ("id", "str"),
-    ("state", "str"),
+    (
+        "state",
+        "str  # starting, running, stopping, completed, failed, cancelled or timed_out",
+    ),
     ("model", "str"),
     ("thinking", "str"),
     ("step_count", "int"),
     ("elapsed_ms", "int"),
     ("observed_at_ms", "int"),
     ("estimated_cost_usd", "float | None"),
-    ("cost_status", "str"),
+    ("cost_status", "str  # complete, lower_bound or unavailable"),
     ("error", "str | None"),
 ];
 
@@ -795,7 +812,7 @@ fn invocation_source(reference: bool) -> String {
         "    return SubagentTask(await _kiki_get_subagent(id))"
     };
     format!(
-        "@dataclass\nclass SubagentStatus:\n{}\n\nclass SubagentTask:\n{}{}\n\n    async def refresh(self) -> SubagentStatus:\n{refresh}\n\n    async def wait(self) -> dict:\n{wait}\n\n    async def cancel(self) -> SubagentStatus:\n{cancel}\n\nasync def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n    \"\"\"Start a subagent and return its task handle.\"\"\"\n{start}\n\nasync def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n    \"\"\"Start a subagent and wait for its result.\"\"\"\n{run}\n\nasync def get_subagent(id: str) -> SubagentTask:\n    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n{get}",
+        "@dataclass\nclass SubagentStatus:\n{}\n\nclass SubagentTask:\n{}{}\n\n    async def refresh(self) -> SubagentStatus:\n{refresh}\n\n    async def wait(self) -> dict:\n        \"\"\"Return {{'id', 'message', 'values'}}; raise TimeoutError if timed out, RuntimeError if failed or cancelled.\"\"\"\n{wait}\n\n    async def cancel(self) -> SubagentStatus:\n{cancel}\n\nasync def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n    \"\"\"Start a subagent. It sees only `prompt` and a copy of this Arena from before the current execution.\"\"\"\n{start}\n\nasync def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n    \"\"\"Start a subagent and wait for its result.\"\"\"\n{run}\n\nasync def get_subagent(id: str) -> SubagentTask:\n    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n{get}",
         interface_fields_source(SUBAGENT_STATUS_FIELDS),
         interface_fields_source(SUBAGENT_TASK_FIELDS),
         constructor.unwrap_or_default(),
@@ -1854,10 +1871,12 @@ impl ToolHost {
         )))
     }
 
-    pub(crate) fn prompt_reference(&self) -> String {
+    /// Children that cannot start subagents do not see the subagent functions.
+    pub(crate) fn prompt_reference(&self, can_delegate: bool) -> String {
         prompt_reference_with_visibility(
             self.skill_catalog.rendered_catalog().is_some(),
             self.read_only,
+            can_delegate,
         )
     }
 
@@ -7757,14 +7776,14 @@ mod tests {
             "@dataclass\n",
             "class SubagentStatus:\n",
             "    id: str\n",
-            "    state: str\n",
+            "    state: str  # starting, running, stopping, completed, failed, cancelled or timed_out\n",
             "    model: str\n",
             "    thinking: str\n",
             "    step_count: int\n",
             "    elapsed_ms: int\n",
             "    observed_at_ms: int\n",
             "    estimated_cost_usd: float | None\n",
-            "    cost_status: str\n",
+            "    cost_status: str  # complete, lower_bound or unavailable\n",
             "    error: str | None\n\n",
             "class SubagentTask:\n",
             "    id: str\n",
@@ -7772,11 +7791,12 @@ mod tests {
             "    async def refresh(self) -> SubagentStatus:\n",
             "        ...\n\n",
             "    async def wait(self) -> dict:\n",
+            "        \"\"\"Return {'id', 'message', 'values'}; raise TimeoutError if timed out, RuntimeError if failed or cancelled.\"\"\"\n",
             "        ...\n\n",
             "    async def cancel(self) -> SubagentStatus:\n",
             "        ...\n\n",
             "async def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n",
-            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n",
+            "    \"\"\"Start a subagent. It sees only `prompt` and a copy of this Arena from before the current execution.\"\"\"\n",
             "    ...\n\n",
             "async def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n",
             "    \"\"\"Start a subagent and wait for its result.\"\"\"\n",
@@ -7790,16 +7810,16 @@ mod tests {
             "    def __init__(self, value: dict):\n        self.id = value['id']\n        self.status = SubagentStatus(**value['status'])\n\n    async def refresh(self) -> SubagentStatus:\n        self.status = SubagentStatus(**await _kiki_refresh_subagent(self.id))\n        return self.status",
         )
         .replace(
-            "    async def wait(self) -> dict:\n        ...",
-            "    async def wait(self) -> dict:\n        outcome = await _kiki_wait_subagent(self.id)\n        self.status = SubagentStatus(**outcome['status'])\n        if outcome['outcome'] == 'completed':\n            return outcome['result']\n        if outcome['outcome'] == 'timed_out':\n            raise TimeoutError(outcome['error'])\n        raise RuntimeError(outcome['error'])",
+            "cancelled.\"\"\"\n        ...",
+            "cancelled.\"\"\"\n        outcome = await _kiki_wait_subagent(self.id)\n        self.status = SubagentStatus(**outcome['status'])\n        if outcome['outcome'] == 'completed':\n            return outcome['result']\n        if outcome['outcome'] == 'timed_out':\n            raise TimeoutError(outcome['error'])\n        raise RuntimeError(outcome['error'])",
         )
         .replace(
             "    async def cancel(self) -> SubagentStatus:\n        ...",
             "    async def cancel(self) -> SubagentStatus:\n        self.status = SubagentStatus(**await _kiki_cancel_subagent(self.id))\n        return self.status",
         )
         .replace(
-            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n    ...",
-            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n    return SubagentTask(await _kiki_start_subagent(prompt, model, read_only))",
+            "current execution.\"\"\"\n    ...",
+            "current execution.\"\"\"\n    return SubagentTask(await _kiki_start_subagent(prompt, model, read_only))",
         )
         .replace(
             "    \"\"\"Start a subagent and wait for its result.\"\"\"\n    ...",
@@ -7860,10 +7880,10 @@ mod tests {
                     "    \"\"\"Read one complete UTF-8 workspace file or skill:// resource.\"\"\"\n",
                     "    return await _kiki_read(path)\n\n",
                     "async def write(path: str, content: str) -> None:\n",
-                    "    \"\"\"Create or replace one complete UTF-8 workspace file.\"\"\"\n",
+                    "    \"\"\"Create or replace one complete UTF-8 workspace file. Replacing an existing file requires reading its current contents first.\"\"\"\n",
                     "    await _kiki_write(path, content)\n\n",
                     "async def edit(path: str, old: str, new: str) -> None:\n",
-                    "    \"\"\"Replace one exact occurrence in a UTF-8 workspace file.\"\"\"\n",
+                    "    \"\"\"Replace text that occurs exactly once in a UTF-8 workspace file.\"\"\"\n",
                     "    await _kiki_edit(path, old, new)\n\n",
                     "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
                     "    \"\"\"List immediate workspace or skill:// directory entries.\"\"\"\n",
@@ -7872,7 +7892,7 @@ mod tests {
                     "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
                     "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]\n\n",
                     "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:\n",
-                    "    \"\"\"Search workspace file contents with a regular expression.\"\"\"\n",
+                    "    \"\"\"Regex-search workspace file contents.\"\"\"\n",
                     "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]\n\n",
                     "async def run(command: str, cwd: str = \".\") -> CommandResult:\n",
                     "    \"\"\"Run one project-local shell command.\"\"\"\n",
@@ -7901,12 +7921,34 @@ mod tests {
         assert_eq!(reference.matches("class CommandResult:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("Run project-local, one-shot commands."));
-        assert!(reference.contains("five minutes of chargeable time"));
+        assert!(reference.contains("five minutes of charged time, including commands and sleeps"));
         assert!(reference.contains(
-            "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged."
+            "The clock stops only while every pending call is a subagent `wait()` or `cancel()`."
         ));
         assert!(!reference.contains("five-minute deadline"));
         assert!(reference.contains("    ..."));
+    }
+
+    #[tokio::test]
+    async fn children_that_cannot_delegate_see_no_subagent_functions() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        let delegating = host.prompt_reference(true);
+        assert!(delegating.contains("async def start_subagent("));
+        assert!(!delegating.contains("Subagents are unavailable to you."));
+
+        let leaf = host.prompt_reference(false);
+        for omitted in [
+            "start_subagent",
+            "run_subagent",
+            "get_subagent",
+            "class SubagentTask:",
+        ] {
+            assert!(!leaf.contains(omitted), "leaf reference retained {omitted}");
+        }
+        assert!(leaf.contains("Subagents are unavailable to you."));
+        assert!(leaf.contains("async def read(path: str) -> str:"));
     }
 
     #[tokio::test]
@@ -7915,11 +7957,11 @@ mod tests {
         fs::write(workspace.path().join("file"), "before").unwrap();
         let root = tool_host(&workspace).await;
         let root_reference = prompt_reference(&SkillCatalog::default());
-        assert_eq!(root.prompt_reference(), root_reference);
-        assert_eq!(root.for_child(false).prompt_reference(), root_reference);
+        assert_eq!(root.prompt_reference(true), root_reference);
+        assert_eq!(root.for_child(false).prompt_reference(true), root_reference);
 
         let child = root.for_child(true);
-        let reference = child.prompt_reference();
+        let reference = child.prompt_reference(true);
         for signature in [
             "async def read(path: str) -> str:",
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
@@ -7942,7 +7984,7 @@ mod tests {
         }
 
         let descendant = child.for_child(false);
-        assert_eq!(descendant.prompt_reference(), reference);
+        assert_eq!(descendant.prompt_reference(true), reference);
         assert_eq!(read(&descendant, "file").await.unwrap(), "before");
 
         let path = normalise_path("file").unwrap();

@@ -1334,11 +1334,13 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
         let prompt_base = self.prompt_base.clone();
         let models = self.models.clone();
         let trace = child.trace();
-        let (id, caller, _parent, _depth, parameters, payload, reporter, coordinator) =
+        let (id, caller, _parent, depth, parameters, payload, reporter, coordinator) =
             child.into_parts();
         let (request, selection, read_only) = parameters.into_parts();
         let accepted_thinking = payload.accepted_thinking.clone();
-        let tool_reference = payload.source.prompt_reference(read_only);
+        let tool_reference = payload
+            .source
+            .prompt_reference(read_only, coordinator.admits_children_of(depth));
         let child_prompt =
             child_prompt(&prompt_base, payload.source.skill_catalog(), tool_reference);
         let model = models.create(child_prompt);
@@ -2463,6 +2465,11 @@ impl Task {
 }
 
 impl<P: Send + 'static> SubagentCoordinator<P> {
+    /// Whether a task at `depth` may start subagents of its own.
+    pub(crate) fn admits_children_of(&self, depth: usize) -> bool {
+        self.policy.allow_nested && depth < self.policy.max_depth
+    }
+
     pub(crate) fn new(policy: SubagentPolicy, runner: Arc<dyn ChildRunner<P>>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -4106,7 +4113,7 @@ mod tests {
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
-            .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
+            .expect("MONTY_BIN must point to the monty-runtime 1.0.0 worker")
     }
 
     #[derive(Clone)]
@@ -4355,6 +4362,20 @@ mod tests {
             max_depth: 4,
             timeout: Duration::from_secs(900),
         }
+    }
+
+    #[test]
+    fn only_tasks_below_the_depth_limit_with_nesting_enabled_admit_children() {
+        let (nested, _) = coordinator(policy());
+        assert!(nested.admits_children_of(1));
+        assert!(nested.admits_children_of(3));
+        assert!(!nested.admits_children_of(4));
+
+        let (flat, _) = coordinator(SubagentPolicy {
+            allow_nested: false,
+            ..policy()
+        });
+        assert!(!flat.admits_children_of(1));
     }
 
     fn coordinator(

@@ -1,4 +1,4 @@
-The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+Summarise the conversation above as a structured checkpoint for another LLM to continue the work.
 
 Use this EXACT format:
 
@@ -30,10 +30,10 @@ Use this EXACT format:
 - [Or "(none)" if not applicable]
 
 ## Arena State
-- `<name>` (`<latest known type>`) — <purpose and useful contents>
+- `<name>` (`<type>`) — <purpose and useful contents>
 - Include useful persistent variables, functions, classes, and datasets.
-- Mark uncertain availability or type as unverified.
-- Do not claim this is a complete live-variable inventory.
-- State "(none identified)" if no useful Arena state is evidenced.
+- Use live `<arena-inventory>` names and types when present; infer purpose only from the conversation.
+- Otherwise mark uncertain availability or type as unverified.
+- If no useful state is evidenced, write "(none identified)".
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.

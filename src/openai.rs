@@ -6407,7 +6407,7 @@ pub(crate) mod tests {
 
             step(&fixture, &history).await.unwrap();
 
-            let canonical_summary = "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\nstored summary\n</summary>";
+            let canonical_summary = "Earlier history is summarised below. Arena variables, functions, classes and data survive compaction unchanged. Treat unverified Arena details as historical evidence; inspect them before relying on them.\n\n<summary>\nstored summary\n</summary>";
             assert_eq!(
                 fixture.request().body,
                 expected_request(
@@ -6453,9 +6453,9 @@ pub(crate) mod tests {
     const LIVE_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
     const LIVE_SETUP_OPENAI: &str =
-        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_ANTHROPIC: &str =
-        "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+        "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_MODEL: &str =
         "live test effective model is not the required model; set KIKI_MODEL to select it";
     const LIVE_SETUP_READ_TOOL: &str =

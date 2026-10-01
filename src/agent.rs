@@ -5,7 +5,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
-    Arena, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
+    Arena, ArenaBinding, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
     InterruptedExecution, Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
 use crate::config::{
@@ -663,13 +663,22 @@ impl<M: Model> Agent<M> {
             return Ok(CompactionResult::NoOp);
         };
 
+        let inventory = self
+            .arena
+            .current_bindings(cancellation)
+            .await
+            .filter(|bindings| !bindings.is_empty())
+            .map(|bindings| render_arena_inventory(&bindings));
         let mut attempts = Vec::new();
         let mut outputs = Vec::new();
         let mut failure = None;
         let mut provider_started = false;
-        for request in preparation.requests().iter().cloned() {
+        for mut request in preparation.requests().iter().cloned() {
             if cancellation.is_cancelled() {
                 break;
+            }
+            if let Some(inventory) = &inventory {
+                request.input.insert_str(0, inventory);
             }
             let mut attempt_started = || {
                 if !provider_started {
@@ -1538,7 +1547,7 @@ fn persisted_code(
     }
 }
 
-const CANCELLATION_WARNING: &str = "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled.";
+const CANCELLATION_WARNING: &str = "Execution cancelled; Python Arena changes discarded. Completed external effects may remain; pending actions were cancelled.";
 
 fn interrupted_execution(error: &ArenaError) -> Option<&InterruptedExecution> {
     match error {
@@ -1577,14 +1586,18 @@ fn contains_cancellation(error: &ArenaError) -> bool {
 
 fn interruption_feedback(evidence: &ExecutionEvidence, state: &str) -> String {
     let mut frames = vec![format!(
-        "<kiki_execution state=\"{state}\" began=\"{}\">",
-        evidence.began
+        "<kiki_execution state=\"{state}\" began=\"{}\" arena_state=\"{}\">",
+        evidence.began,
+        if evidence.began {
+            "rolled_back"
+        } else {
+            "unchanged"
+        },
     )];
     if !evidence.began {
         frames.push("Execution did not begin.".to_owned());
     }
-    append_output(&mut frames, "stdout", &evidence.stdout);
-    append_output(&mut frames, "stderr", &evidence.stderr);
+    append_outputs(&mut frames, &evidence.stdout, &evidence.stderr);
     if let Some(warning) = &evidence.cancellation_warning {
         frames.push(warning.clone());
     }
@@ -1594,8 +1607,7 @@ fn interruption_feedback(evidence: &ExecutionEvidence, state: &str) -> String {
 
 fn execution_feedback(execution: &Execution) -> String {
     let mut frames = Vec::new();
-    append_output(&mut frames, "stdout", &execution.stdout);
-    append_output(&mut frames, "stderr", &execution.stderr);
+    append_outputs(&mut frames, &execution.stdout, &execution.stderr);
     match &execution.outcome {
         ExecutionOutcome::Complete {
             result: Some(result),
@@ -1603,7 +1615,7 @@ fn execution_feedback(execution: &Execution) -> String {
             let truncated = result.tail.is_some();
             frames.push(render_result(result));
             if truncated {
-                frames.push(truncation_warning("result"));
+                frames.push(truncation_warning("result", "Result"));
             }
         }
         ExecutionOutcome::Complete { result: None } => {}
@@ -1614,26 +1626,63 @@ fn execution_feedback(execution: &Execution) -> String {
             }
         }
         ExecutionOutcome::TypeCheckError(error) => {
+            let truncated = if error.omitted_bytes > 0 {
+                " (diagnostics truncated)"
+            } else {
+                ""
+            };
             frames.push(format!(
-                "<kiki_type_check_error omitted_bytes=\"{}\" arena_state=\"unchanged\">\nType check failed before execution:\n{}</kiki_type_check_error>",
+                "<kiki_type_check_error omitted_bytes=\"{}\" arena_state=\"unchanged\">\nType check failed before execution{truncated}:\n{}</kiki_type_check_error>",
                 error.omitted_bytes, error.text
             ));
-            if error.omitted_bytes > 0 {
-                frames.push("<kiki_warning code=\"type_check_error_truncated\" arena_state=\"unchanged\">\nType-check diagnostics were truncated. No Python code was executed.\n</kiki_warning>".to_owned());
-            }
         }
+    }
+    if !execution.changed_bindings.is_empty() {
+        frames.push(render_changed_bindings(&execution.changed_bindings));
     }
     frames.join("\n")
 }
 
-fn append_output(frames: &mut Vec<String>, stream: &str, observation: &Observation) {
-    if observation.total_bytes == 0 {
-        return;
+fn render_arena_inventory(bindings: &[ArenaBinding]) -> String {
+    let mut rendered = "<arena-inventory>\n".to_owned();
+    for binding in bindings.iter().take(INVENTORIED_BINDINGS) {
+        rendered.push_str(&format!("{}: {}\n", binding.name, binding.type_name));
     }
-    let truncated = observation.tail.is_some();
-    frames.push(render_output(stream, observation));
+    if bindings.len() > INVENTORIED_BINDINGS {
+        rendered.push_str(&format!(
+            "({} more)\n",
+            bindings.len() - INVENTORIED_BINDINGS
+        ));
+    }
+    rendered.push_str("</arena-inventory>\n\n");
+    rendered
+}
+
+const INVENTORIED_BINDINGS: usize = 200;
+const LISTED_BINDINGS: usize = 50;
+
+fn render_changed_bindings(bindings: &[ArenaBinding]) -> String {
+    let mut rendered = format!("<kiki_arena_bindings changed=\"{}\">\n", bindings.len());
+    for binding in bindings.iter().take(LISTED_BINDINGS) {
+        rendered.push_str(&format!("{}: {}\n", binding.name, binding.type_name));
+    }
+    if bindings.len() > LISTED_BINDINGS {
+        rendered.push_str(&format!("({} more)\n", bindings.len() - LISTED_BINDINGS));
+    }
+    rendered.push_str("</kiki_arena_bindings>");
+    rendered
+}
+
+fn append_outputs(frames: &mut Vec<String>, stdout: &Observation, stderr: &Observation) {
+    let mut truncated = false;
+    for (stream, observation) in [("stdout", stdout), ("stderr", stderr)] {
+        if observation.total_bytes > 0 {
+            truncated |= observation.tail.is_some();
+            frames.push(render_output(stream, observation));
+        }
+    }
     if truncated {
-        frames.push(truncation_warning("output"));
+        frames.push(truncation_warning("output", "Output"));
     }
 }
 
@@ -1648,35 +1697,33 @@ fn render_result(observation: &Observation) -> String {
 fn render_observation(tag: &str, extra_attributes: &str, observation: &Observation) -> String {
     let truncated = observation.tail.is_some();
     let mut rendered = format!(
-        "<{tag}{extra_attributes} truncated=\"{truncated}\" total_lines=\"{}\" total_bytes=\"{}\">\n<kiki_output_head lines=\"{}\" bytes=\"{}\" ends_mid_line=\"{}\">\n{}",
-        observation.total_lines,
-        observation.total_bytes,
-        observation.head_lines,
-        observation.head.len(),
-        observation.head_ends_mid_line,
-        observation.head,
+        "<{tag}{extra_attributes} truncated=\"{truncated}\" total_lines=\"{}\" total_bytes=\"{}\">\n",
+        observation.total_lines, observation.total_bytes,
     );
-    rendered.push_str("</kiki_output_head>\n");
-    if let Some(tail) = &observation.tail {
-        rendered.push_str(&format!(
-            "<kiki_output_omitted lines=\"{}\" bytes=\"{}\" partial_lines=\"{}\" />\n<kiki_output_tail lines=\"{}\" bytes=\"{}\" starts_mid_line=\"{}\">\n{}",
+    match &observation.tail {
+        // Untruncated, the head is the whole observation.
+        None => rendered.push_str(&observation.head),
+        Some(tail) => rendered.push_str(&format!(
+            "<kiki_output_head lines=\"{}\" bytes=\"{}\" ends_mid_line=\"{}\">\n{}</kiki_output_head>\n<kiki_output_omitted lines=\"{}\" bytes=\"{}\" />\n<kiki_output_tail lines=\"{}\" bytes=\"{}\" starts_mid_line=\"{}\">\n{}</kiki_output_tail>\n",
+            observation.head_lines,
+            observation.head.len(),
+            observation.head_ends_mid_line,
+            observation.head,
             observation.omitted_lines,
             observation.omitted_bytes,
-            observation.partial_lines,
             observation.tail_lines,
             tail.len(),
             observation.tail_starts_mid_line,
             tail,
-        ));
-        rendered.push_str("</kiki_output_tail>\n");
+        )),
     }
     rendered.push_str(&format!("</{tag}>"));
     rendered
 }
 
-fn truncation_warning(kind: &str) -> String {
+fn truncation_warning(code: &str, subject: &str) -> String {
     format!(
-        "<kiki_warning code=\"{kind}_truncated\" arena_state=\"committed\">\nExecution completed, but its model-visible {kind} was truncated. The underlying arena values were not changed. Print a smaller selection to inspect the omitted data.\n</kiki_warning>"
+        "<kiki_warning code=\"{code}_truncated\">\n{subject} truncated; truncation does not change Arena values. Print a smaller selection.\n</kiki_warning>"
     )
 }
 
@@ -1688,7 +1735,7 @@ fn render_error(error: &PythonError) -> String {
 }
 
 fn error_truncation_warning() -> String {
-    "<kiki_warning code=\"error_truncated\" arena_state=\"committed\">\nExecution completed with a Python error, but its model-visible error was truncated. The underlying arena values were not changed.\n</kiki_warning>".to_owned()
+    "<kiki_warning code=\"error_truncated\">\nPython error truncated; truncation does not change Arena values.\n</kiki_warning>".to_owned()
 }
 
 #[cfg(test)]
@@ -1713,8 +1760,8 @@ mod tests {
         GenerationEvidenceBuilder, OverflowRecovery, TerminalEvidence,
     };
     use crate::arena::{
-        Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
-        ToolCallSummary, ToolName,
+        Arena, ArenaBinding, ArenaError, Execution, ExecutionOutcome, Observation, PythonError,
+        ToolCall, ToolCallSummary, ToolName,
     };
     use crate::config::settings::CrossProviderReasoning;
     use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection};
@@ -1739,7 +1786,7 @@ mod tests {
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
-            .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
+            .expect("MONTY_BIN must point to the monty-runtime 1.0.0 worker")
     }
 
     fn default_selection() -> ModelSelection {
@@ -2226,6 +2273,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_requests_lead_with_the_live_arena_inventory() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(Vec::new()).with_summary_responses(vec![
+                "first summary".to_owned(),
+                "second summary".to_owned(),
+            ]),
+        )
+        .await;
+        agent
+            .arena
+            .execute("rows = [1]\ntotal = 1", &CancellationToken::new())
+            .await
+            .expect("seed arena state");
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let policy = CompactionSettings::new(16_384, 20_000);
+        let prepared = writer
+            .prepare_compaction(
+                policy,
+                selection,
+                CrossProviderReasoning::Inline,
+                String::new(),
+                crate::session::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("compaction should remove a prefix")
+            .requests()
+            .to_vec();
+
+        agent
+            .compact(
+                CompactionReason::Manual,
+                policy,
+                selection,
+                CrossProviderReasoning::Inline,
+                String::new(),
+                &CancellationToken::new(),
+                &writer,
+                &mut || {},
+            )
+            .await
+            .expect("settle compaction");
+
+        let sent = agent.model.summary_requests();
+        assert_eq!(sent.len(), prepared.len());
+        for (sent, prepared) in sent.iter().zip(&prepared) {
+            assert_eq!(
+                sent.input,
+                format!(
+                    "<arena-inventory>\nrows: list\ntotal: int\n</arena-inventory>\n\n{}",
+                    prepared.input
+                )
+            );
+        }
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
     async fn manual_compaction_uses_the_prepared_summary_calls_and_commits_once() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -2684,7 +2799,9 @@ mod tests {
         assert_eq!(
             code.result(),
             &CodeResult::Execution {
-                feedback: String::new(),
+                feedback:
+                    "<kiki_arena_bindings changed=\"1\">\npayload: str\n</kiki_arena_bindings>"
+                        .to_owned(),
             }
         );
         assert!(
@@ -4609,7 +4726,9 @@ mod tests {
         assert_eq!(
             feedback,
             &CodeResult::Execution {
-                feedback: String::new()
+                feedback:
+                    "<kiki_arena_bindings changed=\"1\">\nresult: dict\n</kiki_arena_bindings>"
+                        .to_owned()
             }
         );
     }
@@ -4660,7 +4779,7 @@ mod tests {
         assert_eq!(
             completed.result(),
             &CodeResult::Execution {
-                feedback: "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\nhello\n</kiki_output_head>\n</kiki_output>".to_owned(),
+                feedback: "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\nhello\n</kiki_output>".to_owned(),
             }
         );
     }
@@ -5480,7 +5599,7 @@ mod tests {
                 assert!(!feedback.contains("boundary summary"));
                 assert!(feedback.contains("Execution did not begin."));
                 assert!(feedback.contains(
-                    "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled."
+                    "Execution cancelled; Python Arena changes discarded. Completed external effects may remain; pending actions were cancelled."
                 ));
             } else {
                 assert_eq!(result.unwrap().text(), "returned final");
@@ -5624,8 +5743,9 @@ mod tests {
         let feedback = evidence.feedback();
         assert!(!feedback.contains("tool calls"));
         assert!(feedback.contains("before\n"));
+        assert!(feedback.contains("began=\"true\" arena_state=\"rolled_back\""));
         assert!(feedback.contains(
-            "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled."
+            "Execution cancelled; Python Arena changes discarded. Completed external effects may remain; pending actions were cancelled."
         ));
         let recovered = agent
             .arena
@@ -5994,6 +6114,48 @@ mod tests {
     }
 
     #[test]
+    fn agent_lists_changed_arena_bindings_after_the_outcome() {
+        let mut execution = Execution {
+            stdout: super::empty_observation(),
+            stderr: super::empty_observation(),
+            outcome: ExecutionOutcome::PythonError(PythonError {
+                text: "ValueError: late".to_owned(),
+                omitted_bytes: 0,
+            }),
+            tool_calls: Vec::new(),
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
+            changed_bindings: vec![
+                ArenaBinding {
+                    name: "rows".to_owned(),
+                    type_name: "list".to_owned(),
+                },
+                ArenaBinding {
+                    name: "total".to_owned(),
+                    type_name: "int".to_owned(),
+                },
+            ],
+        };
+
+        let feedback = super::execution_feedback(&execution);
+        assert!(feedback.ends_with(
+            "<kiki_arena_bindings changed=\"2\">\nrows: list\ntotal: int\n</kiki_arena_bindings>"
+        ));
+        assert!(feedback.find("ValueError") < feedback.find("<kiki_arena_bindings"));
+
+        execution.changed_bindings = (0..60)
+            .map(|index| ArenaBinding {
+                name: format!("value_{index:02}"),
+                type_name: "int".to_owned(),
+            })
+            .collect();
+        let feedback = super::execution_feedback(&execution);
+        assert!(feedback.contains("<kiki_arena_bindings changed=\"60\">\nvalue_00: int\n"));
+        assert!(feedback.contains("value_49: int\n(10 more)\n</kiki_arena_bindings>"));
+        assert!(!feedback.contains("value_50"));
+    }
+
+    #[test]
     fn agent_frames_stdout_stderr_and_result_in_order_without_escaping_raw_content() {
         let execution = Execution {
             stdout: observation(
@@ -6043,6 +6205,7 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: vec![PathBuf::from("private/effect-sentinel")],
             modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
+            changed_bindings: Vec::new(),
         };
 
         let feedback = super::execution_feedback(&execution);
@@ -6052,31 +6215,46 @@ mod tests {
             feedback,
             concat!(
                 "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n",
-                "<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\n",
-                "<raw>&</kiki_output_head>\n",
-                "</kiki_output>\n",
+                "<raw>&</kiki_output>\n",
                 "<kiki_output stream=\"stderr\" truncated=\"true\" total_lines=\"4\" total_bytes=\"8\">\n",
                 "<kiki_output_head lines=\"2\" bytes=\"4\" ends_mid_line=\"false\">\n",
                 "a\nb\n</kiki_output_head>\n",
-                "<kiki_output_omitted lines=\"1\" bytes=\"2\" partial_lines=\"false\" />\n",
+                "<kiki_output_omitted lines=\"1\" bytes=\"2\" />\n",
                 "<kiki_output_tail lines=\"1\" bytes=\"2\" starts_mid_line=\"false\">\n",
                 "d\n</kiki_output_tail>\n",
                 "</kiki_output>\n",
-                "<kiki_warning code=\"output_truncated\" arena_state=\"committed\">\n",
-                "Execution completed, but its model-visible output was truncated. The underlying arena values were not changed. Print a smaller selection to inspect the omitted data.\n",
+                "<kiki_warning code=\"output_truncated\">\n",
+                "Output truncated; truncation does not change Arena values. Print a smaller selection.\n",
                 "</kiki_warning>\n",
                 "<kiki_result truncated=\"true\" total_lines=\"1\" total_bytes=\"10\">\n",
                 "<kiki_output_head lines=\"1\" bytes=\"4\" ends_mid_line=\"true\">\n",
                 "res<</kiki_output_head>\n",
-                "<kiki_output_omitted lines=\"0\" bytes=\"2\" partial_lines=\"true\" />\n",
+                "<kiki_output_omitted lines=\"0\" bytes=\"2\" />\n",
                 "<kiki_output_tail lines=\"1\" bytes=\"4\" starts_mid_line=\"true\">\n",
                 ">ult</kiki_output_tail>\n",
                 "</kiki_result>\n",
-                "<kiki_warning code=\"result_truncated\" arena_state=\"committed\">\n",
-                "Execution completed, but its model-visible result was truncated. The underlying arena values were not changed. Print a smaller selection to inspect the omitted data.\n",
+                "<kiki_warning code=\"result_truncated\">\n",
+                "Result truncated; truncation does not change Arena values. Print a smaller selection.\n",
                 "</kiki_warning>"
             )
         );
+
+        let mut both = execution.clone();
+        both.stdout = both.stderr.clone();
+        let feedback = super::execution_feedback(&both);
+        assert_eq!(
+            feedback
+                .matches("stream=\"stdout\" truncated=\"true\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            feedback
+                .matches("stream=\"stderr\" truncated=\"true\"")
+                .count(),
+            1
+        );
+        assert_eq!(feedback.matches("code=\"output_truncated\"").count(), 1);
     }
 
     fn result_head(execution: &Execution) -> &str {
@@ -6168,19 +6346,18 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
+            changed_bindings: Vec::new(),
         };
 
         assert_eq!(
             super::execution_feedback(&execution),
             concat!(
                 "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"7\">\n",
-                "<kiki_output_head lines=\"1\" bytes=\"7\" ends_mid_line=\"false\">\n",
-                "output\n</kiki_output_head>\n",
-                "</kiki_output>\n",
+                "output\n</kiki_output>\n",
                 "<kiki_error omitted_bytes=\"3\">\n",
                 "<error></kiki_error>\n",
-                "<kiki_warning code=\"error_truncated\" arena_state=\"committed\">\n",
-                "Execution completed with a Python error, but its model-visible error was truncated. The underlying arena values were not changed.\n",
+                "<kiki_warning code=\"error_truncated\">\n",
+                "Python error truncated; truncation does not change Arena values.\n",
                 "</kiki_warning>"
             )
         );

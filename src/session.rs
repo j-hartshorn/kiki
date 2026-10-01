@@ -4242,7 +4242,7 @@ mod tests {
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
-            .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
+            .expect("MONTY_BIN must point to the monty-runtime 1.0.0 worker")
     }
 
     async fn arena(workspace: &TempDir) -> Arena {
@@ -5152,6 +5152,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
+                changed_bindings: Vec::new(),
             }),
             attempts: Vec::new(),
         };
@@ -5610,6 +5611,7 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
+            changed_bindings: Vec::new(),
         }
     }
 
@@ -5791,6 +5793,7 @@ mod tests {
                 tool_calls,
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
+                changed_bindings: Vec::new(),
             },
         )
         .await
@@ -7459,6 +7462,7 @@ mod tests {
             ],
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
+            changed_bindings: Vec::new(),
         };
         let (_, execution) = settle_fixture_execution_with(
             &session,
@@ -8624,6 +8628,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 read_paths: vec![PathBuf::from("a-b"), PathBuf::from("a/b")],
                 modified_paths: vec![PathBuf::from("m-n"), PathBuf::from("m/n")],
+                changed_bindings: Vec::new(),
             },
         )
         .await;
@@ -9701,6 +9706,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     read_paths: Vec::new(),
                     modified_paths: Vec::new(),
+                    changed_bindings: Vec::new(),
                 },
                 vec![crate::model::AttemptAccounting::UsageUnavailable],
             )],
@@ -10587,6 +10593,7 @@ mod tests {
                                     tool_calls: Vec::new(),
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
+                                    changed_bindings: Vec::new(),
                                 }),
                                 attempts: Vec::new(),
                             },
@@ -10956,6 +10963,7 @@ mod tests {
                             tool_calls: Vec::new(),
                             read_paths: Vec::new(),
                             modified_paths: Vec::new(),
+                            changed_bindings: Vec::new(),
                         }),
                         attempts: Vec::new(),
                     },
@@ -11098,6 +11106,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
+                changed_bindings: Vec::new(),
             }),
             attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
         };
@@ -11266,6 +11275,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
+                changed_bindings: Vec::new(),
             }),
             attempts: Vec::new(),
         };

@@ -747,7 +747,7 @@ fn resolve_worker_path(
             Some(StartupProblem::new(
                 StartupProblemKind::WorkerPathMissing,
                 "Kiki could not locate its own executable to run the embedded Monty worker.",
-                "Set MONTY_BIN to the absolute path of a kiki or monty-runtime 0.0.22 executable, then restart Kiki.",
+                "Set MONTY_BIN to the absolute path of a kiki or monty-runtime 1.0.0 executable, then restart Kiki.",
                 secrets,
             )),
         );
@@ -760,7 +760,7 @@ fn resolve_worker_path(
                 "MONTY_BIN must be an absolute path, but is `{}`.",
                 worker_path.display()
             ),
-            "Set MONTY_BIN to the absolute path of a kiki or monty-runtime 0.0.22 executable, or unset it, then restart Kiki.",
+            "Set MONTY_BIN to the absolute path of a kiki or monty-runtime 1.0.0 executable, or unset it, then restart Kiki.",
             secrets,
         )
     });

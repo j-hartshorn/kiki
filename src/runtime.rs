@@ -16415,9 +16415,11 @@ mod tests {
             feedback,
             concat!(
                 "<kiki_result truncated=\"false\" total_lines=\"1\" total_bytes=\"9\">\n",
-                "<kiki_output_head lines=\"1\" bytes=\"9\" ends_mid_line=\"false\">\n",
-                "'missing'</kiki_output_head>\n",
-                "</kiki_result>"
+                "'missing'</kiki_result>\n",
+                "<kiki_arena_bindings changed=\"6\">\n",
+                "descendant: SubagentTask\nfailed: SubagentTask\nparent: SubagentTask\n",
+                "parent_result: dict\nrecoverable: SubagentTask\nrecoverable_result: dict\n",
+                "</kiki_arena_bindings>"
             )
         );
         let context_debug = format!("{contexts:#?}");
@@ -17589,7 +17591,7 @@ mod tests {
         };
         assert_eq!(
             feedback,
-            "<kiki_execution state=\"cancelled\" began=\"false\">\nExecution did not begin.\nExecution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled.\n</kiki_execution>"
+            "<kiki_execution state=\"cancelled\" began=\"false\" arena_state=\"unchanged\">\nExecution did not begin.\nExecution cancelled; Python Arena changes discarded. Completed external effects may remain; pending actions were cancelled.\n</kiki_execution>"
         );
         assert!(matches!(
             restore.records.last().map(|record| &record.kind),
