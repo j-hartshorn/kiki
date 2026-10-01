@@ -219,7 +219,7 @@ impl PromptEditor {
         true
     }
 
-    fn move_to(&mut self, caret: usize) -> bool {
+    pub(crate) fn move_to(&mut self, caret: usize) -> bool {
         if self.caret == caret {
             return false;
         }
@@ -348,8 +348,32 @@ fn append_line_rows(rows: &mut Vec<VisualRow>, text: &str, start: usize, end: us
 
     let mut row_start = start;
     let mut row_width = 0_usize;
+    let mut word_start = true;
     for (offset, grapheme) in text[start..end].grapheme_indices(true) {
         let grapheme_start = start + offset;
+        let whitespace = grapheme.chars().all(char::is_whitespace);
+        if word_start && !whitespace {
+            // Look ahead only once per word. Keep fitting words together, but
+            // leave oversized words to the grapheme-wrap fallback below.
+            let word_width: usize = text[grapheme_start..end]
+                .graphemes(true)
+                .take_while(|part| !part.chars().all(char::is_whitespace))
+                .map(|part| Line::raw(part).width())
+                .sum();
+            if grapheme_start > row_start
+                && word_width <= width
+                && row_width.saturating_add(word_width) > width
+            {
+                rows.push(VisualRow {
+                    start: row_start,
+                    end: grapheme_start,
+                    width: row_width,
+                });
+                row_start = grapheme_start;
+                row_width = 0;
+            }
+        }
+        word_start = whitespace;
         let grapheme_width = Line::raw(grapheme).width();
         if grapheme_start > row_start && row_width.saturating_add(grapheme_width) > width {
             rows.push(VisualRow {
@@ -652,6 +676,88 @@ mod tests {
         assert!(editor.apply(PromptEdit::PromptStart, 3));
         let layout = editor.layout(3, 2);
         assert_eq!(rows_with_sources(&layout), [("ab", 0..2), ("界c", 2..6)]);
+    }
+
+    #[test]
+    fn word_wrap_moves_a_fitting_word_without_dropping_its_separator() {
+        let mut editor = from_text("hello world");
+        let layout = editor.layout(8, 10);
+        assert_eq!(
+            rows_with_sources(&layout),
+            [("hello ", 0..6), ("world", 6..11)]
+        );
+        assert_eq!(layout.cursor(), Some((1, 5)));
+        assert_eq!(editor.text(), "hello world");
+    }
+
+    #[test]
+    fn word_wrap_preserves_spaces_newlines_and_absolute_utf8_sources() {
+        let mut editor = from_text("  one  two \n\ncafé 界\n");
+        let layout = editor.layout(6, 10);
+        assert_eq!(
+            rows_with_sources(&layout),
+            [
+                ("  one ", 0..6),
+                (" two ", 6..11),
+                ("", 12..12),
+                ("café ", 13..19),
+                ("界", 19..22),
+                ("", 23..23),
+            ]
+        );
+        assert_eq!(layout.cursor(), Some((5, 0)));
+        assert_eq!(editor.take(), "  one  two \n\ncafé 界\n");
+    }
+
+    #[test]
+    fn word_wrap_falls_back_to_intact_graphemes_for_oversized_words() {
+        let mut editor = from_text("a e\u{301}🧑\u{200d}💻界b");
+        let layout = editor.layout(4, 10);
+        assert_eq!(
+            rows_with_sources(&layout),
+            [
+                ("a e\u{301}", 0..5),
+                ("🧑\u{200d}💻界", 5..19),
+                ("b", 19..20),
+            ]
+        );
+        assert_eq!(layout.cursor(), Some((2, 1)));
+
+        let mut editor = from_text("界e\u{301}");
+        let layout = editor.layout(1, 10);
+        assert_eq!(
+            rows_with_sources(&layout),
+            [("界", 0..3), ("e\u{301}", 3..6), ("", 6..6)]
+        );
+        assert_eq!(layout.cursor(), Some((2, 0)));
+    }
+
+    #[test]
+    fn word_wrap_reflows_and_tracks_the_caret_through_visible_sources() {
+        let mut editor = from_text("one two three");
+        let layout = editor.layout(6, 2);
+        assert_eq!(
+            rows_with_sources(&layout),
+            [("two ", 4..8), ("three", 8..13)]
+        );
+        assert_eq!(layout.cursor(), Some((1, 5)));
+
+        assert!(editor.apply(PromptEdit::PromptStart, 6));
+        let layout = editor.layout(6, 2);
+        assert_eq!(rows_with_sources(&layout), [("one ", 0..4), ("two ", 4..8)]);
+        assert_eq!(layout.cursor(), Some((0, 0)));
+        assert!(editor.apply(PromptEdit::Down, 6));
+        let layout = editor.layout(6, 2);
+        assert_eq!(rows_with_sources(&layout), [("one ", 0..4), ("two ", 4..8)]);
+        assert_eq!(layout.cursor(), Some((1, 0)));
+
+        let layout = editor.layout(13, 10);
+        assert_eq!(
+            rows_with_sources(&layout),
+            [("one two three", 0..13), ("", 13..13)]
+        );
+        assert_eq!(layout.cursor(), Some((0, 4)));
+        assert_eq!(editor.text(), "one two three");
     }
 
     #[test]

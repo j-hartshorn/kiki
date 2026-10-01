@@ -26,6 +26,7 @@ use rattles::TickedRattler;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::clipboard::{ClipboardPort, LocalClipboard};
 use crate::config::models::{CATALOGUE, Provider};
@@ -198,6 +199,9 @@ struct App {
     mode: AppMode,
     prompt: PromptEditor,
     prompt_width: u16,
+    prompt_view: Option<(Rect, PromptLayout)>,
+    prompt_drag: Option<usize>,
+    prompt_selection: Option<Range<usize>>,
     transcript: Transcript,
     subagent_monitor: subagents::SubagentMonitor,
     foreground_cancellation_requested: bool,
@@ -251,6 +255,9 @@ impl Default for App {
             mode: AppMode::Configured,
             prompt: PromptEditor::default(),
             prompt_width: 80,
+            prompt_view: None,
+            prompt_drag: None,
+            prompt_selection: None,
             transcript: Transcript::default(),
             subagent_monitor: subagents::SubagentMonitor::default(),
             foreground_cancellation_requested: false,
@@ -425,6 +432,10 @@ impl App {
             return update;
         }
         let notice_cleared = self.clear_notice();
+        if let Some(mut update) = self.handle_prompt_mouse(mouse) {
+            update.visible_changed |= notice_cleared;
+            return update;
+        }
         let mut update = match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_older(MOUSE_WHEEL_SCROLL_ROWS),
             MouseEventKind::ScrollDown => self.scroll_newer(MOUSE_WHEEL_SCROLL_ROWS),
@@ -441,6 +452,69 @@ impl App {
         update
     }
 
+    fn prompt_position(&self, column: u16, row: u16, clamp: bool) -> Option<usize> {
+        let (area, layout) = self.prompt_view.as_ref()?;
+        if area.is_empty() || layout.rows().is_empty() {
+            return None;
+        }
+        if !clamp && !area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let row = row.clamp(area.y, area.bottom().saturating_sub(1));
+        let index = usize::from(row - area.y).min(layout.rows().len() - 1);
+        let visual = &layout.rows()[index];
+        if self.prompt.text().get(visual.source()) != Some(visual.text()) {
+            return None;
+        }
+        let target = usize::from(column.saturating_sub(area.x));
+        let mut cells = 0;
+        for (offset, grapheme) in visual.text().grapheme_indices(true) {
+            cells += Line::raw(grapheme).width();
+            if target < cells {
+                return Some(visual.source().start + offset);
+            }
+        }
+        Some(visual.source().end)
+    }
+
+    fn handle_prompt_mouse(&mut self, mouse: MouseEvent) -> Option<Update> {
+        if self.is_submission_disabled()
+            || self.compact_acknowledgement_pending
+            || self.picker.is_some()
+            || self.tree_navigator.is_some()
+        {
+            return None;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let caret = self.prompt_position(mouse.column, mouse.row, false)?;
+                self.invalidate_selection();
+                self.prompt_drag = Some(caret);
+                self.prompt.move_to(caret);
+                self.refresh_completion();
+            }
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                let anchor = self.prompt_drag?;
+                let focus = self.prompt_position(mouse.column, mouse.row, true)?;
+                self.prompt_selection =
+                    (anchor != focus).then_some(anchor.min(focus)..anchor.max(focus));
+                if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                    self.prompt_drag = None;
+                    if let Some(range) = &self.prompt_selection {
+                        self.pending_copy_text = Some(self.prompt.text()[range.clone()].to_owned());
+                    }
+                    self.prompt.move_to(focus);
+                    self.refresh_completion();
+                }
+            }
+            _ => return None,
+        }
+        Some(Update {
+            visible_changed: true,
+            ..Update::default()
+        })
+    }
+
     fn handle_slash_overlay_mouse(&mut self, mouse: MouseEvent) -> Option<Update> {
         if !matches!(
             mouse.kind,
@@ -452,6 +526,13 @@ impl App {
             .is_some_and(|overlay| overlay.contains(Position::new(mouse.column, mouse.row)))
         {
             return None;
+        }
+        if self.prompt_drag.take().is_some() {
+            let visible_changed = self.prompt_selection.take().is_some();
+            return Some(Update {
+                visible_changed,
+                ..Update::default()
+            });
         }
         let Some(_) = self.drag.take() else {
             return Some(Update::default());
@@ -479,12 +560,17 @@ impl App {
         } else {
             false
         };
+        let prompt_selection_cleared = self.prompt_selection.take().is_some();
+        self.prompt_drag = None;
         let mut update = self.handle_key_inner(key, now);
+        update.visible_changed |= prompt_selection_cleared;
         update.visible_changed |= notice_cleared;
         update
     }
 
     fn handle_paste(&mut self, text: &str) -> Update {
+        let selection_cleared = self.prompt_selection.take().is_some();
+        self.prompt_drag = None;
         let notice_cleared = if !self.is_tree_loading() {
             self.clear_notice()
         } else {
@@ -502,7 +588,10 @@ impl App {
         };
         Update {
             commands: Vec::new(),
-            visible_changed: prompt_changed || self.refresh_completion() || notice_cleared,
+            visible_changed: prompt_changed
+                || self.refresh_completion()
+                || notice_cleared
+                || selection_cleared,
             quit: false,
         }
     }
@@ -1465,11 +1554,14 @@ impl App {
 
     fn invalidate_selection_with_status(&mut self, keep_status: bool) -> bool {
         let preserve_status = keep_status && matches!(&self.notice, Some(Notice::Status(_)));
-        let visible_changed = self.selection.is_some()
+        let visible_changed = self.prompt_selection.is_some()
+            || self.selection.is_some()
             || (!preserve_status && self.notice.is_some())
             || self.flash.is_some();
         self.selection = None;
         self.drag = None;
+        self.prompt_drag = None;
+        self.prompt_selection = None;
         self.pending_copy = false;
         if !preserve_status {
             self.notice = None;
@@ -2708,6 +2800,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     let area = frame.area();
+    app.prompt_view = None;
     if let Some(stale_overlay) = app.slash_overlay.take() {
         frame.render_widget(Clear, stale_overlay.intersection(area));
     }
@@ -2957,7 +3050,19 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             && app.picker.is_none()
             && app.tree_navigator.is_none(),
         slash::recognised_token_range(app.prompt.text()),
+        app.prompt_selection
+            .as_ref()
+            .filter(|_| app.flash.as_ref().is_none_or(|flash| flash.highlighted)),
     );
+    app.prompt_view = Some((
+        Rect::new(
+            content.x.saturating_add(PROMPT_GUTTER_WIDTH),
+            content.y,
+            content.width.saturating_sub(PROMPT_GUTTER_WIDTH),
+            content.height,
+        ),
+        prompt,
+    ));
     frame.render_widget(
         Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
         bottom_rule,
@@ -3061,6 +3166,7 @@ fn render_prompt(
     content: Rect,
     cursor_visible: bool,
     recognised_token: Option<Range<usize>>,
+    selection: Option<&Range<usize>>,
 ) {
     if content.height == 0 {
         return;
@@ -3092,6 +3198,29 @@ fn render_prompt(
             content.height,
         ),
     );
+    if let Some(selection) = selection {
+        for (row_index, row) in prompt.rows().iter().enumerate() {
+            let mut column = 0;
+            for (offset, grapheme) in row.text().grapheme_indices(true) {
+                let width = Line::raw(grapheme).width();
+                let start = row.source().start + offset;
+                if start < selection.end && start + grapheme.len() > selection.start {
+                    for cell_column in column..column + width {
+                        if cell_column < usize::from(text_width)
+                            && row_index < usize::from(content.height)
+                        {
+                            let cell = &mut frame.buffer_mut()[(
+                                content.x + PROMPT_GUTTER_WIDTH + cell_column as u16,
+                                content.y + row_index as u16,
+                            )];
+                            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                        }
+                    }
+                }
+                column += width;
+            }
+        }
+    }
     if cursor_visible
         && let Some((row, column)) = prompt.cursor()
         && let (Ok(row), Ok(column)) = (u16::try_from(row), u16::try_from(column))
@@ -5232,9 +5361,9 @@ mod tests {
     #[test]
     fn slash_exact_token_style_crosses_soft_wraps_and_leaves_ordinary_drafts_plain() {
         let mut wrapped = app_with_prompt("/model arg");
-        let buffer = rendered_buffer(&mut wrapped, 5, 18);
+        let buffer = rendered_buffer(&mut wrapped, 5, 21);
         let (token_column, token_row) = cell_start(&buffer, "/mo");
-        let (argument_column, argument_row) = cell_start(&buffer, " ar");
+        let (argument_column, argument_row) = cell_start(&buffer, "arg");
 
         for column in token_column..token_column + 3 {
             assert_eq!(buffer[(column, token_row)].fg, Color::Cyan);
@@ -5258,7 +5387,7 @@ mod tests {
         );
 
         assert!(wrapped.handle_key(key(KeyCode::Left)).visible_changed);
-        let interior = rendered_buffer(&mut wrapped, 5, 18);
+        let interior = rendered_buffer(&mut wrapped, 5, 21);
         assert_eq!(interior[(token_column, token_row)].fg, Color::Cyan);
         assert!(
             interior[(token_column, token_row)]
@@ -7592,6 +7721,156 @@ mod tests {
             FakeInput::new([Some(Event::Paste(String::new())), Some(quit_event())]);
         assert_eq!(run_transcript_loop(&mut notice, &mut notice_input), 2);
         assert!(notice.notice().is_none());
+    }
+
+    #[test]
+    fn prompt_mouse_selection_preserves_unicode_newlines_and_soft_wraps() {
+        let mut app = app_with_prompt("ab界cd\nsecond line");
+        let (_, position) = cursor(&mut app, 10, 18);
+        let now = Instant::now();
+        // Select backwards from the visible tail to the start of its preceding row.
+        let start_row = position.y.saturating_sub(1);
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                position.x,
+                position.y,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, start_row),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 2, start_row),
+            now,
+        );
+        let mut clipboard = FakeClipboard::available();
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(clipboard.writes, ["second line"]);
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                position.x,
+                position.y,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 2, start_row - 1),
+            now,
+        );
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(clipboard.writes[1], "ab界cd\nsecond line");
+
+        let mut unicode = app_with_prompt("a界e\u{301}z");
+        cursor(&mut unicode, 20, 12);
+        unicode.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 4, 10),
+            now,
+        );
+        unicode.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 4, 10),
+            now,
+        );
+        type_prompt(&mut unicode, "X");
+        assert_eq!(unicode.prompt.text(), "aX界e\u{301}z");
+    }
+
+    #[test]
+    fn prompt_mouse_click_is_ignored_when_input_is_disabled() {
+        let mut app = app_with_prompt("hello");
+        cursor(&mut app, 20, 12);
+        app.handle_event(RuntimeEvent::RuntimeDisabled {
+            reason: RuntimeDisabledReason::OpenAiAuthentication,
+        });
+        let now = Instant::now();
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 10),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 2, 10),
+            now,
+        );
+        assert!(app.prompt.caret_at_end());
+        let mut clipboard = FakeClipboard::available();
+        assert!(!app.finish_pending_copy(&mut clipboard, now));
+    }
+
+    #[test]
+    fn prompt_mouse_click_does_not_copy_and_editing_clears_selection() {
+        let mut app = app_with_prompt("hello");
+        cursor(&mut app, 20, 12);
+        let now = Instant::now();
+        let mut clipboard = FakeClipboard::available();
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 10),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 3, 10),
+            now,
+        );
+        assert!(!app.finish_pending_copy(&mut clipboard, now));
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 10),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 5, 10),
+            now,
+        );
+        app.finish_pending_copy(&mut clipboard, now);
+        type_prompt(&mut app, "X");
+        let buffer = rendered_buffer(&mut app, 20, 12);
+        assert!(!buffer[(2, 10)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(app.prompt.text(), "helXlo");
+    }
+
+    #[test]
+    fn prompt_mouse_drag_copies_exact_text_on_release() {
+        let mut app = app_with_prompt("alpha beta");
+        cursor(&mut app, 20, 12);
+        let now = Instant::now();
+        let mut clipboard = FakeClipboard::available();
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 10),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 7, 10),
+            now,
+        );
+        let buffer = rendered_buffer(&mut app, 20, 12);
+        assert!(buffer[(2, 10)].modifier.contains(Modifier::REVERSED));
+        assert!(!app.finish_pending_copy(&mut clipboard, now));
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 7, 10),
+            now,
+        );
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(clipboard.writes, ["alpha"]);
+        assert_eq!(app.prompt.text(), "alpha beta");
+        assert_eq!(app.notice(), Some("Copied"));
+    }
+
+    #[test]
+    fn prompt_mouse_click_places_the_cursor_for_insertion() {
+        let mut app = app_with_prompt("abcdef");
+        cursor(&mut app, 20, 12);
+        let now = Instant::now();
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 4, 10),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 4, 10),
+            now,
+        );
+        type_prompt(&mut app, "X");
+        assert_eq!(submitted_prompt(&mut app), "abXcdef");
     }
 
     #[test]
