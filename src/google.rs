@@ -1479,11 +1479,19 @@ mod tests {
     }
 
     fn tool_stream() -> String {
+        tool_stream_from(0)
+    }
+
+    fn tool_stream_from(first_index: usize) -> String {
         stream(
             vec![
-                thought(0, &["Checking ", "the file"], "sig-1"),
-                model_output(1, "I'll run it."),
-                function_call(2, "call_1", &[r#"{"code":"pri"#, r#"nt(1)"}"#]),
+                thought(first_index, &["Checking ", "the file"], "sig-1"),
+                model_output(first_index + 1, "I'll run it."),
+                function_call(
+                    first_index + 2,
+                    "call_1",
+                    &[r#"{"code":"pri"#, r#"nt(1)"}"#],
+                ),
             ],
             "requires_action",
             final_usage(),
@@ -1791,42 +1799,45 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_stream_returns_code_with_commentary_reasoning_preview_and_replay() {
-        let fixture = Fixture::start(FixtureReply::OwnedSse(tool_stream())).await;
+        for first_index in [0, 3] {
+            let fixture =
+                Fixture::start(FixtureReply::OwnedSse(tool_stream_from(first_index))).await;
 
-        let (result, progress) = step(&fixture, &history("inspect")).await;
-        let step = result.unwrap();
+            let (result, progress) = step(&fixture, &history("inspect")).await;
+            let step = result.unwrap();
 
-        assert_eq!(
-            step.action,
-            ModelAction::Code {
-                source: "print(1)".to_owned(),
-                call_id: ModelCallId::new("call_1"),
-                commentary: Some("I'll run it.".to_owned()),
-            }
-        );
-        assert_eq!(step.reasoning_summary, "Checking the file");
-        assert_eq!(step.replay.provider(), "google");
-        assert_eq!(replay_values(&step.replay), tool_steps());
-        assert_eq!(step.attempts, vec![expected_accounting()]);
-        assert_eq!(
-            progress.first(),
-            Some(&ModelProgress::AttemptStarted { attempt: 1 })
-        );
-        assert_eq!(
-            progress.last(),
-            Some(&ModelProgress::AttemptSettled {
-                attempt: 1,
-                accounting: expected_accounting(),
-            })
-        );
-        assert_eq!(
-            streamed(&progress),
-            (
-                "Checking the file".to_owned(),
-                "I'll run it.".to_owned(),
-                "print(1)".to_owned()
-            )
-        );
+            assert_eq!(
+                step.action,
+                ModelAction::Code {
+                    source: "print(1)".to_owned(),
+                    call_id: ModelCallId::new("call_1"),
+                    commentary: Some("I'll run it.".to_owned()),
+                }
+            );
+            assert_eq!(step.reasoning_summary, "Checking the file");
+            assert_eq!(step.replay.provider(), "google");
+            assert_eq!(replay_values(&step.replay), tool_steps());
+            assert_eq!(step.attempts, vec![expected_accounting()]);
+            assert_eq!(
+                progress.first(),
+                Some(&ModelProgress::AttemptStarted { attempt: 1 })
+            );
+            assert_eq!(
+                progress.last(),
+                Some(&ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: expected_accounting(),
+                })
+            );
+            assert_eq!(
+                streamed(&progress),
+                (
+                    "Checking the file".to_owned(),
+                    "I'll run it.".to_owned(),
+                    "print(1)".to_owned()
+                )
+            );
+        }
     }
 
     #[tokio::test]
@@ -2084,42 +2095,6 @@ mod tests {
                 .validate_history(&annotated_replay, selection())
                 .unwrap_err(),
             ModelError::InvalidHistory("opaque Google replay is malformed")
-        );
-    }
-
-    #[tokio::test]
-    async fn non_zero_increasing_step_indices_assemble_in_order() {
-        let offset_stream = stream(
-            vec![
-                thought(3, &["Checking ", "the file"], "sig-1"),
-                model_output(4, "I'll run it."),
-                function_call(5, "call_1", &[r#"{"code":"pri"#, r#"nt(1)"}"#]),
-            ],
-            "requires_action",
-            final_usage(),
-        );
-        let fixture = Fixture::start(FixtureReply::OwnedSse(offset_stream)).await;
-
-        let (result, progress) = step(&fixture, &history("inspect")).await;
-        let step = result.unwrap();
-
-        assert_eq!(
-            step.action,
-            ModelAction::Code {
-                source: "print(1)".to_owned(),
-                call_id: ModelCallId::new("call_1"),
-                commentary: Some("I'll run it.".to_owned()),
-            }
-        );
-        assert_eq!(step.reasoning_summary, "Checking the file");
-        assert_eq!(replay_values(&step.replay), tool_steps());
-        assert_eq!(
-            streamed(&progress),
-            (
-                "Checking the file".to_owned(),
-                "I'll run it.".to_owned(),
-                "print(1)".to_owned()
-            )
         );
     }
 
