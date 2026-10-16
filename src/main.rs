@@ -4,7 +4,6 @@ pub mod arena;
 mod clipboard;
 mod compaction;
 pub mod config;
-#[cfg(test)]
 mod google;
 mod highlight;
 mod login;
@@ -72,6 +71,7 @@ fn production_model(
         &prompt::root_prompt(ready.prompt_base(), catalog),
         ready.api_key(Provider::OpenAi).map(ApiKey::expose),
         ready.api_key(Provider::Anthropic).map(ApiKey::expose),
+        ready.api_key(Provider::Google).map(ApiKey::expose),
         anthropic_cache_ttl,
         cross_provider_reasoning,
     )

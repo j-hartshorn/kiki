@@ -2574,15 +2574,16 @@ mod tests {
     };
     use crate::config::{
         DEFAULT_MODEL, ModelSelection, SessionPreferences,
-        models::{LUNA, OPUS_5_5, Provider, SOL, TERRA},
+        models::{GEMINI_4_ARGON, LUNA, OPUS_5_5, Provider, SOL, TERRA},
         settings::{CacheTtl, CrossProviderReasoning},
     };
+    use crate::google::GoogleModel;
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay,
         ScriptedAction as ModelAction, ScriptedModel, SkillActivation, SummaryRequest,
-        SummaryResult,
+        SummaryResult, canonical_compaction_summary,
     };
     use crate::openai::OpenAiModel;
     use crate::session::{
@@ -15100,30 +15101,42 @@ mod tests {
         assert_eq!(shutdown_controller(commands, task).await.len(), 2);
     }
 
-    struct GatedAuthenticationFailureModel {
+    struct GatedModel<M> {
         started: Arc<Notify>,
         release: Arc<Notify>,
+        inner: M,
     }
 
-    impl Model for GatedAuthenticationFailureModel {
+    impl<M: Model> Model for GatedModel<M> {
+        fn validate_history(
+            &self,
+            history: &ModelHistory,
+            selection: ModelSelection,
+        ) -> Result<(), ModelError> {
+            self.inner.validate_history(history, selection)
+        }
+
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
-            _selection: ModelSelection,
-            _history: &'a ModelHistory,
-            _cancellation: &'a CancellationToken,
-            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+            selection: ModelSelection,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
                 self.started.notify_one();
                 self.release.notified().await;
-                Err(provider_failure(401))
+                self.inner
+                    .step(selection, history, cancellation, progress)
+                    .await
             }
         }
     }
 
-    async fn authentication_failure_after_mid_run_selection(
+    async fn authentication_failure_after_mid_run_selection<M: Model>(
+        model: M,
         run: ModelSelection,
         accepted_mid_run: ModelSelection,
     ) -> Vec<RuntimeEvent> {
@@ -15132,9 +15145,10 @@ mod tests {
         let release = Arc::new(Notify::new());
         let controller = controller_with_model(
             &workspace,
-            GatedAuthenticationFailureModel {
+            GatedModel {
                 started: started.clone(),
                 release: release.clone(),
+                inner: model,
             },
         )
         .await
@@ -15167,6 +15181,10 @@ mod tests {
     async fn anthropic_authentication_failure_after_an_accepted_openai_selection_disables_as_anthropic()
      {
         let settled = authentication_failure_after_mid_run_selection(
+            StatusThenMessageModel {
+                status: 401,
+                steps: 0,
+            },
             ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap(),
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
         )
@@ -15190,6 +15208,10 @@ mod tests {
     async fn openai_authentication_failure_after_an_accepted_anthropic_selection_disables_as_openai()
      {
         let settled = authentication_failure_after_mid_run_selection(
+            StatusThenMessageModel {
+                status: 401,
+                steps: 0,
+            },
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
             ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap(),
         )
@@ -15207,6 +15229,245 @@ mod tests {
             [RuntimeDisabledReason::Authentication(Provider::OpenAi)],
             "{settled:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn google_authentication_failure_after_mid_run_selection_disables_with_run_provider() {
+        let google_selection =
+            ModelSelection::new(&GEMINI_4_ARGON, GEMINI_4_ARGON.default_thinking).unwrap();
+        let openai_selection = ModelSelection::new(&SOL, SOL.default_thinking).unwrap();
+        let anthropic_selection =
+            ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap();
+
+        for (code, body) in [
+            (
+                401,
+                serde_json::json!({
+                    "error": {
+                        "code": 401,
+                        "message": "Request had invalid authentication credentials.",
+                        "status": "UNAUTHENTICATED"
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                400,
+                serde_json::json!({
+                    "error": {
+                        "code": 400,
+                        "message": "API key not valid. Please pass a valid API key.",
+                        "status": "INVALID_ARGUMENT",
+                        "details": [{
+                            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                            "reason": "API_KEY_INVALID",
+                            "domain": "googleapis.com"
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+        ] {
+            for accepted_mid_run in [openai_selection, anthropic_selection] {
+                let fixture = Fixture::start(FixtureReply::OwnedStatus {
+                    code,
+                    headers: Vec::new(),
+                    body: body.clone(),
+                })
+                .await;
+                let settled = authentication_failure_after_mid_run_selection(
+                    GoogleModel::with_endpoint(
+                        "system prompt",
+                        "google-key",
+                        &fixture.endpoint,
+                        CrossProviderReasoning::Inline,
+                    ),
+                    google_selection,
+                    accepted_mid_run,
+                )
+                .await;
+                let disabled = settled
+                    .iter()
+                    .filter_map(|event| match event {
+                        RuntimeEvent::RuntimeDisabled { reason } => Some(reason.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    disabled,
+                    [RuntimeDisabledReason::Authentication(Provider::Google)],
+                    "HTTP {code} -> {accepted_mid_run:?}: {settled:?}"
+                );
+            }
+        }
+
+        for (run, expected_provider) in [
+            (openai_selection, Provider::OpenAi),
+            (anthropic_selection, Provider::Anthropic),
+        ] {
+            let settled = authentication_failure_after_mid_run_selection(
+                StatusThenMessageModel {
+                    status: 401,
+                    steps: 0,
+                },
+                run,
+                google_selection,
+            )
+            .await;
+            let disabled = settled
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::RuntimeDisabled { reason } => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                disabled,
+                [RuntimeDisabledReason::Authentication(expected_provider)],
+                "{settled:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_google_authentication_failure_keeps_the_key_and_request_metadata_private() {
+        const KEY: &str = "AIzaSy-runtime-hostile-credential";
+        const METADATA: &str = "req_google_runtime_hostile_metadata";
+        for (code, body, expected_message) in [
+            (
+                401,
+                serde_json::json!({
+                    "error": {
+                        "code": 401,
+                        "message": format!("invalid x-goog-api-key {KEY}"),
+                        "status": "UNAUTHENTICATED"
+                    }
+                })
+                .to_string(),
+                "model provider failed: authentication failure (HTTP 401) [UNAUTHENTICATED]: invalid x-goog-api-key [REDACTED]",
+            ),
+            (
+                400,
+                serde_json::json!({
+                    "error": {
+                        "code": 400,
+                        "message": format!("API key not valid {KEY}. Please pass a valid API key."),
+                        "status": "INVALID_ARGUMENT",
+                        "details": [{
+                            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                            "reason": "API_KEY_INVALID",
+                            "domain": "googleapis.com",
+                            "metadata": {"request": METADATA}
+                        }]
+                    }
+                })
+                .to_string(),
+                "model provider failed: authentication failure (HTTP 400) [INVALID_ARGUMENT]: API key not valid [REDACTED]. Please pass a valid API key.",
+            ),
+        ] {
+            let fixture = Fixture::start(FixtureReply::OwnedStatus {
+                code,
+                headers: vec![("x-request-id".to_owned(), METADATA.to_owned())],
+                body,
+            })
+            .await;
+            let workspace = tempfile::tempdir().unwrap();
+            let mut controller = controller_with_model(
+                &workspace,
+                GoogleModel::with_endpoint(
+                    "system prompt",
+                    KEY,
+                    &fixture.endpoint,
+                    CrossProviderReasoning::Inline,
+                ),
+            )
+            .await
+            .with_selection(
+                ModelSelection::new(&GEMINI_4_ARGON, GEMINI_4_ARGON.default_thinking).unwrap(),
+            );
+            let home = controller.test_home.take().expect("persisted test home");
+            let session_id = controller.test_session.as_ref().unwrap().id().to_owned();
+            let (commands, mut events, mut progress, task) = start_controller(controller);
+
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: "inspect".to_owned(),
+                    activation: None,
+                })
+                .await
+                .unwrap();
+            let settled = events_until_settled(&mut events).await;
+            let progress = drain_progress(&mut progress);
+            let records = shutdown_controller(commands, task).await;
+
+            assert_eq!(fixture.request_count(), 1);
+            assert!(
+                settled.contains(&RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::Authentication(Provider::Google),
+                }),
+                "{settled:?}"
+            );
+            let [
+                _,
+                StoredRecord {
+                    record: Record::FailedRun { message, .. },
+                    ..
+                },
+            ] = records.as_slice()
+            else {
+                panic!("expected a failed Run after the request: {records:?}");
+            };
+            assert_eq!(message, expected_message);
+
+            let mut transcript = Transcript::default();
+            for event in settled.iter().cloned() {
+                transcript.apply(event, false);
+            }
+            let layout = transcript.layout(1024);
+            let height = u16::try_from(layout.total_height()).expect("test transcript height");
+            let mut buffer =
+                ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1024, height));
+            layout.render(buffer.area, 0, &mut buffer);
+            let rendered = buffer
+                .content
+                .chunks(1024)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                transcript.status(),
+                "Google authentication failed; restart Kiki"
+            );
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+
+            let observable = format!("{settled:?}\n{progress:?}\n{records:?}\n{rendered}");
+            assert!(!observable.contains(KEY), "{observable}");
+            assert!(!observable.contains(METADATA), "{observable}");
+
+            let session = Session::open(home.path(), &session_id).expect("reopen failed session");
+            let restored = session.restore().expect("restore failed Run");
+            assert_eq!(
+                restored_initial_state(&restored).timeline,
+                records
+                    .into_iter()
+                    .map(RestoredTimelineItem::Record)
+                    .collect::<Vec<_>>()
+            );
+            session.close().expect("close failed session");
+            for entry in fs::read_dir(home.path().join(".kiki/sessions")).unwrap() {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                for secret in [KEY, METADATA] {
+                    assert!(
+                        !bytes
+                            .windows(secret.len())
+                            .any(|window| window == secret.as_bytes()),
+                        "{} persisted {secret}",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -15569,6 +15830,418 @@ mod tests {
         for opaque in ["openai-encrypted", "rs_1", "fc_1", "msg_1", "summary_text"] {
             assert!(!body.contains(opaque), "{opaque} leaked into {body}");
         }
+        session.close().expect("close session");
+    }
+
+    fn google_sse(events: &[serde_json::Value]) -> FixtureReply {
+        FixtureReply::OwnedSse(format!(
+            "{}event: done\ndata: [DONE]\n\n",
+            events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["event_type"].as_str().unwrap()
+                    )
+                })
+                .collect::<String>()
+        ))
+    }
+
+    fn google_message(text: &str) -> FixtureReply {
+        google_sse(&[
+            serde_json::json!({
+                "event_type": "interaction.created",
+                "interaction": {
+                    "id": "int_google",
+                    "model": "gemini-4-argon",
+                    "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "event_type": "step.start",
+                "index": 0,
+                "step": {"type": "model_output"}
+            }),
+            serde_json::json!({
+                "event_type": "step.delta",
+                "index": 0,
+                "delta": {"type": "text", "text": text}
+            }),
+            serde_json::json!({"event_type": "step.stop", "index": 0}),
+            serde_json::json!({
+                "event_type": "interaction.completed",
+                "interaction": {
+                    "id": "int_google",
+                    "model": "gemini-4-argon",
+                    "status": "completed",
+                    "usage": {
+                        "total_input_tokens": 1,
+                        "total_cached_tokens": 0,
+                        "total_output_tokens": 1,
+                        "total_thought_tokens": 0,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_saved_openai_session_reopens_and_continues_on_google_from_semantic_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let openai = Fixture::start_sequence(vec![
+            openai_completed(serde_json::json!([
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Checking the sum"}],
+                    "encrypted_content": "openai-encrypted-code",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "I'll add them.", "annotations": []}],
+                    "status": "completed"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "execute_python",
+                    "arguments": r#"{"code":"print(40 + 2)"}"#,
+                    "status": "completed"
+                }
+            ])),
+            openai_completed(serde_json::json!([
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [{"type": "summary_text", "text": "Reporting the sum"}],
+                    "encrypted_content": "openai-encrypted-final",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The sum is 42.", "annotations": []}],
+                    "status": "completed"
+                }
+            ])),
+        ])
+        .await;
+        let mut controller = controller_with_model(
+            &workspace,
+            OpenAiModel::with_endpoint("system prompt", "openai-key", &openai.endpoint),
+        )
+        .await
+        .with_selection(ModelSelection::new(&SOL, SOL.default_thinking).unwrap());
+        let home = controller.test_home.take().expect("persisted test home");
+        let session_id = controller.test_session.as_ref().unwrap().id().to_owned();
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "add 40 and 2".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+        assert!(
+            matches!(
+                records.last(),
+                Some(StoredRecord { record: Record::FinalMessage { text, .. }, .. })
+                    if text == "The sum is 42."
+            ),
+            "{records:?}"
+        );
+        assert_eq!(openai.request_count(), 2);
+
+        let session = Session::open(home.path(), &session_id).expect("reopen OpenAI session");
+        let saved_history = session
+            .restore()
+            .expect("restore OpenAI session")
+            .executable
+            .expect("executable OpenAI session")
+            .history;
+        let feedback = saved_history
+            .entries()
+            .iter()
+            .find_map(ModelContextEntry::completed_code)
+            .expect("saved completed code")
+            .result()
+            .feedback()
+            .to_owned();
+        assert!(feedback.contains("42"), "{feedback}");
+        let google = Fixture::start(google_message("Still 42.")).await;
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            GoogleModel::with_endpoint(
+                "system prompt",
+                "google-key",
+                &google.endpoint,
+                CrossProviderReasoning::Inline,
+            ),
+            ModelSelection::new(&GEMINI_4_ARGON, GEMINI_4_ARGON.default_thinking).unwrap(),
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            ResumeOptions::default(),
+        )
+        .await
+        .expect("restore on Google");
+        assert_eq!(initial.disabled_reason, None);
+
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "double-check".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+        assert!(
+            matches!(
+                records.last(),
+                Some(StoredRecord { record: Record::FinalMessage { text, .. }, .. })
+                    if text == "Still 42."
+            ),
+            "{records:?}"
+        );
+        let body = google.request().body;
+        assert_eq!(
+            body["input"],
+            serde_json::json!([
+                {"type": "user_input", "content": [{"type": "text", "text": "add 40 and 2"}]},
+                {
+                    "type": "thought",
+                    "signature": "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
+                },
+                {"type": "model_output", "content": [{"type": "text", "text": "Checking the sum"}]},
+                {"type": "model_output", "content": [{"type": "text", "text": "I'll add them."}]},
+                {
+                    "type": "function_call",
+                    "id": "call_1",
+                    "name": "execute_python",
+                    "arguments": {"code": "print(40 + 2)"}
+                },
+                {
+                    "type": "function_result",
+                    "call_id": "call_1",
+                    "name": "execute_python",
+                    "result": feedback
+                },
+                {"type": "model_output", "content": [{"type": "text", "text": "Reporting the sum"}]},
+                {"type": "model_output", "content": [{"type": "text", "text": "The sum is 42."}]},
+                {"type": "user_input", "content": [{"type": "text", "text": "double-check"}]}
+            ])
+        );
+        let body = body.to_string();
+        for opaque in ["openai-encrypted", "rs_1", "fc_1", "msg_1", "summary_text"] {
+            assert!(!body.contains(opaque), "{opaque} leaked into {body}");
+        }
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn google_run_triggers_automatic_threshold_compaction_retains_signed_completed_code_and_continues()
+     {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let google_tool_step = google_sse(&[
+            serde_json::json!({
+                "event_type": "interaction.created",
+                "interaction": {
+                    "id": "int_step_1",
+                    "model": "gemini-4-argon",
+                    "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "event_type": "step.start",
+                "index": 0,
+                "step": {"type": "thought"}
+            }),
+            serde_json::json!({
+                "event_type": "step.delta",
+                "index": 0,
+                "delta": {
+                    "type": "thought_summary",
+                    "content": {"type": "text", "text": "Multiplying"}
+                }
+            }),
+            serde_json::json!({
+                "event_type": "step.delta",
+                "index": 0,
+                "delta": {"type": "thought_signature", "signature": "sig-google-1"}
+            }),
+            serde_json::json!({"event_type": "step.stop", "index": 0}),
+            serde_json::json!({
+                "event_type": "step.start",
+                "index": 1,
+                "step": {"type": "model_output"}
+            }),
+            serde_json::json!({
+                "event_type": "step.delta",
+                "index": 1,
+                "delta": {"type": "text", "text": "I'll calculate it."}
+            }),
+            serde_json::json!({"event_type": "step.stop", "index": 1}),
+            serde_json::json!({
+                "event_type": "step.start",
+                "index": 2,
+                "step": {
+                    "type": "function_call",
+                    "id": "call_1",
+                    "name": "execute_python"
+                }
+            }),
+            serde_json::json!({
+                "event_type": "step.delta",
+                "index": 2,
+                "delta": {
+                    "type": "arguments_delta",
+                    "arguments": r#"{"code":"print(17 * 23)"}"#
+                }
+            }),
+            serde_json::json!({"event_type": "step.stop", "index": 2}),
+            serde_json::json!({
+                "event_type": "interaction.completed",
+                "interaction": {
+                    "id": "int_step_1",
+                    "model": "gemini-4-argon",
+                    "status": "requires_action",
+                    "usage": {
+                        "total_input_tokens": 9000,
+                        "total_cached_tokens": 0,
+                        "total_output_tokens": 500,
+                        "total_thought_tokens": 500,
+                        "total_tokens": 10000
+                    }
+                }
+            }),
+        ]);
+        let google = Fixture::start_sequence(vec![
+            google_tool_step,
+            google_message("Compacted Google summary."),
+            google_message("The product is 391."),
+        ])
+        .await;
+        let compaction_settings = format!(
+            "reserve_tokens = {}\nkeep_recent_tokens = 1\n",
+            GEMINI_4_ARGON.context_window_tokens - 5_000
+        );
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            GoogleModel::with_endpoint(
+                "system prompt",
+                "google-key",
+                &google.endpoint,
+                CrossProviderReasoning::Inline,
+            ),
+            &compaction_settings,
+        )
+        .await;
+        let controller = controller.with_selection(
+            ModelSelection::new(&GEMINI_4_ARGON, GEMINI_4_ARGON.default_thinking).unwrap(),
+        );
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "compute 17 * 23".to_owned(),
+                activation: None,
+            })
+            .await
+            .expect("submit request");
+        let settled = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&settled),
+            [
+                "record:1:user",
+                "execution:1:1",
+                "record:1:execution:1",
+                "automatic-compaction:1",
+                "record:1:compaction:AutomaticThreshold:applied",
+                "record:1:message:2:The product is 391.",
+                "settled:1",
+            ]
+        );
+        let applied_summary = records
+            .iter()
+            .find_map(|stored| match &stored.record {
+                Record::Compaction {
+                    outcome: CompactionOutcome::Applied { summary, .. },
+                } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("applied compaction summary");
+        assert!(
+            applied_summary.contains("Compacted Google summary."),
+            "{applied_summary}"
+        );
+
+        let requests = google.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].body["input"],
+            serde_json::json!([
+                {"type": "user_input", "content": [{"type": "text", "text": "compute 17 * 23"}]}
+            ])
+        );
+        assert!(requests[1].body.get("tools").is_none());
+        assert_eq!(
+            requests[2].body["input"],
+            serde_json::json!([
+                {
+                    "type": "user_input",
+                    "content": [{"type": "text", "text": canonical_compaction_summary(&applied_summary)}]
+                },
+                {
+                    "type": "thought",
+                    "summary": [{"type": "text", "text": "Multiplying"}],
+                    "signature": "sig-google-1"
+                },
+                {
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": "I'll calculate it."}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "call_1",
+                    "name": "execute_python",
+                    "arguments": {"code": "print(17 * 23)"}
+                },
+                {
+                    "type": "function_result",
+                    "call_id": "call_1",
+                    "name": "execute_python",
+                    "result": "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"4\">\n391\n</kiki_output>"
+                }
+            ])
+        );
         session.close().expect("close session");
     }
 

@@ -607,7 +607,6 @@ impl ProviderFailure {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn with_authentication(mut self, authentication: bool) -> Self {
         self.authentication = authentication;
         self

@@ -6536,6 +6536,8 @@ pub(crate) mod tests {
         "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_ANTHROPIC: &str =
         "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
+    const LIVE_SETUP_GOOGLE: &str =
+        "live test requires GEMINI_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_MODEL: &str =
         "live test effective model is not the required model; set KIKI_MODEL to select it";
     const LIVE_SETUP_READ_TOOL: &str =
@@ -6844,7 +6846,7 @@ pub(crate) mod tests {
         let setup_failure = match effective_model.provider() {
             Provider::OpenAi => LIVE_SETUP_OPENAI,
             Provider::Anthropic => LIVE_SETUP_ANTHROPIC,
-            Provider::Google => LIVE_SETUP_MODEL,
+            Provider::Google => LIVE_SETUP_GOOGLE,
         };
         let persisted_settings = configuration.snapshot().settings().clone();
         let (worker_path, workspace_root, model, prompt_base, selection, policy) = {

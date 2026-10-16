@@ -3741,4 +3741,82 @@ mod tests {
         );
         assert_eq!(foreign_attempts, 0);
     }
+
+    #[tokio::test]
+    #[ignore = "requires explicit GEMINI_API_KEY, KIKI_MODEL=google/gemini-4-argon and MONTY_BIN"]
+    async fn live_argon() {
+        if let Err(message) = crate::openai::tests::run_live_smoke_test(&GEMINI_4_ARGON).await {
+            panic!("{message}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit GEMINI_API_KEY"]
+    async fn live_argon_continues_after_compaction_with_retained_signed_thinking() {
+        let key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+        let mut model = GoogleModel::new(
+            "Use execute_python for every calculation.",
+            key,
+            CrossProviderReasoning::Inline,
+        );
+        let selection = ModelSelection::new(&GEMINI_4_ARGON, "high").unwrap();
+        let cancellation = CancellationToken::new();
+
+        let first = model
+            .step(
+                selection,
+                &history("Think it through, then call execute_python to compute 17 * 23."),
+                &cancellation,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let ModelAction::Code {
+            source,
+            call_id,
+            commentary,
+        } = first.action
+        else {
+            panic!("expected code");
+        };
+        assert!(
+            replay_values(&first.replay)
+                .iter()
+                .any(|step| step["type"] == "thought"
+                    && step["signature"]
+                        .as_str()
+                        .is_some_and(|signature| !signature.is_empty())),
+            "no signed thinking to retain"
+        );
+        let summary = model
+            .summarise(
+                SummaryRequest {
+                    instructions: "Summarise the conversation in one sentence.".to_owned(),
+                    input: "User: compute 17 * 23 with execute_python.".to_owned(),
+                    selection,
+                    output_limit: 16_384,
+                },
+                &cancellation,
+                &mut || {},
+            )
+            .await
+            .unwrap();
+        let mut compacted = ModelHistory::new();
+        compacted.append_compaction_summary(summary.text);
+        compacted
+            .append_completed_code(
+                source,
+                call_id,
+                commentary,
+                first.reasoning_summary,
+                first.replay,
+                CodeResult::execution("391\n".to_owned()),
+            )
+            .unwrap();
+
+        model
+            .step(selection, &compacted, &cancellation, &mut |_| {})
+            .await
+            .unwrap();
+    }
 }

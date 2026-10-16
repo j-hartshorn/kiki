@@ -11,6 +11,7 @@ use crate::{
         models::Provider,
         settings::{CacheTtl, CrossProviderReasoning},
     },
+    google::GoogleModel,
     model::{
         Model, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, SummaryRequest,
         SummaryResult,
@@ -65,6 +66,7 @@ pub(crate) async fn bounded_body(response: &mut reqwest::Response) -> Option<Vec
 pub(crate) struct ProviderModel {
     openai: Option<OpenAiModel>,
     anthropic: Option<AnthropicModel>,
+    google: Option<GoogleModel>,
 }
 
 impl ProviderModel {
@@ -72,6 +74,7 @@ impl ProviderModel {
         prompt: &str,
         openai_api_key: Option<&str>,
         anthropic_api_key: Option<&str>,
+        google_api_key: Option<&str>,
         anthropic_cache_ttl: CacheTtl,
         cross_provider_reasoning: CrossProviderReasoning,
     ) -> Self {
@@ -86,6 +89,8 @@ impl ProviderModel {
                     cross_provider_reasoning,
                 )
             }),
+            google: google_api_key
+                .map(|api_key| GoogleModel::new(prompt, api_key, cross_provider_reasoning)),
         }
     }
 
@@ -93,6 +98,7 @@ impl ProviderModel {
         [
             (Provider::OpenAi, self.openai.is_some()),
             (Provider::Anthropic, self.anthropic.is_some()),
+            (Provider::Google, self.google.is_some()),
         ]
         .into_iter()
         .filter_map(|(provider, present)| present.then_some(provider))
@@ -125,7 +131,11 @@ impl Model for ProviderModel {
                 .as_ref()
                 .ok_or(missing_adapter(Provider::Anthropic))?
                 .validate_history(history, selection),
-            Provider::Google => Err(missing_adapter(Provider::Google)),
+            Provider::Google => self
+                .google
+                .as_ref()
+                .ok_or(missing_adapter(Provider::Google))?
+                .validate_history(history, selection),
         }
     }
 
@@ -152,7 +162,13 @@ impl Model for ProviderModel {
                         .summarise(request, cancellation, attempt_started)
                         .await
                 }
-                Provider::Google => Err(missing_adapter(Provider::Google).into()),
+                Provider::Google => {
+                    self.google
+                        .as_mut()
+                        .ok_or(missing_adapter(Provider::Google))?
+                        .summarise(request, cancellation, attempt_started)
+                        .await
+                }
             }
         }
     }
@@ -181,7 +197,13 @@ impl Model for ProviderModel {
                         .step(selection, history, cancellation, progress)
                         .await
                 }
-                Provider::Google => Err(missing_adapter(Provider::Google).into()),
+                Provider::Google => {
+                    self.google
+                        .as_mut()
+                        .ok_or(missing_adapter(Provider::Google))?
+                        .step(selection, history, cancellation, progress)
+                        .await
+                }
             }
         }
     }
@@ -199,7 +221,8 @@ impl ChildModelFactory for ProviderModel {
             anthropic: self
                 .anthropic
                 .as_ref()
-                .map(|model| model.with_prompt(prompt)),
+                .map(|model| model.with_prompt(prompt.clone())),
+            google: self.google.as_ref().map(|model| model.with_prompt(prompt)),
         }
     }
 }
@@ -218,9 +241,10 @@ mod tests {
         anthropic::AnthropicModel,
         config::{
             ModelSelection,
-            models::{OPUS_5_5, Provider, SOL},
+            models::{GEMINI_4_ARGON, OPUS_5_5, Provider, SOL},
             settings::{CacheTtl, CrossProviderReasoning},
         },
+        google::GoogleModel,
         model::{
             Model, ModelAction, ModelError, ModelFailure, ModelHistory, ModelStep, SummaryRequest,
         },
@@ -233,6 +257,7 @@ mod tests {
 
     const OPENAI_KEY: &str = "openai-fixture-key";
     const ANTHROPIC_KEY: &str = "anthropic-fixture-key";
+    const GOOGLE_KEY: &str = "google-fixture-key";
 
     fn openai() -> ModelSelection {
         ModelSelection::new(&SOL, SOL.default_thinking).unwrap()
@@ -240,6 +265,10 @@ mod tests {
 
     fn anthropic() -> ModelSelection {
         ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap()
+    }
+
+    fn google() -> ModelSelection {
+        ModelSelection::new(&GEMINI_4_ARGON, GEMINI_4_ARGON.default_thinking).unwrap()
     }
 
     fn history() -> ModelHistory {
@@ -324,10 +353,62 @@ mod tests {
         )
     }
 
+    fn google_message(text: &str) -> FixtureReply {
+        let events = [
+            json!({
+                "event_type": "interaction.created",
+                "interaction": {
+                    "id": "int_1",
+                    "model": "gemini-4-argon",
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "event_type": "step.start",
+                "index": 0,
+                "step": {"type": "model_output"}
+            }),
+            json!({
+                "event_type": "step.delta",
+                "index": 0,
+                "delta": {"type": "text", "text": text}
+            }),
+            json!({"event_type": "step.stop", "index": 0}),
+            json!({
+                "event_type": "interaction.completed",
+                "interaction": {
+                    "id": "int_1",
+                    "model": "gemini-4-argon",
+                    "status": "completed",
+                    "usage": {
+                        "total_input_tokens": 1,
+                        "total_cached_tokens": 0,
+                        "total_output_tokens": 1,
+                        "total_thought_tokens": 0,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+        FixtureReply::OwnedSse(format!(
+            "{}event: done\ndata: [DONE]\n\n",
+            events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["event_type"].as_str().unwrap()
+                    )
+                })
+                .collect::<String>()
+        ))
+    }
+
     fn router(
         prompt: &str,
         openai: Option<&Fixture>,
         anthropic: Option<&Fixture>,
+        google: Option<&Fixture>,
     ) -> ProviderModel {
         ProviderModel {
             openai: openai
@@ -338,6 +419,14 @@ mod tests {
                     ANTHROPIC_KEY,
                     &fixture.endpoint,
                     CacheTtl::FiveMinutes,
+                    CrossProviderReasoning::Inline,
+                )
+            }),
+            google: google.map(|fixture| {
+                GoogleModel::with_endpoint(
+                    prompt,
+                    GOOGLE_KEY,
+                    &fixture.endpoint,
                     CrossProviderReasoning::Inline,
                 )
             }),
@@ -451,10 +540,16 @@ mod tests {
             anthropic_message("Anthropic summary"),
         ])
         .await;
+        let google_fixture = Fixture::start_sequence(vec![
+            google_message("from Google"),
+            google_message("Google summary"),
+        ])
+        .await;
         let mut model = router(
             "root prompt",
             Some(&openai_fixture),
             Some(&anthropic_fixture),
+            Some(&google_fixture),
         );
         let cancellation = CancellationToken::new();
 
@@ -469,9 +564,10 @@ mod tests {
         assert_eq!(
             (
                 openai_fixture.request_count(),
-                anthropic_fixture.request_count()
+                anthropic_fixture.request_count(),
+                google_fixture.request_count()
             ),
-            (0, 1)
+            (0, 1, 0)
         );
 
         let openai_step = step(&mut model, openai()).await.unwrap();
@@ -485,9 +581,27 @@ mod tests {
         assert_eq!(
             (
                 openai_fixture.request_count(),
-                anthropic_fixture.request_count()
+                anthropic_fixture.request_count(),
+                google_fixture.request_count()
             ),
-            (1, 1)
+            (1, 1, 0)
+        );
+
+        let google_step = step(&mut model, google()).await.unwrap();
+        assert_eq!(
+            google_step.action,
+            ModelAction::Message {
+                text: "from Google".to_owned()
+            }
+        );
+        assert_eq!(google_step.replay.provider(), "google");
+        assert_eq!(
+            (
+                openai_fixture.request_count(),
+                anthropic_fixture.request_count(),
+                google_fixture.request_count()
+            ),
+            (1, 1, 1)
         );
 
         let mut anthropic_history = history();
@@ -501,6 +615,17 @@ mod tests {
             Ok(())
         );
         assert_eq!(model.validate_history(&anthropic_history, openai()), Ok(()));
+        assert_eq!(model.validate_history(&anthropic_history, google()), Ok(()));
+
+        let mut google_history = history();
+        google_history.append_final_message(
+            "from Google".to_owned(),
+            String::new(),
+            google_step.replay,
+        );
+        assert_eq!(model.validate_history(&google_history, google()), Ok(()));
+        assert_eq!(model.validate_history(&google_history, openai()), Ok(()));
+        assert_eq!(model.validate_history(&google_history, anthropic()), Ok(()));
 
         let summary = model
             .summarise(summary_request(openai()), &cancellation, &mut || {})
@@ -512,12 +637,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.text, "Anthropic summary");
+        let summary = model
+            .summarise(summary_request(google()), &cancellation, &mut || {})
+            .await
+            .unwrap();
+        assert_eq!(summary.text, "Google summary");
         assert_eq!(
             (
                 openai_fixture.request_count(),
-                anthropic_fixture.request_count()
+                anthropic_fixture.request_count(),
+                google_fixture.request_count()
             ),
-            (2, 2)
+            (2, 2, 2)
         );
     }
 
@@ -528,14 +659,19 @@ mod tests {
 
         for (mut model, selection, variable) in [
             (
-                router("root prompt", Some(&fixture), None),
+                router("root prompt", Some(&fixture), None, Some(&fixture)),
                 anthropic(),
                 "ANTHROPIC_API_KEY",
             ),
             (
-                router("root prompt", None, Some(&fixture)),
+                router("root prompt", None, Some(&fixture), Some(&fixture)),
                 openai(),
                 "OPENAI_API_KEY",
+            ),
+            (
+                router("root prompt", Some(&fixture), Some(&fixture), None),
+                google(),
+                "GEMINI_API_KEY",
             ),
         ] {
             let mut progress_events = 0;
@@ -569,21 +705,42 @@ mod tests {
 
     #[test]
     fn the_provider_set_matches_the_present_keys() {
-        for (openai_key, anthropic_key, providers) in [
+        for (openai_key, anthropic_key, google_key, providers) in [
             (
                 Some("openai-key"),
                 Some("anthropic-key"),
+                Some("google-key"),
+                vec![Provider::OpenAi, Provider::Anthropic, Provider::Google],
+            ),
+            (
+                Some("openai-key"),
+                Some("anthropic-key"),
+                None,
                 vec![Provider::OpenAi, Provider::Anthropic],
             ),
-            (Some("openai-key"), None, vec![Provider::OpenAi]),
-            (None, Some("anthropic-key"), vec![Provider::Anthropic]),
-            (None, None, Vec::new()),
+            (
+                Some("openai-key"),
+                None,
+                Some("google-key"),
+                vec![Provider::OpenAi, Provider::Google],
+            ),
+            (
+                None,
+                Some("anthropic-key"),
+                Some("google-key"),
+                vec![Provider::Anthropic, Provider::Google],
+            ),
+            (Some("openai-key"), None, None, vec![Provider::OpenAi]),
+            (None, Some("anthropic-key"), None, vec![Provider::Anthropic]),
+            (None, None, Some("google-key"), vec![Provider::Google]),
+            (None, None, None, Vec::new()),
         ] {
             assert_eq!(
                 ProviderModel::new(
                     "root prompt",
                     openai_key,
                     anthropic_key,
+                    google_key,
                     CacheTtl::FiveMinutes,
                     CrossProviderReasoning::Inline
                 )
@@ -608,6 +765,7 @@ mod tests {
         assert!(!child_instructions.contains("async def write("));
         let openai_fixture = Fixture::start(openai_message("done")).await;
         let anthropic_fixture = Fixture::start(anthropic_message("done")).await;
+        let google_fixture = Fixture::start(google_message("done")).await;
         let mut parent = ProviderModel {
             anthropic: Some(AnthropicModel::with_endpoint(
                 &root,
@@ -616,17 +774,18 @@ mod tests {
                 CacheTtl::OneHour,
                 CrossProviderReasoning::Inline,
             )),
-            ..router(&root, Some(&openai_fixture), None)
+            ..router(&root, Some(&openai_fixture), None, Some(&google_fixture))
         };
 
         let mut child = parent.create(child_instructions.clone());
-        for selection in [openai(), anthropic()] {
+        for selection in [openai(), anthropic(), google()] {
             step(&mut child, selection).await.unwrap();
             step(&mut parent, selection).await.unwrap();
         }
 
         let openai_requests = openai_fixture.requests.lock().unwrap().clone();
         let anthropic_requests = anthropic_fixture.requests.lock().unwrap().clone();
+        let google_requests = google_fixture.requests.lock().unwrap().clone();
         assert_eq!(
             openai_requests
                 .iter()
@@ -652,6 +811,13 @@ mod tests {
                 }])
             ]
         );
+        assert_eq!(
+            google_requests
+                .iter()
+                .map(|request| request.body["system_instruction"].clone())
+                .collect::<Vec<_>>(),
+            [json!(child_instructions), json!(root)]
+        );
         for request in &openai_requests {
             assert_eq!(
                 header(&request.head, "authorization"),
@@ -660,6 +826,9 @@ mod tests {
         }
         for request in &anthropic_requests {
             assert_eq!(header(&request.head, "x-api-key"), Some(ANTHROPIC_KEY));
+        }
+        for request in &google_requests {
+            assert_eq!(header(&request.head, "x-goog-api-key"), Some(GOOGLE_KEY));
         }
     }
 }
