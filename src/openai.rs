@@ -30,6 +30,7 @@ use crate::{
         canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
+    provider::redact,
 };
 
 const OPENAI_PROVIDER: &str = Provider::OpenAi.id();
@@ -1130,14 +1131,6 @@ fn is_context_overflow(status: Option<u16>, code: Option<&str>, message: &str) -
         CONTEXT_OVERFLOW_PHRASES
             .iter()
             .any(|phrase| message.contains(phrase))
-    }
-}
-
-fn redact(value: &str, api_key: &str) -> String {
-    if api_key.is_empty() {
-        value.to_owned()
-    } else {
-        value.replace(api_key, "[REDACTED]")
     }
 }
 
