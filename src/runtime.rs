@@ -2716,7 +2716,7 @@ mod tests {
                         text: format!("{label} reply"),
                         reasoning_summary: String::new(),
                         replay: ProviderReplay::new(
-                            "openai",
+                            crate::config::auth::provider_id(DEFAULT_MODEL.provider()),
                             vec![OpaqueReplayItem::new(vec![b'x'; 100_000])],
                         ),
                         attempts: Vec::new(),
@@ -8823,7 +8823,7 @@ mod tests {
                     ..
                 },
                 RuntimeEvent::RuntimeDisabled {
-                    reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
+                    reason: RuntimeDisabledReason::Authentication(Provider::Google),
                 },
                 RuntimeEvent::RunSettled { run_id: RunId(1) },
             ] if request == "disable runtime"
@@ -8852,7 +8852,7 @@ mod tests {
         assert_eq!(
             next_event(&mut events).await,
             RuntimeEvent::SubmissionRejectedDisabled {
-                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
+                reason: RuntimeDisabledReason::Authentication(Provider::Google),
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -15033,7 +15033,7 @@ mod tests {
                     ..
                 },
                 RuntimeEvent::RuntimeDisabled {
-                    reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
+                    reason: RuntimeDisabledReason::Authentication(Provider::Google),
                 },
                 RuntimeEvent::RunSettled { .. },
             ]
@@ -15052,7 +15052,7 @@ mod tests {
         assert_eq!(
             rejection,
             RuntimeEvent::SubmissionRejectedDisabled {
-                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
+                reason: RuntimeDisabledReason::Authentication(Provider::Google),
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -17614,7 +17614,7 @@ mod tests {
         let footer = transcript.layout(160).footer_rule(160).to_string();
         assert!(footer.contains("↑220 ↓20"), "{footer}");
         assert!(footer.contains("CH0.0%"), "{footer}");
-        assert!(footer.contains("0.0%/272k"), "{footer}");
+        assert!(footer.contains("0.0%/1m"), "{footer}");
 
         let mut sibling_context = session
             .writer()
@@ -17750,7 +17750,7 @@ mod tests {
                 .to_string();
         assert!(returned_footer.contains("↑220 ↓20"), "{returned_footer}");
         assert!(returned_footer.contains("CH0.0%"), "{returned_footer}");
-        assert!(returned_footer.contains("0.0%/272k"), "{returned_footer}");
+        assert!(returned_footer.contains("0.0%/1m"), "{returned_footer}");
         assert_eq!(
             fs::read_to_string(workspace.path().join("authorised"))
                 .expect("read retained external effect"),

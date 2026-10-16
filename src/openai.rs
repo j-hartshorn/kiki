@@ -1930,11 +1930,7 @@ pub(crate) mod tests {
     }
 
     fn default_selection() -> ModelSelection {
-        ModelSelection::new(
-            crate::config::DEFAULT_MODEL,
-            crate::config::DEFAULT_MODEL.default_thinking,
-        )
-        .unwrap()
+        ModelSelection::new(&SOL, SOL.default_thinking).unwrap()
     }
 
     #[test]

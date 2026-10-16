@@ -2106,7 +2106,7 @@ mod tests {
                 .await
                 .expect("start compaction fixture step");
             let replay = ProviderReplay::new(
-                "openai",
+                crate::config::auth::provider_id(DEFAULT_MODEL.provider()),
                 vec![crate::model::OpaqueReplayItem::new(vec![b'x'; 100_000])],
             );
             writer
@@ -2851,7 +2851,10 @@ mod tests {
                     .inner
                     .step(selection, history, cancellation, progress)
                     .await?;
-                step.replay = ProviderReplay::new("openai", step.replay.items().to_vec());
+                step.replay = ProviderReplay::new(
+                    crate::config::auth::provider_id(selection.model().provider()),
+                    step.replay.items().to_vec(),
+                );
                 Ok(step)
             }
         }
@@ -2904,7 +2907,10 @@ mod tests {
                     step_id,
                     text: "earlier reply".to_owned(),
                     reasoning_summary: String::new(),
-                    replay: ProviderReplay::new("openai", Vec::new()),
+                    replay: ProviderReplay::new(
+                        crate::config::auth::provider_id(DEFAULT_MODEL.provider()),
+                        Vec::new(),
+                    ),
                     attempts: vec![AttemptAccounting::KnownUsage(crate::model::ModelUsage {
                         model: DEFAULT_MODEL.id.to_owned(),
                         service_tier: None,

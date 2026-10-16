@@ -287,7 +287,7 @@ impl Default for App {
             session_name: None,
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
-            providers: vec![Provider::OpenAi, Provider::Anthropic],
+            providers: vec![Provider::OpenAi, Provider::Anthropic, Provider::Google],
             picker: None,
             tree_navigator: None,
             manual_navigation_pending: false,
@@ -3353,7 +3353,7 @@ mod tests {
         ToolCallToken, ToolName,
     };
     use crate::clipboard::{ClipboardError, ClipboardPort};
-    use crate::config::models::{ASTRA, OPUS_5_5, Provider, SOL, TERRA};
+    use crate::config::models::{ASTRA, GPT6_1_SOL, GPT6_SOL, OPUS_5_5, Provider, SOL, TERRA};
     use crate::config::{ModelSelection, SessionPreferences};
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
@@ -4830,7 +4830,7 @@ mod tests {
         let buffer = rendered_buffer(&mut app, 80, 8);
         assert_eq!(
             buffer[(0, 7)].fg,
-            super::thinking_rule_colour(SOL.thinking_levels, "high")
+            super::thinking_rule_colour(super::DEFAULT_MODEL.thinking_levels, "high")
         );
     }
 
@@ -6454,7 +6454,7 @@ mod tests {
         let (rows, rule) = rows_and_prompt_rule(&mut app);
         assert_eq!(
             rows[rule - 2],
-            "Model selected: openai/gpt-5.6-sol · medium"
+            "Model selected: openai/gpt-6.1-sol · medium"
         );
         let rows = history_rows(&mut app);
         let terra_card = rows
@@ -6479,10 +6479,10 @@ mod tests {
             .iter()
             .filter(|row| row.contains("Model selected"))
             .collect::<Vec<_>>();
-        assert_eq!(cards, ["Model selected: openai/gpt-5.6-sol · medium"]);
+        assert_eq!(cards, ["Model selected: openai/gpt-6.1-sol · medium"]);
         assert_eq!(rows.last().map(String::as_str), Some("Session restored."));
         let screen = rendered(&mut app, 80, 40);
-        assert!(screen.contains("gpt-5.6-sol • thinking medium"), "{screen}");
+        assert!(screen.contains("gpt-6.1-sol • thinking medium"), "{screen}");
     }
 
     #[test]
@@ -6534,7 +6534,7 @@ mod tests {
 
     fn model_picker_rows(app: &mut App) -> Vec<String> {
         app.open_model_picker("");
-        let screen = rendered(app, 80, 40);
+        let screen = rendered(app, 80, 45);
         screen
             .lines()
             .skip_while(|line| !line.contains("Filter:"))
@@ -6569,6 +6569,9 @@ mod tests {
                 "anthropic/claude-opus-5-5",
                 "anthropic/claude-sonnet-5-5",
                 "anthropic/claude-fable-5-1",
+                "Google",
+                "google/gemini-4-argon",
+                "google/gemini-3.8-flash",
             ]
         );
     }
@@ -6597,6 +6600,20 @@ mod tests {
             ]
         );
 
+        let mut app =
+            app_with_favourites("[\"google/gemini-4-argon\", \"anthropic/claude-fable-5-1\"]");
+        app.providers = vec![Provider::OpenAi, Provider::Anthropic];
+        let rows = model_picker_rows(&mut app);
+        assert_eq!(
+            rows.iter().take(2).map(String::as_str).collect::<Vec<_>>(),
+            ["Favourites", "anthropic/claude-fable-5-1"]
+        );
+        assert!(!rows.iter().any(|row| row == "Google"), "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.starts_with("google/")),
+            "{rows:?}"
+        );
+
         let mut app = app_with_favourites("[\"anthropic/claude-fable-5-1\"]");
         app.providers = vec![Provider::OpenAi];
         let rows = model_picker_rows(&mut app);
@@ -6611,22 +6628,27 @@ mod tests {
         app.providers = vec![Provider::OpenAi];
         let before = app.settings_selection;
 
-        let update = enter_at(&mut app, "/model anthropic/claude-opus-5-5", now);
+        for (model_id, variable) in [
+            (OPUS_5_5.id, "ANTHROPIC_API_KEY"),
+            ("google/gemini-4-argon", "GEMINI_API_KEY"),
+        ] {
+            let update = enter_at(&mut app, &format!("/model {model_id}"), now);
 
-        assert!(update.commands.is_empty(), "{:?}", update.commands);
-        assert!(update.visible_changed);
-        assert!(app.prompt.is_empty());
-        assert_eq!(app.settings_selection, before);
-        let notice = app.notice().expect("keyless model notice");
-        assert!(notice.contains(OPUS_5_5.id), "{notice}");
-        assert!(notice.contains("ANTHROPIC_API_KEY"), "{notice}");
+            assert!(update.commands.is_empty(), "{:?}", update.commands);
+            assert!(update.visible_changed);
+            assert!(app.prompt.is_empty());
+            assert_eq!(app.settings_selection, before);
+            let notice = app.notice().expect("keyless model notice");
+            assert!(notice.contains(model_id), "{notice}");
+            assert!(notice.contains(variable), "{notice}");
+        }
     }
 
     #[test]
     fn astra_is_first_and_uses_its_model_owned_thinking_levels() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
-        assert!(std::ptr::eq(app.settings_selection.model(), &SOL));
+        assert!(std::ptr::eq(app.settings_selection.model(), &GPT6_1_SOL));
 
         let open = enter_at(&mut app, "/model", now);
         assert!(open.commands.is_empty());
@@ -6712,7 +6734,7 @@ mod tests {
         assert!(update.commands.is_empty());
         assert!(app.prompt.is_empty());
         let notice = app.notice().expect("unsupported level status");
-        assert!(notice.contains(SOL.id));
+        assert!(notice.contains(GPT6_1_SOL.id));
         assert!(notice.contains("low, medium, high, xhigh, max"));
     }
 
@@ -6772,9 +6794,9 @@ mod tests {
         assert!(preview.commands.is_empty());
         assert!(app.preview.is_some());
         assert_eq!(app.session_thinking.get(TERRA.id), Some(&"medium"));
-        let sol = enter_at(&mut app, "/model openai/gpt-5.6-sol", now);
+        let sol = enter_at(&mut app, "/model openai/gpt-6.1-sol", now);
         let (selection, _) = applied_settings(&sol);
-        assert!(std::ptr::eq(selection.model(), &SOL));
+        assert!(std::ptr::eq(selection.model(), &GPT6_1_SOL));
         assert_eq!(selection.thinking(), "low");
         assert!(app.preview.is_none());
     }
@@ -6785,16 +6807,16 @@ mod tests {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
         let (selection, _) = applied_settings(&enter_at(&mut app, "/thinking high", now));
-        assert!(std::ptr::eq(selection.model(), &SOL));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert!(std::ptr::eq(selection.model(), &GPT6_1_SOL));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"medium"));
 
         let (selection, _) =
             applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
         assert!(std::ptr::eq(selection.model(), &TERRA));
 
         let (selection, _) =
-            applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
-        assert!(std::ptr::eq(selection.model(), &SOL));
+            applied_settings(&enter_at(&mut app, "/model openai/gpt-6.1-sol", now));
+        assert!(std::ptr::eq(selection.model(), &GPT6_1_SOL));
         assert_eq!(selection.thinking(), "medium");
     }
 
@@ -6809,7 +6831,7 @@ mod tests {
         let tab = app.handle_key_at(shifted_key(KeyCode::Tab), now + Duration::from_secs(1));
         assert!(tab.commands.is_empty());
         assert_eq!(app.settings_selection.thinking(), "xhigh");
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"medium"));
 
         assert!(
             app.tick(now + Duration::from_millis(2_999))
@@ -6832,6 +6854,27 @@ mod tests {
             assert!(update.commands.is_empty());
             assert_eq!(app.settings_selection.thinking(), expected);
         }
+
+        let (selection, _) =
+            applied_settings(&enter_at(&mut app, "/model google/gemini-4-argon", now));
+        assert_eq!(selection.model().id, "google/gemini-4-argon");
+        assert_eq!(selection.thinking(), "medium");
+        for expected in ["high", "low", "medium", "high"] {
+            let update = app.handle_key_at(key(KeyCode::BackTab), now);
+            assert!(update.commands.is_empty());
+            assert_eq!(app.settings_selection.thinking(), expected);
+        }
+        for level in ["low", "medium", "high"] {
+            let (selection, _) =
+                applied_settings(&enter_at(&mut app, &format!("/thinking {level}"), now));
+            assert_eq!(selection.thinking(), level);
+        }
+        let unsupported = enter_at(&mut app, "/thinking xhigh", now);
+        assert!(unsupported.commands.is_empty());
+        let notice = app.notice().expect("unsupported google thinking notice");
+        assert!(notice.contains("google/gemini-4-argon"), "{notice}");
+        assert!(notice.contains("low, medium, high"), "{notice}");
+        assert!(!notice.contains("xhigh"), "{notice}");
     }
 
     #[test]
@@ -6883,7 +6926,7 @@ mod tests {
         let (rows, rule) = rows_and_prompt_rule(&mut app);
         assert_eq!(
             rows[rule - 2],
-            "[pending] Model selected: openai/gpt-5.6-sol · high"
+            "[pending] Model selected: openai/gpt-6.1-sol · high"
         );
         assert!(app.selection.is_none());
 
@@ -6891,12 +6934,12 @@ mod tests {
         let (rows, rule) = rows_and_prompt_rule(&mut app);
         assert_eq!(
             rows[rule - 2],
-            "[pending] Model selected: openai/gpt-5.6-sol · high"
+            "[pending] Model selected: openai/gpt-6.1-sol · high"
         );
 
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
         let (rows, rule) = rows_and_prompt_rule(&mut app);
-        assert_eq!(rows[rule - 2], "Model selected: openai/gpt-5.6-sol · high");
+        assert_eq!(rows[rule - 2], "Model selected: openai/gpt-6.1-sol · high");
     }
 
     #[test]
@@ -6985,7 +7028,7 @@ mod tests {
         let (_, rule) = rows_and_prompt_rule(&mut app);
         assert_eq!(history_bottom(&app), rule - 3);
 
-        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-6.1-sol", now));
         let (rows, rule) = rows_and_prompt_rule(&mut app);
         assert_eq!(history_bottom(&app), rule);
         assert!(!rows.iter().any(|row| row.contains("Model selected")));
@@ -7115,9 +7158,9 @@ mod tests {
         let (selection, revision) = applied_settings(&app.tick(now + Duration::from_secs(2)));
         assert_eq!(selection.thinking(), "high");
         assert_eq!(revision, 1);
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"medium"));
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"high"));
 
         app.handle_key_at(key(KeyCode::BackTab), now + Duration::from_secs(3));
         let (selection, revision) = applied_settings(&enter_at(
@@ -7138,12 +7181,12 @@ mod tests {
         let (_, second) = applied_settings(&enter_at(&mut app, "/thinking low", now));
 
         assert_eq!(app.settings_selection.thinking(), "low");
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"medium"));
         assert!(!app.handle_event(RuntimeEvent::SettingsAccepted { revision: first }));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"medium"));
         assert!(!app.handle_event(RuntimeEvent::SettingsAccepted { revision: first }));
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision: second }));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"low"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"low"));
     }
 
     #[test]
@@ -7158,7 +7201,7 @@ mod tests {
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted {
             revision: sol_revision,
         }));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"high"));
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted {
             revision: terra_revision,
         }));
@@ -7167,7 +7210,7 @@ mod tests {
             Some(&TERRA.default_thinking)
         );
 
-        let (sol, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
+        let (sol, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-6.1-sol", now));
         assert_eq!(sol.thinking(), "high");
     }
 
@@ -7177,7 +7220,7 @@ mod tests {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
         app.handle_key_at(key(KeyCode::BackTab), now);
         let (_, revision) = applied_settings(&app.tick(now + Duration::from_secs(2)));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"medium"));
         app.handle_key_at(key(KeyCode::BackTab), now + Duration::from_secs(2));
 
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
@@ -7185,7 +7228,7 @@ mod tests {
         assert_eq!(app.settings_selection.thinking(), "xhigh");
         assert!(app.preview.is_some());
         assert!(app.pending_settings.is_empty());
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"high"));
 
         let (_, preview_revision) = applied_settings(&app.tick(now + Duration::from_secs(4)));
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted {
@@ -7194,7 +7237,7 @@ mod tests {
 
         assert!(app.pending_settings.is_empty());
         assert!(app.preview.is_none());
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"xhigh"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"xhigh"));
     }
 
     #[test]
@@ -7270,7 +7313,7 @@ mod tests {
         assert_eq!(*revision, 1);
         assert_eq!(request, "use the visible setting");
         assert!(app.preview.is_none());
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert_eq!(app.session_thinking.get(GPT6_1_SOL.id), Some(&"medium"));
 
         let (sender, mut receiver) = mpsc::channel(2);
         super::dispatch_commands(&sender, &update, &Trace::disabled()).expect("dispatch commands");
@@ -7317,7 +7360,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             now,
         ));
-        assert!(std::ptr::eq(selection.model(), &TERRA));
+        assert!(std::ptr::eq(selection.model(), &GPT6_SOL));
         assert!(
             app.notice()
                 .is_some_and(|notice| notice.contains("User default saved"))
@@ -7325,7 +7368,7 @@ mod tests {
         assert!(
             fs::read_to_string(home.path().join(".kiki/config.toml"))
                 .expect("model setting")
-                .contains("model = \"openai/gpt-5.6-terra\"")
+                .contains("model = \"openai/gpt-6-sol\"")
         );
 
         let _ = enter_at(&mut app, "/thinking", now);
@@ -7337,7 +7380,7 @@ mod tests {
         assert!(
             fs::read_to_string(home.path().join(".kiki/config.toml"))
                 .expect("thinking setting")
-                .contains("\"openai/gpt-5.6-terra\" = \"high\"")
+                .contains("\"openai/gpt-6-sol\" = \"high\"")
         );
 
         fs::create_dir_all(workspace.path().join(".kiki")).expect("project settings directory");
@@ -8228,11 +8271,12 @@ mod tests {
     fn configuration_configured_mode_renders_a_ready_snapshot_and_remains_editable() {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
-        let history = rendered(&mut app, 120, 16);
+        let history = rendered(&mut app, 120, 17);
         assert!(history.contains("Startup configuration"));
         assert!(history.contains("Submission: available"));
         assert!(history.contains("OpenAI API key: present"));
         assert!(history.contains("Anthropic API key: missing"));
+        assert!(history.contains("Google API key: missing"));
         assert!(!history.contains("test-api-key"));
 
         assert!(app.handle_key(key(KeyCode::Char('x'))).visible_changed);
@@ -12064,12 +12108,12 @@ mod tests {
         let screen = rendered(&mut app, 33, 2);
         let rows = screen.lines().collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1], "─  …t-5.6-sol • thinking medium ─");
+        assert_eq!(rows[1], "─  …t-6.1-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 2);
         assert_eq!(
             buffer[(0, 1)].fg,
-            super::thinking_rule_colour(SOL.thinking_levels, SOL.default_thinking)
+            super::thinking_rule_colour(GPT6_1_SOL.thinking_levels, GPT6_1_SOL.default_thinking)
         );
 
         for width in 0..=4 {
@@ -12089,12 +12133,12 @@ mod tests {
         let rows = screen.lines().collect::<Vec<_>>();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1], "─".repeat(33));
-        assert_eq!(rows[2], "─  …t-5.6-sol • thinking medium ─");
+        assert_eq!(rows[2], "─  …t-6.1-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 3);
         assert_eq!(
             buffer[(0, 2)].fg,
-            super::thinking_rule_colour(SOL.thinking_levels, SOL.default_thinking)
+            super::thinking_rule_colour(GPT6_1_SOL.thinking_levels, GPT6_1_SOL.default_thinking)
         );
 
         for width in 0..=4 {
@@ -12303,7 +12347,7 @@ mod tests {
             footer.contains("↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k"),
             "{footer}"
         );
-        assert!(footer.contains("gpt-5.6-sol • thinking medium"), "{footer}");
+        assert!(footer.contains("gpt-6.1-sol • thinking medium"), "{footer}");
     }
 
     #[test]

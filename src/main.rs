@@ -75,6 +75,7 @@ fn production_model(
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Invocation {
     Version,
     Login(Provider),
@@ -88,7 +89,7 @@ enum Invocation {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "Usage: kiki [sessions | --continue | --resume <32-lowerhex-id> [--here] | login <openai|anthropic> | logout <openai|anthropic> | --version]",
+        "Usage: kiki [sessions | --continue | --resume <32-lowerhex-id> [--here] | login <openai|anthropic|google> | logout <openai|anthropic|google> | --version]",
     )
 }
 
@@ -100,8 +101,14 @@ fn valid_session_id(value: &str) -> bool {
 }
 
 fn invocation() -> Result<Invocation, io::Error> {
+    parse_invocation(std::env::args_os().skip(1))
+}
+
+fn parse_invocation(
+    raw_arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Invocation, io::Error> {
     let mut arguments = Vec::new();
-    for argument in std::env::args_os().skip(1) {
+    for argument in raw_arguments {
         arguments.push(argument.into_string().map_err(|_| usage())?);
     }
     match arguments.as_slice() {
@@ -642,6 +649,32 @@ mod tests {
             name,
             &format!("description: {description}\n"),
             "body",
+        );
+    }
+
+    #[test]
+    fn login_and_logout_invocations_accept_openai_anthropic_and_google() {
+        use super::{Invocation, Provider, parse_invocation};
+        use std::ffi::OsString;
+
+        for (slug, provider) in [
+            ("openai", Provider::OpenAi),
+            ("anthropic", Provider::Anthropic),
+            ("google", Provider::Google),
+        ] {
+            assert_eq!(
+                parse_invocation(["login", slug].map(OsString::from)).unwrap(),
+                Invocation::Login(provider)
+            );
+            assert_eq!(
+                parse_invocation(["logout", slug].map(OsString::from)).unwrap(),
+                Invocation::Logout(provider)
+            );
+        }
+        let error = parse_invocation(["login", "gemini"].map(OsString::from)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Usage: kiki [sessions | --continue | --resume <32-lowerhex-id> [--here] | login <openai|anthropic|google> | logout <openai|anthropic|google> | --version]"
         );
     }
 

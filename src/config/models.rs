@@ -521,7 +521,15 @@ pub static CATALOGUE: [&ModelConfiguration; 12] = [
     &GEMINI_4_ARGON,
     &GEMINI_3_8_FLASH,
 ];
-pub static DEFAULT_MODEL: &ModelConfiguration = &SOL;
+pub static DEFAULT_MODEL: &ModelConfiguration = &GEMINI_4_ARGON;
+pub static DEFAULT_MODELS: [&ModelConfiguration; 3] = [&GEMINI_4_ARGON, &GPT6_1_SOL, &OPUS_5_5];
+
+pub fn default_model_for_providers(providers: &[Provider]) -> &'static ModelConfiguration {
+    DEFAULT_MODELS
+        .into_iter()
+        .find(|model| providers.contains(&model.provider()))
+        .unwrap_or(DEFAULT_MODEL)
+}
 
 impl ModelConfiguration {
     pub fn supports_thinking(&self, thinking: &str) -> bool {
@@ -578,7 +586,49 @@ mod tests {
             CATALOGUE.iter().map(|m| m.id).collect::<HashSet<_>>().len(),
             12
         );
-        assert!(std::ptr::eq(DEFAULT_MODEL, &SOL));
+        assert!(std::ptr::eq(DEFAULT_MODEL, &GEMINI_4_ARGON));
+    }
+
+    #[test]
+    fn default_model_for_providers_follows_google_openai_anthropic_priority() {
+        assert_eq!(
+            DEFAULT_MODELS.map(|model| model.id),
+            [
+                "google/gemini-4-argon",
+                "openai/gpt-6.1-sol",
+                "anthropic/claude-opus-5-5",
+            ]
+        );
+        for providers in [
+            &[Provider::Google][..],
+            &[Provider::Google, Provider::OpenAi, Provider::Anthropic],
+            &[Provider::Anthropic, Provider::OpenAi, Provider::Google],
+            &[Provider::OpenAi, Provider::Google],
+            &[Provider::Anthropic, Provider::Google],
+        ] {
+            assert!(
+                std::ptr::eq(default_model_for_providers(providers), &GEMINI_4_ARGON),
+                "{providers:?}"
+            );
+        }
+        for providers in [
+            &[Provider::OpenAi][..],
+            &[Provider::OpenAi, Provider::Anthropic],
+            &[Provider::Anthropic, Provider::OpenAi],
+        ] {
+            assert!(
+                std::ptr::eq(default_model_for_providers(providers), &GPT6_1_SOL),
+                "{providers:?}"
+            );
+        }
+        assert!(std::ptr::eq(
+            default_model_for_providers(&[Provider::Anthropic]),
+            &OPUS_5_5
+        ));
+        assert!(std::ptr::eq(
+            default_model_for_providers(&[]),
+            &GEMINI_4_ARGON
+        ));
     }
 
     #[test]

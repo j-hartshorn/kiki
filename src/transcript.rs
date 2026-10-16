@@ -3766,6 +3766,7 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
         format!("Prompt: {prompt_source}"),
         api_key_line(Provider::OpenAi),
         api_key_line(Provider::Anthropic),
+        api_key_line(Provider::Google),
         format!("Submission: {submission}"),
     ];
     if snapshot.problems().is_empty() {
@@ -7843,11 +7844,12 @@ result
             "Startup configuration
 Worker: /opt/kiki/bin/monty
 Workspace: /workspace/project
-Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)
+Model: openai/gpt-6.1-sol (context: 1.05m, max output: 128k)
 Thinking: medium
 Prompt: bundled system
 OpenAI API key: present
 Anthropic API key: missing
+Google API key: missing
 Submission: available
 Problems: none"
         );

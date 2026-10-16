@@ -894,9 +894,9 @@ mod tests {
         estimate_tokens, exceeds_threshold, output_budget, prepare, serialise_entry,
         strip_reserved_blocks, truncate_feedback,
     };
-    use crate::config::models::{OPUS_5_5, TERRA};
+    use crate::config::ModelSelection;
+    use crate::config::models::{OPUS_5_5, SOL, TERRA};
     use crate::config::settings::CrossProviderReasoning;
-    use crate::config::{DEFAULT_MODEL, ModelSelection};
     use crate::model::{
         AttemptAccounting, CodeResult, ModelCallId, ModelContextEntry, ModelHistory, ModelUsage,
         OpaqueReplayItem, ProviderReplay, SkillActivation,
@@ -911,7 +911,7 @@ mod tests {
     const NATIVE: &str = "openai";
 
     fn selection() -> ModelSelection {
-        ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap()
+        ModelSelection::new(&SOL, SOL.default_thinking).unwrap()
     }
 
     fn native() -> Destination {
@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     fn usage(total: Option<u64>, input: Option<u64>, output: Option<u64>) -> AttemptAccounting {
-        model_usage(DEFAULT_MODEL.id, total, input, output)
+        model_usage(SOL.id, total, input, output)
     }
 
     fn model_usage(
@@ -1738,7 +1738,7 @@ mod tests {
     #[test]
     fn usage_baselines_accept_untracked_retries_and_skip_unusable_attempts() {
         let retried = AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
-            model: DEFAULT_MODEL.id.to_owned(),
+            model: SOL.id.to_owned(),
             service_tier: None,
             input_tokens: Some(5),
             cached_input_tokens: Some(50),
