@@ -5,13 +5,11 @@ use eventsource_stream::{EventStreamError, Eventsource};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{
         ModelSelection,
-        constants::ACCEPTED_MODEL_CONTENT_LIMIT,
         models::Provider,
         settings::{CacheTtl, CrossProviderReasoning},
     },
@@ -21,7 +19,11 @@ use crate::{
         OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
         canonical_compaction_summary,
     },
-    presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
+    presentation::{
+        ContentBudget, PresentationBatcher, PresentationKind, PythonPreviewDecoder,
+        SSE_FRAME_LIMIT, SseFrameLimit,
+    },
+    provider::{bounded_body, redact, retry_delay},
 };
 
 const ANTHROPIC_PROVIDER: &str = "anthropic";
@@ -29,12 +31,7 @@ const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const EXECUTE_PYTHON: &str = "execute_python";
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
-// Room for 16 MiB of content escaped as `\u00XX` (6 bytes per byte) in one frame.
-const SSE_FRAME_LIMIT: usize = 128 * 1024 * 1024;
 const HTTP_RETRIES: u32 = 2;
-const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-const SERVER_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(60);
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
@@ -720,44 +717,6 @@ impl From<ModelError> for AttemptFailure {
     }
 }
 
-fn retry_delay(headers: &reqwest::header::HeaderMap, retry: u32) -> Duration {
-    let header = |name: &str| headers.get(name)?.to_str().ok().map(str::trim);
-    let number = |value: &str| value.parse::<f64>().ok().filter(|number| *number >= 0.0);
-    let seconds_until = |value: &str| {
-        let date = OffsetDateTime::parse(value, &Rfc2822).ok()?;
-        Some((date - OffsetDateTime::now_utc()).as_seconds_f64()).filter(|seconds| *seconds >= 0.0)
-    };
-    header("retry-after-ms")
-        .and_then(number)
-        .map(|milliseconds| milliseconds / 1000.0)
-        .or_else(|| {
-            let value = header("retry-after")?;
-            number(value).or_else(|| seconds_until(value))
-        })
-        // Cap before converting: huge values overflow `Duration`.
-        .map(|seconds| Duration::from_secs_f64(seconds.min(SERVER_RETRY_DELAY_LIMIT.as_secs_f64())))
-        .unwrap_or(HTTP_RETRY_BACKOFF * 2_u32.pow(retry))
-}
-
-fn redact(value: &str, api_key: &str) -> String {
-    if api_key.is_empty() {
-        value.to_owned()
-    } else {
-        value.replace(api_key, "[REDACTED]")
-    }
-}
-
-async fn bounded_body(response: &mut reqwest::Response) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if body.len() + chunk.len() > ERROR_BODY_LIMIT {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Some(body)
-}
-
 fn text_content(text: &str) -> Value {
     json!({"type": "text", "text": text})
 }
@@ -944,66 +903,6 @@ impl OpenBlock {
                 ContentBlock::ToolUse { id, name, input }
             }
         })
-    }
-}
-
-#[derive(Default)]
-struct ContentBudget(usize);
-
-impl ContentBudget {
-    fn spend(&mut self, bytes: usize) -> Result<(), ModelError> {
-        self.0 = self
-            .0
-            .checked_add(bytes)
-            .filter(|&used| used <= ACCEPTED_MODEL_CONTENT_LIMIT)
-            .ok_or(ModelError::ContentTooLarge)?;
-        Ok(())
-    }
-}
-
-struct SseFrameLimit {
-    limit: usize,
-    partial_line: Vec<u8>,
-    frame_bytes: usize,
-    after_cr: bool,
-}
-
-impl SseFrameLimit {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            partial_line: Vec::new(),
-            frame_bytes: 0,
-            after_cr: false,
-        }
-    }
-
-    // eventsource-stream re-parses partial lines per chunk and stalls on a trailing CR: emit whole LF lines.
-    fn complete_lines(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ModelError> {
-        let mut lines = Vec::new();
-        for &byte in chunk {
-            let after_cr = std::mem::replace(&mut self.after_cr, byte == b'\r');
-            match byte {
-                // Only a blank-line CR leaves the count at zero.
-                b'\n' if after_cr && self.frame_bytes == 0 => continue,
-                b'\n' if after_cr => {}
-                b'\r' | b'\n' if self.partial_line.is_empty() => {
-                    self.frame_bytes = 0;
-                    lines.push(b'\n');
-                    continue;
-                }
-                b'\r' | b'\n' => {
-                    lines.append(&mut self.partial_line);
-                    lines.push(b'\n');
-                }
-                _ => self.partial_line.push(byte),
-            }
-            self.frame_bytes += 1;
-            if self.frame_bytes > self.limit {
-                return Err(ModelError::ContentTooLarge);
-            }
-        }
-        Ok(lines)
     }
 }
 
@@ -1301,14 +1200,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use eventsource_stream::Eventsource;
-    use futures::StreamExt;
-    use reqwest::header::{HeaderMap, HeaderValue};
     use serde_json::{Value, json};
-    use time::{OffsetDateTime, format_description::well_known::Rfc2822};
     use tokio_util::sync::CancellationToken;
 
-    use super::{AnthropicModel, SSE_FRAME_LIMIT, SseFrameLimit, retry_delay};
+    use super::{AnthropicModel, SSE_FRAME_LIMIT};
     use crate::{
         config::{
             ModelSelection,
@@ -2700,112 +2595,6 @@ mod tests {
         assert_eq!(step.attempts, vec![expected_accounting()]);
     }
 
-    #[tokio::test]
-    async fn sse_frame_limit_keeps_a_crlf_split_across_chunks_as_one_line_ending() {
-        let mut frames = SseFrameLimit::new(SMALL_FRAME_LIMIT);
-        let chunks: [&[u8]; 3] = [
-            b"event: ping\r",
-            b"\ndata: {\"type\":\"ping\"}\r",
-            b"\n\r\n",
-        ];
-
-        let events = futures::stream::iter(chunks)
-            .map(|chunk| frames.complete_lines(chunk))
-            .eventsource()
-            .map(|event| event.map(|event| (event.event, event.data)))
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(
-            events,
-            [Ok(("ping".to_owned(), r#"{"type":"ping"}"#.to_owned()))]
-        );
-    }
-
-    #[test]
-    fn sse_frame_limit_accepts_ignored_and_error_frames_at_the_limit_but_not_one_byte_over() {
-        for frame in [ignored_frame, error_frame] {
-            let at_limit = padded(frame, SMALL_FRAME_LIMIT);
-            let over_limit = padded(frame, SMALL_FRAME_LIMIT + 1);
-
-            assert_eq!(
-                SseFrameLimit::new(SMALL_FRAME_LIMIT).complete_lines(at_limit.as_bytes()),
-                Ok(at_limit.into_bytes())
-            );
-            assert_eq!(
-                SseFrameLimit::new(SMALL_FRAME_LIMIT).complete_lines(over_limit.as_bytes()),
-                Err(ModelError::ContentTooLarge)
-            );
-        }
-    }
-
-    #[test]
-    fn sse_frame_limit_charges_both_bytes_of_crlf_frame_lines_in_whole_and_byte_chunks() {
-        let crlf_frame = |frame_bytes: usize| {
-            let framing = "event: ping\r\ndata: \r\n".len();
-            format!(
-                "event: ping\r\ndata: {}\r\n\r\n",
-                "x".repeat(frame_bytes - framing)
-            )
-        };
-        let at_limit = crlf_frame(SMALL_FRAME_LIMIT).repeat(2);
-        let over_limit = crlf_frame(SMALL_FRAME_LIMIT + 1);
-        for chunk_size in [1, usize::MAX] {
-            let lines = |body: &str| {
-                let mut frames = SseFrameLimit::new(SMALL_FRAME_LIMIT);
-                body.as_bytes()
-                    .chunks(chunk_size)
-                    .map(|chunk| frames.complete_lines(chunk))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|lines| lines.concat())
-            };
-
-            assert_eq!(
-                lines(&at_limit),
-                Ok(at_limit.replace("\r\n", "\n").into_bytes()),
-                "{chunk_size}-byte chunks"
-            );
-            assert_eq!(
-                lines(&over_limit),
-                Err(ModelError::ContentTooLarge),
-                "{chunk_size}-byte chunks"
-            );
-        }
-    }
-
-    #[test]
-    fn sse_frame_limit_emits_each_line_ending_as_one_lf_and_resets_at_blank_lines_across_chunks() {
-        for line_end in ["\n", "\r", "\r\n"] {
-            let frame = format!("xxx{line_end}xxx{line_end}");
-            let body = format!("{frame}{line_end}{frame}{line_end}{frame}");
-            for chunk_size in [1, 2, 3, body.len()] {
-                let mut frames = SseFrameLimit::new(frame.len());
-
-                let lines = body
-                    .as_bytes()
-                    .chunks(chunk_size)
-                    .map(|chunk| frames.complete_lines(chunk))
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
-
-                assert!(
-                    lines
-                        .iter()
-                        .all(|lines| lines.last().is_none_or(|&byte| byte == b'\n'))
-                );
-                assert_eq!(
-                    lines.concat(),
-                    body.replace(line_end, "\n").into_bytes(),
-                    "{line_end:?} in {chunk_size}-byte chunks"
-                );
-                assert_eq!(
-                    frames.complete_lines(b"x"),
-                    Err(ModelError::ContentTooLarge)
-                );
-            }
-        }
-    }
-
     #[test]
     fn production_frame_limit_fits_at_limit_content_escaped_six_fold_in_one_frame() {
         let frame = |data: &str| {
@@ -2848,6 +2637,16 @@ mod tests {
             items
                 .iter()
                 .map(|item| OpaqueReplayItem::new(serde_json::to_vec(item).unwrap()))
+                .collect(),
+        )
+    }
+
+    fn google_replay(steps: &[Value]) -> ProviderReplay {
+        ProviderReplay::new(
+            "google",
+            steps
+                .iter()
+                .map(|step| OpaqueReplayItem::new(serde_json::to_vec(step).unwrap()))
                 .collect(),
         )
     }
@@ -2915,6 +2714,48 @@ mod tests {
                 }),
             ]),
         );
+        history.append_user_request("google turn");
+        history
+            .append_completed_code(
+                "print(2)".to_owned(),
+                ModelCallId::new("call_google_1"),
+                Some("Running on Google.".to_owned()),
+                code_reasoning.to_owned(),
+                google_replay(&[
+                    json!({
+                        "type": "thought",
+                        "summary": [{"type": "text", "text": code_reasoning}],
+                        "signature": "google-thought-signature"
+                    }),
+                    json!({
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "Running on Google."}]
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "id": "call_google_1",
+                        "name": "execute_python",
+                        "arguments": {"code": "print(2)"}
+                    }),
+                ]),
+                CodeResult::execution("2\n".to_owned()),
+            )
+            .unwrap();
+        history.append_final_message(
+            "It printed 2.".to_owned(),
+            "Google summary".to_owned(),
+            google_replay(&[
+                json!({
+                    "type": "thought",
+                    "summary": [{"type": "text", "text": "Google summary"}],
+                    "signature": "google-final-signature"
+                }),
+                json!({
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": "It printed 2."}]
+                }),
+            ]),
+        );
         history.append_user_request("thanks");
         history
     }
@@ -2925,17 +2766,21 @@ mod tests {
             (
                 CrossProviderReasoning::Inline,
                 "Checking the file",
-                [Some("Checking the file"), Some("Reading the output")],
+                [
+                    Some("Checking the file"),
+                    Some("Reading the output"),
+                    Some("Google summary"),
+                ],
             ),
             (
                 CrossProviderReasoning::Inline,
                 "",
-                [None, Some("Reading the output")],
+                [None, Some("Reading the output"), Some("Google summary")],
             ),
             (
                 CrossProviderReasoning::Drop,
                 "Checking the file",
-                [None, None],
+                [None, None, None],
             ),
         ] {
             let fixture =
@@ -2972,6 +2817,19 @@ mod tests {
             ]);
             let mut final_turn = reasoning_texts[1].map(text).into_iter().collect::<Vec<_>>();
             final_turn.push(text("It printed 1."));
+            let mut google_code_turn = reasoning_texts[0].map(text).into_iter().collect::<Vec<_>>();
+            google_code_turn.extend([
+                text("Running on Google."),
+                json!({
+                    "type": "tool_use",
+                    "id": "call_google_1",
+                    "name": "execute_python",
+                    "input": {"code": "print(2)"}
+                }),
+            ]);
+            let mut google_final_turn =
+                reasoning_texts[2].map(text).into_iter().collect::<Vec<_>>();
+            google_final_turn.push(text("It printed 2."));
             let mut expected = expected_request(json!([
                 {"role": "user", "content": [text("first request")]},
                 {"role": "assistant", "content": message_blocks()},
@@ -2985,6 +2843,17 @@ mod tests {
                     ]
                 },
                 {"role": "assistant", "content": final_turn},
+                {"role": "user", "content": [text("google turn")]},
+                {"role": "assistant", "content": google_code_turn},
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_google_1",
+                        "content": "2\n"
+                    }]
+                },
+                {"role": "assistant", "content": google_final_turn},
                 {
                     "role": "user",
                     "content": [{
@@ -3007,7 +2876,16 @@ mod tests {
             );
             for request in &requests {
                 let body = request.body.to_string();
-                for opaque in ["openai-encrypted", "rs_1", "fc_1", "msg_1", "summary_text"] {
+                for opaque in [
+                    "openai-encrypted",
+                    "rs_1",
+                    "fc_1",
+                    "msg_1",
+                    "summary_text",
+                    "google-thought-signature",
+                    "google-final-signature",
+                    "model_output",
+                ] {
                     assert!(!body.contains(opaque), "{opaque} leaked into {body}");
                 }
                 assert_eq!(cache_breakpoints(&request.body), 2);
@@ -3317,84 +3195,6 @@ mod tests {
 
         result.unwrap();
         assert_same_requests(&fixture, 2);
-    }
-
-    fn header_map(pairs: &[(&'static str, &str)]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for (name, value) in pairs {
-            headers.insert(*name, HeaderValue::from_str(value).unwrap());
-        }
-        headers
-    }
-
-    #[test]
-    fn retry_delay_prefers_retry_after_ms_caps_server_delays_and_otherwise_backs_off() {
-        let huge = "9".repeat(400);
-        for (pairs, retry, expected) in [
-            (
-                &[("retry-after-ms", "250"), ("retry-after", "30")][..],
-                0,
-                Duration::from_millis(250),
-            ),
-            (&[("retry-after", "2")], 0, Duration::from_secs(2)),
-            (&[("retry-after", "120")], 0, Duration::from_secs(60)),
-            (&[("retry-after-ms", "120000")], 0, Duration::from_secs(60)),
-            (&[("retry-after", "1e20")], 0, Duration::from_secs(60)),
-            (
-                &[("retry-after", huge.as_str())],
-                0,
-                Duration::from_secs(60),
-            ),
-            (&[("retry-after-ms", "1e30")], 0, Duration::from_secs(60)),
-            (
-                &[("retry-after-ms", huge.as_str()), ("retry-after", "3")],
-                0,
-                Duration::from_secs(60),
-            ),
-            (&[("retry-after", "NaN")], 0, Duration::from_millis(100)),
-            (
-                &[("retry-after-ms", "soon"), ("retry-after", "3")],
-                0,
-                Duration::from_secs(3),
-            ),
-            (&[("retry-after", "-1")], 0, Duration::from_millis(100)),
-            (
-                &[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
-                1,
-                Duration::from_millis(200),
-            ),
-            (&[], 0, Duration::from_millis(100)),
-            (&[], 1, Duration::from_millis(200)),
-        ] {
-            assert_eq!(
-                retry_delay(&header_map(pairs), retry),
-                expected,
-                "{pairs:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn retry_after_http_dates_delay_until_a_future_date_capped_and_ignore_past_dates() {
-        let date = |offset: OffsetDateTime| offset.format(&Rfc2822).unwrap();
-        let now = OffsetDateTime::now_utc();
-        let beyond_cap = date(now + Duration::from_secs(120));
-        let imf_fixdate = date(now + Duration::from_secs(30)).replace("+0000", "GMT");
-        let past = date(now - Duration::from_secs(120));
-
-        assert_eq!(
-            retry_delay(&header_map(&[("retry-after", beyond_cap.as_str())]), 0),
-            Duration::from_secs(60)
-        );
-        let delay = retry_delay(&header_map(&[("retry-after", imf_fixdate.as_str())]), 0);
-        assert!(
-            (Duration::from_secs(28)..=Duration::from_secs(30)).contains(&delay),
-            "{imf_fixdate}: {delay:?}"
-        );
-        assert_eq!(
-            retry_delay(&header_map(&[("retry-after", past.as_str())]), 1),
-            Duration::from_millis(200)
-        );
     }
 
     #[tokio::test]

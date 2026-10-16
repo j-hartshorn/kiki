@@ -592,6 +592,7 @@ pub struct ProviderFailure {
     status: Option<u16>,
     code: Option<String>,
     message: String,
+    authentication: bool,
     context_overflow: bool,
 }
 
@@ -601,8 +602,15 @@ impl ProviderFailure {
             status,
             code: code.map(|value| bounded_utf8(value, PROVIDER_CODE_LIMIT)),
             message: bounded_utf8(message, PROVIDER_MESSAGE_LIMIT),
+            authentication: false,
             context_overflow: false,
         }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn with_authentication(mut self, authentication: bool) -> Self {
+        self.authentication = authentication;
+        self
     }
 
     pub(crate) fn with_context_overflow(mut self, context_overflow: bool) -> Self {
@@ -623,7 +631,7 @@ impl ProviderFailure {
     }
 
     pub fn is_authentication(&self) -> bool {
-        self.status == Some(401)
+        self.authentication || self.status == Some(401)
     }
 
     pub fn is_context_overflow(&self) -> bool {
@@ -1582,6 +1590,39 @@ mod tests {
         ] {
             assert!(!ModelFailure::from(error).is_context_overflow());
         }
+    }
+
+    #[test]
+    fn provider_failures_mark_authentication_on_http_401_or_explicit_flag() {
+        let http_400 = ProviderFailure::new(
+            Some(400),
+            Some("INVALID_ARGUMENT".to_owned()),
+            "API key not valid".to_owned(),
+        );
+        let flagged = http_400.clone().with_authentication(true);
+        let cleared = flagged.clone().with_authentication(false);
+        let http_401 = ProviderFailure::new(
+            Some(401),
+            Some("UNAUTHENTICATED".to_owned()),
+            "missing key".to_owned(),
+        )
+        .with_authentication(false);
+
+        assert!(!http_400.is_authentication());
+        assert!(flagged.is_authentication());
+        assert!(
+            ModelFailure::from(ModelError::Provider(Box::new(flagged.clone()))).is_authentication()
+        );
+        assert_eq!(
+            flagged.to_string(),
+            "authentication failure (HTTP 400) [INVALID_ARGUMENT]: API key not valid"
+        );
+        assert!(!cleared.is_authentication());
+        assert_eq!(
+            cleared.to_string(),
+            "provider failure (HTTP 400) [INVALID_ARGUMENT]: API key not valid"
+        );
+        assert!(http_401.is_authentication());
     }
 
     #[tokio::test]

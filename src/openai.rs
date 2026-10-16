@@ -6224,6 +6224,16 @@ pub(crate) mod tests {
             )
         }
 
+        fn google_replay(steps: &[Value]) -> ProviderReplay {
+            ProviderReplay::new(
+                "google",
+                steps
+                    .iter()
+                    .map(|step| OpaqueReplayItem::new(serde_json::to_vec(step).unwrap()))
+                    .collect(),
+            )
+        }
+
         fn cross_provider_history(code_reasoning: &str) -> ModelHistory {
             let mut history = history("first request");
             history.append_final_message(
@@ -6254,6 +6264,48 @@ pub(crate) mod tests {
                     json!({"type": "text", "text": "It printed 1."}),
                 ]),
             );
+            history.append_user_request("google turn");
+            history
+                .append_completed_code(
+                    "print(2)".to_owned(),
+                    ModelCallId::new("call_google_1"),
+                    Some("Running on Google.".to_owned()),
+                    code_reasoning.to_owned(),
+                    google_replay(&[
+                        json!({
+                            "type": "thought",
+                            "summary": [{"type": "text", "text": code_reasoning}],
+                            "signature": "google-thought-signature"
+                        }),
+                        json!({
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "Running on Google."}]
+                        }),
+                        json!({
+                            "type": "function_call",
+                            "id": "call_google_1",
+                            "name": "execute_python",
+                            "arguments": {"code": "print(2)"}
+                        }),
+                    ]),
+                    CodeResult::execution("2\n".to_owned()),
+                )
+                .unwrap();
+            history.append_final_message(
+                "It printed 2.".to_owned(),
+                "Google summary".to_owned(),
+                google_replay(&[
+                    json!({
+                        "type": "thought",
+                        "summary": [{"type": "text", "text": "Google summary"}],
+                        "signature": "google-final-signature"
+                    }),
+                    json!({
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "It printed 2."}]
+                    }),
+                ]),
+            );
             history.append_user_request("continue");
             history
         }
@@ -6265,17 +6317,21 @@ pub(crate) mod tests {
                 (
                     CrossProviderReasoning::Inline,
                     "Checking the file",
-                    [Some("Checking the file"), Some("Summarising")],
+                    [
+                        Some("Checking the file"),
+                        Some("Summarising"),
+                        Some("Google summary"),
+                    ],
                 ),
                 (
                     CrossProviderReasoning::Inline,
                     "",
-                    [None, Some("Summarising")],
+                    [None, Some("Summarising"), Some("Google summary")],
                 ),
                 (
                     CrossProviderReasoning::Drop,
                     "Checking the file",
-                    [None, None],
+                    [None, None, None],
                 ),
             ] {
                 let fixture = Fixture::start_sequence(vec![
@@ -6325,6 +6381,22 @@ pub(crate) mod tests {
                 input.extend(reasoning_texts[1].map(assistant_text));
                 input.extend([
                     assistant_text("It printed 1."),
+                    json!({"role": "user", "content": "google turn"}),
+                ]);
+                input.extend(reasoning_texts[0].map(assistant_text));
+                input.extend([
+                    assistant_text("Running on Google."),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_google_1",
+                        "name": "execute_python",
+                        "arguments": r#"{"code":"print(2)"}"#
+                    }),
+                    json!({"type": "function_call_output", "call_id": "call_google_1", "output": "2\n"}),
+                ]);
+                input.extend(reasoning_texts[2].map(assistant_text));
+                input.extend([
+                    assistant_text("It printed 2."),
                     json!({"role": "user", "content": "continue"}),
                 ]);
                 let requests = fixture.requests.lock().unwrap().clone();
@@ -6341,7 +6413,14 @@ pub(crate) mod tests {
                 );
                 for request in &requests {
                     let body = request.body.to_string();
-                    for opaque in ["anthropic-signature", "anthropic-redacted-data", "thinking"] {
+                    for opaque in [
+                        "anthropic-signature",
+                        "anthropic-redacted-data",
+                        "thinking",
+                        "google-thought-signature",
+                        "google-final-signature",
+                        "model_output",
+                    ] {
                         assert!(!body.contains(opaque), "{opaque} leaked into {body}");
                     }
                 }

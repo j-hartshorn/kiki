@@ -1,10 +1,29 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::model::ModelProgress;
+use crate::{
+    config::constants::ACCEPTED_MODEL_CONTENT_LIMIT,
+    model::{ModelError, ModelProgress},
+};
 
 pub(crate) const PROGRESS_PAYLOAD_LIMIT: usize = 4 * 1024;
 pub(crate) const PROGRESS_RATE_LIMIT: Duration = Duration::from_millis(50);
+// Room for 16 MiB of content escaped as `\u00XX` (6 bytes per byte) in one frame.
+pub(crate) const SSE_FRAME_LIMIT: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+pub(crate) struct ContentBudget(usize);
+
+impl ContentBudget {
+    pub(crate) fn spend(&mut self, bytes: usize) -> Result<(), ModelError> {
+        self.0 = self
+            .0
+            .checked_add(bytes)
+            .filter(|&used| used <= ACCEPTED_MODEL_CONTENT_LIMIT)
+            .ok_or(ModelError::ContentTooLarge)?;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PresentationKind {
@@ -321,15 +340,68 @@ fn hexadecimal(character: char) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
+pub(crate) struct SseFrameLimit {
+    limit: usize,
+    partial_line: Vec<u8>,
+    frame_bytes: usize,
+    after_cr: bool,
+}
+
+impl SseFrameLimit {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            partial_line: Vec::new(),
+            frame_bytes: 0,
+            after_cr: false,
+        }
+    }
+
+    // eventsource-stream re-parses partial lines per chunk and stalls on a trailing CR: emit whole LF lines.
+    pub(crate) fn complete_lines(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ModelError> {
+        let mut lines = Vec::new();
+        for &byte in chunk {
+            let after_cr = std::mem::replace(&mut self.after_cr, byte == b'\r');
+            match byte {
+                // Only a blank-line CR leaves the count at zero.
+                b'\n' if after_cr && self.frame_bytes == 0 => continue,
+                b'\n' if after_cr => {}
+                b'\r' | b'\n' if self.partial_line.is_empty() => {
+                    self.frame_bytes = 0;
+                    lines.push(b'\n');
+                    continue;
+                }
+                b'\r' | b'\n' => {
+                    lines.append(&mut self.partial_line);
+                    lines.push(b'\n');
+                }
+                _ => self.partial_line.push(byte),
+            }
+            self.frame_bytes += 1;
+            if self.frame_bytes > self.limit {
+                return Err(ModelError::ContentTooLarge);
+            }
+        }
+        Ok(lines)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+    use serde_json::json;
+
     use super::{
         PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT, PresentationBatcher, PresentationKind,
-        PythonPreviewDecoder,
+        PythonPreviewDecoder, SseFrameLimit,
     };
-    use crate::{config::constants::ACCEPTED_MODEL_CONTENT_LIMIT, model::ModelProgress};
+    use crate::{
+        config::constants::ACCEPTED_MODEL_CONTENT_LIMIT,
+        model::{ModelError, ModelProgress},
+    };
 
     #[test]
     fn presentation_batcher_emits_pending_content_at_the_next_due_producer_event() {
@@ -523,6 +595,133 @@ mod tests {
             let mut decoder = PythonPreviewDecoder::default();
             let decoded = decoder.push(arguments);
             assert!(!decoded.contains("ignored"), "{arguments}: {decoded}");
+        }
+    }
+
+    const SMALL_FRAME_LIMIT: usize = 1024;
+
+    fn ignored_frame(padding: &str) -> String {
+        let event = json!({"type": "future_event", "padding": padding});
+        format!("event: future_event\ndata: {event}\n\n")
+    }
+
+    fn error_frame(message: &str) -> String {
+        let event = json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": message}
+        });
+        format!("event: error\ndata: {event}\n\n")
+    }
+
+    fn padded(frame: fn(&str) -> String, frame_bytes: usize) -> String {
+        // The closing blank line resets the count instead of adding to it.
+        let framing = frame("").len() - 1;
+        frame(&"x".repeat(frame_bytes - framing))
+    }
+
+    #[tokio::test]
+    async fn sse_frame_limit_keeps_a_crlf_split_across_chunks_as_one_line_ending() {
+        let mut frames = SseFrameLimit::new(SMALL_FRAME_LIMIT);
+        let chunks: [&[u8]; 3] = [
+            b"event: ping\r",
+            b"\ndata: {\"type\":\"ping\"}\r",
+            b"\n\r\n",
+        ];
+
+        let events = futures::stream::iter(chunks)
+            .map(|chunk| frames.complete_lines(chunk))
+            .eventsource()
+            .map(|event| event.map(|event| (event.event, event.data)))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            events,
+            [Ok(("ping".to_owned(), r#"{"type":"ping"}"#.to_owned()))]
+        );
+    }
+
+    #[test]
+    fn sse_frame_limit_accepts_ignored_and_error_frames_at_the_limit_but_not_one_byte_over() {
+        for frame in [ignored_frame, error_frame] {
+            let at_limit = padded(frame, SMALL_FRAME_LIMIT);
+            let over_limit = padded(frame, SMALL_FRAME_LIMIT + 1);
+
+            assert_eq!(
+                SseFrameLimit::new(SMALL_FRAME_LIMIT).complete_lines(at_limit.as_bytes()),
+                Ok(at_limit.into_bytes())
+            );
+            assert_eq!(
+                SseFrameLimit::new(SMALL_FRAME_LIMIT).complete_lines(over_limit.as_bytes()),
+                Err(ModelError::ContentTooLarge)
+            );
+        }
+    }
+
+    #[test]
+    fn sse_frame_limit_charges_both_bytes_of_crlf_frame_lines_in_whole_and_byte_chunks() {
+        let crlf_frame = |frame_bytes: usize| {
+            let framing = "event: ping\r\ndata: \r\n".len();
+            format!(
+                "event: ping\r\ndata: {}\r\n\r\n",
+                "x".repeat(frame_bytes - framing)
+            )
+        };
+        let at_limit = crlf_frame(SMALL_FRAME_LIMIT).repeat(2);
+        let over_limit = crlf_frame(SMALL_FRAME_LIMIT + 1);
+        for chunk_size in [1, usize::MAX] {
+            let lines = |body: &str| {
+                let mut frames = SseFrameLimit::new(SMALL_FRAME_LIMIT);
+                body.as_bytes()
+                    .chunks(chunk_size)
+                    .map(|chunk| frames.complete_lines(chunk))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|lines| lines.concat())
+            };
+
+            assert_eq!(
+                lines(&at_limit),
+                Ok(at_limit.replace("\r\n", "\n").into_bytes()),
+                "{chunk_size}-byte chunks"
+            );
+            assert_eq!(
+                lines(&over_limit),
+                Err(ModelError::ContentTooLarge),
+                "{chunk_size}-byte chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_frame_limit_emits_each_line_ending_as_one_lf_and_resets_at_blank_lines_across_chunks() {
+        for line_end in ["\n", "\r", "\r\n"] {
+            let frame = format!("xxx{line_end}xxx{line_end}");
+            let body = format!("{frame}{line_end}{frame}{line_end}{frame}");
+            for chunk_size in [1, 2, 3, body.len()] {
+                let mut frames = SseFrameLimit::new(frame.len());
+
+                let lines = body
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .map(|chunk| frames.complete_lines(chunk))
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+
+                assert!(
+                    lines
+                        .iter()
+                        .all(|lines| lines.last().is_none_or(|&byte| byte == b'\n'))
+                );
+                assert_eq!(
+                    lines.concat(),
+                    body.replace(line_end, "\n").into_bytes(),
+                    "{line_end:?} in {chunk_size}-byte chunks"
+                );
+                assert_eq!(
+                    frames.complete_lines(b"x"),
+                    Err(ModelError::ContentTooLarge)
+                );
+            }
         }
     }
 }

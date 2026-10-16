@@ -4,6 +4,8 @@ pub mod arena;
 mod clipboard;
 mod compaction;
 pub mod config;
+#[cfg(test)]
+mod google;
 mod highlight;
 mod login;
 pub mod model;

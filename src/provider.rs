@@ -1,5 +1,7 @@
 use std::future::Future;
+use std::time::Duration;
 
+use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -16,6 +18,48 @@ use crate::{
     openai::OpenAiModel,
     subagents::ChildModelFactory,
 };
+
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
+const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const SERVER_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(60);
+
+pub(crate) fn retry_delay(headers: &reqwest::header::HeaderMap, retry: u32) -> Duration {
+    let header = |name: &str| headers.get(name)?.to_str().ok().map(str::trim);
+    let number = |value: &str| value.parse::<f64>().ok().filter(|number| *number >= 0.0);
+    let seconds_until = |value: &str| {
+        let date = OffsetDateTime::parse(value, &Rfc2822).ok()?;
+        Some((date - OffsetDateTime::now_utc()).as_seconds_f64()).filter(|seconds| *seconds >= 0.0)
+    };
+    header("retry-after-ms")
+        .and_then(number)
+        .map(|milliseconds| milliseconds / 1000.0)
+        .or_else(|| {
+            let value = header("retry-after")?;
+            number(value).or_else(|| seconds_until(value))
+        })
+        // Cap before converting: huge values overflow `Duration`.
+        .map(|seconds| Duration::from_secs_f64(seconds.min(SERVER_RETRY_DELAY_LIMIT.as_secs_f64())))
+        .unwrap_or(HTTP_RETRY_BACKOFF * 2_u32.pow(retry))
+}
+
+pub(crate) fn redact(value: &str, api_key: &str) -> String {
+    if api_key.is_empty() {
+        value.to_owned()
+    } else {
+        value.replace(api_key, "[REDACTED]")
+    }
+}
+
+pub(crate) async fn bounded_body(response: &mut reqwest::Response) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > ERROR_BODY_LIMIT {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
 
 #[derive(Clone)]
 pub(crate) struct ProviderModel {
@@ -162,10 +206,14 @@ impl ChildModelFactory for ProviderModel {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use reqwest::header::{HeaderMap, HeaderValue};
     use serde_json::json;
+    use time::{OffsetDateTime, format_description::well_known::Rfc2822};
     use tokio_util::sync::CancellationToken;
 
-    use super::ProviderModel;
+    use super::{ProviderModel, retry_delay};
     use crate::{
         anthropic::AnthropicModel,
         config::{
@@ -311,6 +359,84 @@ mod tests {
             let (header, value) = line.split_once(':')?;
             header.eq_ignore_ascii_case(name).then(|| value.trim())
         })
+    }
+
+    fn header_map(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn retry_delay_prefers_retry_after_ms_caps_server_delays_and_otherwise_backs_off() {
+        let huge = "9".repeat(400);
+        for (pairs, retry, expected) in [
+            (
+                &[("retry-after-ms", "250"), ("retry-after", "30")][..],
+                0,
+                Duration::from_millis(250),
+            ),
+            (&[("retry-after", "2")], 0, Duration::from_secs(2)),
+            (&[("retry-after", "120")], 0, Duration::from_secs(60)),
+            (&[("retry-after-ms", "120000")], 0, Duration::from_secs(60)),
+            (&[("retry-after", "1e20")], 0, Duration::from_secs(60)),
+            (
+                &[("retry-after", huge.as_str())],
+                0,
+                Duration::from_secs(60),
+            ),
+            (&[("retry-after-ms", "1e30")], 0, Duration::from_secs(60)),
+            (
+                &[("retry-after-ms", huge.as_str()), ("retry-after", "3")],
+                0,
+                Duration::from_secs(60),
+            ),
+            (&[("retry-after", "NaN")], 0, Duration::from_millis(100)),
+            (
+                &[("retry-after-ms", "soon"), ("retry-after", "3")],
+                0,
+                Duration::from_secs(3),
+            ),
+            (&[("retry-after", "-1")], 0, Duration::from_millis(100)),
+            (
+                &[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
+                1,
+                Duration::from_millis(200),
+            ),
+            (&[], 0, Duration::from_millis(100)),
+            (&[], 1, Duration::from_millis(200)),
+        ] {
+            assert_eq!(
+                retry_delay(&header_map(pairs), retry),
+                expected,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_http_dates_delay_until_a_future_date_capped_and_ignore_past_dates() {
+        let date = |offset: OffsetDateTime| offset.format(&Rfc2822).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let beyond_cap = date(now + Duration::from_secs(120));
+        let imf_fixdate = date(now + Duration::from_secs(30)).replace("+0000", "GMT");
+        let past = date(now - Duration::from_secs(120));
+
+        assert_eq!(
+            retry_delay(&header_map(&[("retry-after", beyond_cap.as_str())]), 0),
+            Duration::from_secs(60)
+        );
+        let delay = retry_delay(&header_map(&[("retry-after", imf_fixdate.as_str())]), 0);
+        assert!(
+            (Duration::from_secs(28)..=Duration::from_secs(30)).contains(&delay),
+            "{imf_fixdate}: {delay:?}"
+        );
+        assert_eq!(
+            retry_delay(&header_map(&[("retry-after", past.as_str())]), 1),
+            Duration::from_millis(200)
+        );
     }
 
     #[tokio::test]
