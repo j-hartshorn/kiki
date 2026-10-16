@@ -21,6 +21,7 @@ mod skills;
 mod sse_fixture;
 mod subagents;
 mod telemetry;
+mod theme;
 pub mod tools;
 mod transcript;
 pub mod tui;

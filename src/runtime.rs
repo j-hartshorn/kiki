@@ -9023,7 +9023,7 @@ mod tests {
         assert_eq!(restored, live);
 
         let render = |transcript: &mut Transcript| {
-            let layout = transcript.layout(1024);
+            let layout = transcript.layout(&crate::theme::DARK, 1024);
             let height = u16::try_from(layout.total_height()).expect("test transcript height");
             let mut buffer =
                 ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1024, height));
@@ -15292,7 +15292,7 @@ mod tests {
         for event in settled.iter().cloned() {
             transcript.apply(event, false);
         }
-        let layout = transcript.layout(1024);
+        let layout = transcript.layout(&crate::theme::DARK, 1024);
         let height = u16::try_from(layout.total_height()).expect("test transcript height");
         let mut buffer =
             ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1024, height));
@@ -15819,7 +15819,10 @@ mod tests {
         for event in foreground {
             transcript.apply(event, false);
         }
-        let before = transcript.layout(128).footer_rule(128).to_string();
+        let before = transcript
+            .layout(&crate::theme::DARK, 128)
+            .footer_rule(&crate::theme::DARK, 128)
+            .to_string();
         assert!(before.contains("↑100 ↓10 R50 W0"), "{before}");
         assert!(before.contains("$0.00002300"), "{before}");
         assert!(before.contains("CH50.0%"), "{before}");
@@ -15861,7 +15864,10 @@ mod tests {
                 break;
             }
         }
-        let after = transcript.layout(128).footer_rule(128).to_string();
+        let after = transcript
+            .layout(&crate::theme::DARK, 128)
+            .footer_rule(&crate::theme::DARK, 128)
+            .to_string();
         assert!(after.contains("↑300 ↓30 R50 W0"), "{after}");
         assert!(after.contains("$0.0006630"), "{after}");
         assert!(after.contains("CH50.0%"), "{after}");
@@ -16447,7 +16453,10 @@ mod tests {
         {
             transcript.apply(event, false);
         }
-        let footer = transcript.layout(160).footer_rule(160).to_string();
+        let footer = transcript
+            .layout(&crate::theme::DARK, 160)
+            .footer_rule(&crate::theme::DARK, 160)
+            .to_string();
         assert!(footer.contains("↑560 ↓56 R100 W0"), "{footer}");
         assert!(footer.contains("CH20.0%"), "{footer}");
         assert!(footer.contains("0.0%/272k"), "{footer}");
@@ -17622,7 +17631,10 @@ mod tests {
         let initial = restored_initial_state(&restore);
         let mut transcript =
             Transcript::restored(crate::config::ready_snapshot_for_test(), &initial);
-        let footer = transcript.layout(160).footer_rule(160).to_string();
+        let footer = transcript
+            .layout(&crate::theme::DARK, 160)
+            .footer_rule(&crate::theme::DARK, 160)
+            .to_string();
         assert!(footer.contains("↑220 ↓20"), "{footer}");
         assert!(footer.contains("CH0.0%"), "{footer}");
         assert!(footer.contains("0.0%/272k"), "{footer}");
@@ -17756,8 +17768,8 @@ mod tests {
         );
         let returned_footer =
             Transcript::restored(crate::config::ready_snapshot_for_test(), &returned_state)
-                .layout(160)
-                .footer_rule(160)
+                .layout(&crate::theme::DARK, 160)
+                .footer_rule(&crate::theme::DARK, 160)
                 .to_string();
         assert!(returned_footer.contains("↑220 ↓20"), "{returned_footer}");
         assert!(returned_footer.contains("CH0.0%"), "{returned_footer}");

@@ -41,6 +41,7 @@ use crate::runtime::{
 use crate::selection::{DocumentPosition, Selection};
 use crate::skills::{SkillCatalog, SkillDiagnostic, SkillLookupError};
 use crate::telemetry::{Trace, TraceEvent};
+use crate::theme::{self, Theme};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
@@ -196,6 +197,7 @@ struct ThinkingPreview {
 }
 
 struct App {
+    theme: &'static Theme,
     mode: AppMode,
     prompt: PromptEditor,
     prompt_width: u16,
@@ -252,6 +254,7 @@ impl Default for App {
         let settings_selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
             .expect("default model thinking must be supported");
         Self {
+            theme: &theme::DARK,
             mode: AppMode::Configured,
             prompt: PromptEditor::default(),
             prompt_width: 80,
@@ -2291,6 +2294,7 @@ fn run_project_skill_trust_loop<B: Backend>(
             terminal
                 .draw(|frame| {
                     visible_path_rows = render_project_skill_trust(
+                        &theme::DARK,
                         frame,
                         scope,
                         trust_selected,
@@ -2361,6 +2365,7 @@ fn run_project_skill_trust_loop<B: Backend>(
 }
 
 fn render_project_skill_trust(
+    theme: &Theme,
     frame: &mut Frame,
     scope: &Path,
     trust_selected: bool,
@@ -2371,7 +2376,7 @@ fn render_project_skill_trust(
     if area.is_empty() {
         return None;
     }
-    frame.buffer_mut().set_style(area, page_style());
+    frame.buffer_mut().set_style(area, page_style(theme));
     let width = area.width.min(100);
     let height = area.height.min(12);
     let popup = Rect::new(
@@ -2804,9 +2809,9 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     if let Some(stale_overlay) = app.slash_overlay.take() {
         frame.render_widget(Clear, stale_overlay.intersection(area));
     }
-    frame.buffer_mut().set_style(area, page_style());
+    frame.buffer_mut().set_style(area, page_style(app.theme));
     if area.width == 0 || area.height == 0 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
         app.history_unavailable();
         return;
     }
@@ -2847,7 +2852,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     }
 
     if configuration_only {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
         if area.height == 1 {
             app.history_unavailable();
             return;
@@ -2883,6 +2888,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             .min(area.height.saturating_sub(1));
         let dock_top = bottom_rule.y.saturating_sub(dock_height);
         let monitor = app.subagent_monitor.layout(
+            app.theme,
             area.width,
             dock_top.saturating_sub(area.y).saturating_sub(1),
             now,
@@ -2904,7 +2910,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         );
         let rule_style = thinking_rule_style(app.settings_selection);
         frame.render_widget(
-            Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
+            Paragraph::new(layout.footer_rule(app.theme, bottom_rule.width)).style(rule_style),
             bottom_rule,
         );
         if let Some(navigator) = &mut app.tree_navigator {
@@ -2918,13 +2924,13 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     }
 
     if area.height == 1 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
         app.history_unavailable();
         return;
     }
 
     if area.height <= 3 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
         let rule_style = thinking_rule_style(app.settings_selection);
         if area.height == 3 {
             render_rule(
@@ -2934,13 +2940,14 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             );
         }
         let layout = match app.footer_context() {
-            Some(context) => app
-                .transcript
-                .layout_with_footer(bottom_rule.width, context),
-            None => app.transcript.layout(bottom_rule.width),
+            Some(context) => {
+                app.transcript
+                    .layout_with_footer(app.theme, bottom_rule.width, context)
+            }
+            None => app.transcript.layout(app.theme, bottom_rule.width),
         };
         frame.render_widget(
-            Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
+            Paragraph::new(layout.footer_rule(app.theme, bottom_rule.width)).style(rule_style),
             bottom_rule,
         );
         app.history_unavailable();
@@ -2978,10 +2985,13 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     let pending_card = app
         .transcript
         .pending_model_change(app.settings_selection)
-        .map(|selection| model_change_card(selection, app.settings_pending(), area.width))
+        .map(|selection| {
+            model_change_card(app.theme, selection, app.settings_pending(), area.width)
+        })
         .filter(|card| card.height() < history_height.saturating_sub(throbber_height));
     let card_height = pending_card.as_ref().map_or(0, ModelChangeCard::height);
     let monitor = app.subagent_monitor.layout(
+        app.theme,
         area.width,
         history_height
             .saturating_sub(throbber_height)
@@ -3064,7 +3074,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         prompt,
     ));
     frame.render_widget(
-        Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
+        Paragraph::new(layout.footer_rule(app.theme, bottom_rule.width)).style(rule_style),
         bottom_rule,
     );
     if let Some(picker) = &mut app.picker {
@@ -3074,8 +3084,10 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
 
 fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> TranscriptLayout {
     let layout = match app.footer_context() {
-        Some(context) => app.transcript.layout_with_footer(viewport.width, context),
-        None => app.transcript.layout(viewport.width),
+        Some(context) => app
+            .transcript
+            .layout_with_footer(app.theme, viewport.width, context),
+        None => app.transcript.layout(app.theme, viewport.width),
     };
     if viewport.is_empty() {
         app.history_unavailable();
@@ -3137,7 +3149,7 @@ fn render_slash_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(area.right().saturating_sub(width));
     let overlay = Rect::new(x, area.bottom().saturating_sub(height), width, height);
     frame.render_widget(Clear, overlay);
-    frame.buffer_mut().set_style(overlay, page_style());
+    frame.buffer_mut().set_style(overlay, page_style(app.theme));
     let lines = rows.into_iter().map(|row| {
         let text = format!("{} {}", row.token, row.purpose);
         let padding = usize::from(width).saturating_sub(Line::raw(&text).width());
@@ -6852,7 +6864,7 @@ mod tests {
         assert_eq!(history_bottom(&app), rule - 3);
         let buffer = rendered_buffer(&mut app, 80, 40);
         let (column, row) = cell_start(&buffer, "[pending]");
-        assert_eq!(buffer[(column, row)].fg, Color::Rgb(128, 128, 128));
+        assert_eq!(buffer[(column, row)].fg, app.theme.muted);
 
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
         let (rows, rule) = rows_and_prompt_rule(&mut app);
@@ -12366,7 +12378,7 @@ mod tests {
                     && full[(*column + 4, 3)].symbol() == "%"
             })
             .expect("context percentage");
-        assert_eq!(full[(column, 3)].fg, Color::Yellow);
+        assert_eq!(full[(column, 3)].fg, app.theme.warning);
         let full = rendered(&mut app, 80, 4);
         assert!(
             full.lines()

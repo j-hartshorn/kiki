@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crate::pricing::RunCostEstimate;
 use crate::runtime::{Record, RestoredTimelineItem, RuntimeEvent};
 use crate::subagents::{TaskId, TaskObservation, TaskRecord, TaskState};
+use crate::theme::Theme;
 use crate::transcript::{format_footer_usd, muted_page_style, normalise_terminal_text};
 use ratatui::style::Style;
 use ratatui::text::{Line, Text};
@@ -247,6 +248,7 @@ impl SubagentMonitor {
 
     pub(super) fn layout(
         &mut self,
+        theme: &Theme,
         width: u16,
         available_rows: u16,
         now: Instant,
@@ -276,7 +278,8 @@ impl SubagentMonitor {
             };
         };
 
-        let (mut lines, visible_elapsed) = self.render_projection(&forest, &projection, width, now);
+        let (mut lines, visible_elapsed) =
+            self.render_projection(theme, &forest, &projection, width, now);
         if padding {
             lines.insert(0, Line::raw(""));
             lines.push(Line::raw(""));
@@ -430,6 +433,7 @@ impl SubagentMonitor {
 
     fn render_projection(
         &self,
+        theme: &Theme,
         forest: &Forest,
         projection: &Projection,
         width: u16,
@@ -444,11 +448,11 @@ impl SubagentMonitor {
             .enumerate()
         {
             render_node(
+                theme,
                 &mut lines,
                 &mut visible_elapsed,
-                id,
+                (id, &self.entries[id]),
                 depth,
-                &self.entries,
                 width,
                 now,
             );
@@ -486,11 +490,11 @@ impl SubagentMonitor {
 
         for root in &projection.roots {
             render_node(
+                theme,
                 &mut lines,
                 &mut visible_elapsed,
-                root,
+                (root, &self.entries[root]),
                 0,
-                &self.entries,
                 width,
                 now,
             );
@@ -679,15 +683,15 @@ fn choose_candidate(
 }
 
 fn render_node(
+    theme: &Theme,
     lines: &mut Vec<Line<'static>>,
     visible_elapsed: &mut Vec<(String, u64)>,
-    id: &str,
+    node: (&str, &Entry),
     depth: usize,
-    entries: &BTreeMap<String, Entry>,
     width: u16,
     now: Instant,
 ) {
-    let entry = &entries[id];
+    let (id, entry) = node;
     let elapsed = entry.elapsed(now);
     let header = header_at(
         id,
@@ -699,7 +703,7 @@ fn render_node(
     if is_active(entry.observation.state) && header.shows_elapsed {
         visible_elapsed.push((id.to_owned(), elapsed.as_secs()));
     }
-    let style = terminal_style(entry.observation.state);
+    let style = terminal_style(theme, entry.observation.state);
     lines.push(Line::styled(header.text, style));
     lines.push(Line::styled(
         prompt_preview_at(&entry.prompt, width, depth),
@@ -740,10 +744,12 @@ fn is_active(state: TaskState) -> bool {
     )
 }
 
-fn terminal_style(state: TaskState) -> Style {
-    (!is_active(state))
-        .then(muted_page_style)
-        .unwrap_or_default()
+fn terminal_style(theme: &Theme, state: TaskState) -> Style {
+    if is_active(state) {
+        Style::default()
+    } else {
+        muted_page_style(theme)
+    }
 }
 
 struct Header {
@@ -1097,7 +1103,7 @@ mod tests {
 
     fn layout_text(monitor: &mut SubagentMonitor, width: u16, rows: u16, now: Instant) -> String {
         monitor
-            .layout(width, rows, now)
+            .layout(&crate::theme::DARK, width, rows, now)
             .lines
             .iter()
             .map(ToString::to_string)
@@ -1235,7 +1241,7 @@ mod tests {
         monitor.entries.get_mut("03").unwrap().observation.state = TaskState::Running;
 
         let text = monitor
-            .layout(120, 12, now)
+            .layout(&crate::theme::DARK, 120, 12, now)
             .lines
             .iter()
             .map(ToString::to_string)
@@ -1630,7 +1636,7 @@ mod tests {
             );
         }
 
-        let layout = monitor.layout(120, 11, now);
+        let layout = monitor.layout(&crate::theme::DARK, 120, 11, now);
         let text = layout
             .lines
             .iter()
@@ -1654,10 +1660,16 @@ mod tests {
             entry(TaskState::Completed, RunCostEstimate::Unavailable, now),
         );
 
-        let layout = monitor.layout(120, 4, now);
+        let layout = monitor.layout(&crate::theme::DARK, 120, 4, now);
 
-        assert_eq!(layout.lines[1].style, crate::transcript::muted_page_style());
-        assert_eq!(layout.lines[2].style, crate::transcript::muted_page_style());
+        assert_eq!(
+            layout.lines[1].style,
+            crate::transcript::muted_page_style(&crate::theme::DARK)
+        );
+        assert_eq!(
+            layout.lines[2].style,
+            crate::transcript::muted_page_style(&crate::theme::DARK)
+        );
     }
 
     #[test]
@@ -1675,14 +1687,19 @@ mod tests {
             entry(TaskState::Completed, RunCostEstimate::Unavailable, now),
         );
 
-        let summary = monitor.layout(80, 1, now);
+        let summary = monitor.layout(&crate::theme::DARK, 80, 1, now);
         assert_eq!(
             summary.lines[0].to_string(),
             "  Subagents: 1 active, 1 finished"
         );
-        assert!(monitor.layout(80, 0, now).lines.is_empty());
+        assert!(
+            monitor
+                .layout(&crate::theme::DARK, 80, 0, now)
+                .lines
+                .is_empty()
+        );
         for width in 0..12 {
-            let layout = monitor.layout(width, 4, now);
+            let layout = monitor.layout(&crate::theme::DARK, width, 4, now);
             assert!(
                 layout
                     .lines
@@ -1702,12 +1719,12 @@ mod tests {
             entry(TaskState::Running, RunCostEstimate::Unavailable, now),
         );
 
-        monitor.layout(120, 4, now);
+        monitor.layout(&crate::theme::DARK, 120, 4, now);
         assert!(!monitor.tick(now + Duration::from_millis(999)));
         assert!(monitor.tick(now + Duration::from_secs(1)));
-        monitor.layout(120, 4, now + Duration::from_secs(1));
+        monitor.layout(&crate::theme::DARK, 120, 4, now + Duration::from_secs(1));
         assert!(!monitor.tick(now + Duration::from_secs(1) + Duration::from_millis(999)));
-        monitor.layout(120, 1, now + Duration::from_secs(2));
+        monitor.layout(&crate::theme::DARK, 120, 1, now + Duration::from_secs(2));
         assert!(!monitor.tick(now + Duration::from_secs(3)));
     }
 
@@ -1764,7 +1781,7 @@ mod tests {
         ));
         assert!(
             monitor
-                .layout(120, 4, now)
+                .layout(&crate::theme::DARK, 120, 4, now)
                 .lines
                 .iter()
                 .any(|line| line.to_string().contains("00:10"))
@@ -1789,7 +1806,12 @@ mod tests {
             now,
         ));
         assert!(!monitor.apply(&RuntimeEvent::SubagentFinished { record: status }, now,));
-        assert!(monitor.layout(120, 4, now).lines.is_empty());
+        assert!(
+            monitor
+                .layout(&crate::theme::DARK, 120, 4, now)
+                .lines
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1843,7 +1865,7 @@ mod tests {
         ));
         assert_eq!(monitor.admission_order, ["run001"]);
         monitor.entries.get_mut("run001").unwrap().observation.state = TaskState::Completed;
-        let layout = monitor.layout(120, 4, now + Duration::from_secs(10));
+        let layout = monitor.layout(&crate::theme::DARK, 120, 4, now + Duration::from_secs(10));
         assert!(
             layout
                 .lines

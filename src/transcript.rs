@@ -35,6 +35,7 @@ use crate::selection::{
 use crate::session::{CompactionOutcome, CompactionReason};
 use crate::skills::SkillOrigin;
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
+use crate::theme::Theme;
 
 #[derive(Clone, Copy)]
 struct MarkdownStyleSheet;
@@ -108,6 +109,7 @@ struct SubagentFinishedCard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompactionCard {
+    state: ArenaState,
     heading: String,
     collapsed: String,
     expanded: CompactionContent,
@@ -276,6 +278,16 @@ enum ArenaState {
     Error,
 }
 
+impl ArenaState {
+    fn background(self, theme: &Theme) -> Color {
+        match self {
+            Self::InProgress => theme.tool_pending_bg,
+            Self::Complete => theme.tool_success_bg,
+            Self::Error => theme.tool_error_bg,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArenaContent {
     label: &'static str,
@@ -362,6 +374,7 @@ impl TranscriptBlock {
                 })
             }
             Self::Compaction(card) => NormalisedBlock::Compaction(CompactionCard {
+                state: card.state,
                 heading: normalise_terminal_text(&card.heading),
                 collapsed: normalise_terminal_text(&card.collapsed),
                 expanded: card.expanded.normalise(),
@@ -431,34 +444,24 @@ impl TranscriptBlock {
     }
 }
 
-const PAGE: Color = Color::Reset;
-const TEXT: Color = Color::Rgb(212, 212, 212);
-const MUTED: Color = Color::Rgb(128, 128, 128);
-const DIM: Color = Color::Rgb(102, 102, 102);
-const USER: Color = Color::Rgb(52, 53, 65);
-const IN_PROGRESS_ARENA: Color = Color::Rgb(40, 40, 50);
-const COMPLETE_ARENA: Color = Color::Rgb(40, 50, 40);
-const ERROR_ARENA: Color = Color::Rgb(60, 40, 40);
-const REASONING: Color = Color::Rgb(30, 30, 36);
-
-pub(crate) fn page_style() -> Style {
-    Style::reset().fg(TEXT).bg(PAGE)
+pub(crate) fn page_style(theme: &Theme) -> Style {
+    Style::reset().fg(theme.text).bg(Color::Reset)
 }
 
-pub(crate) fn muted_page_style() -> Style {
-    page_style().fg(MUTED)
+pub(crate) fn muted_page_style(theme: &Theme) -> Style {
+    page_style(theme).fg(theme.muted)
 }
 
-fn card_style(background: Color) -> Style {
-    Style::reset().fg(TEXT).bg(background)
+fn card_style(theme: &Theme, background: Color) -> Style {
+    Style::reset().fg(theme.text).bg(background)
 }
 
-fn muted_card_style(background: Color) -> Style {
-    Style::reset().fg(MUTED).bg(background)
+fn muted_card_style(theme: &Theme, background: Color) -> Style {
+    Style::reset().fg(theme.muted).bg(background)
 }
 
-fn dim_card_style(background: Color) -> Style {
-    Style::reset().fg(DIM).bg(background)
+fn dim_card_style(theme: &Theme, background: Color) -> Style {
+    Style::reset().fg(theme.dim).bg(background)
 }
 
 fn effective_padding(width: u16, wanted: u16) -> (u16, u16) {
@@ -486,6 +489,7 @@ fn code_preview(source: &str, expanded: bool) -> (String, Option<usize>) {
 }
 
 fn tool_call_text(
+    theme: &Theme,
     tool_calls: &[ToolCall],
     run_previews: &[Option<RunPreview>],
     expanded: bool,
@@ -499,7 +503,7 @@ fn tool_call_text(
     if let Some(omitted) = omitted {
         lines.push(Line::styled(
             format!("[{omitted} earlier tool calls omitted]"),
-            dim_card_style(background),
+            dim_card_style(theme, background),
         ));
     }
     for (index, call) in tool_calls
@@ -507,25 +511,28 @@ fn tool_call_text(
         .enumerate()
         .skip(omitted.unwrap_or_default())
     {
-        lines.push(Line::styled(tool_call_label(call), card_style(background)));
+        lines.push(Line::styled(
+            tool_call_label(call),
+            card_style(theme, background),
+        ));
         if let Some(preview) = run_previews.get(index).and_then(Option::as_ref) {
             lines.push(Line::styled(
                 format!("╭─ $ {}", preview.command),
-                dim_card_style(background),
+                dim_card_style(theme, background),
             ));
             if !preview.stdout.is_empty() {
                 lines.extend(
-                    logical_lines(&preview.stdout)
-                        .into_iter()
-                        .map(|line| Line::styled(format!("│ {line}"), card_style(background))),
+                    logical_lines(&preview.stdout).into_iter().map(|line| {
+                        Line::styled(format!("│ {line}"), card_style(theme, background))
+                    }),
                 );
             }
-            lines.push(Line::styled("╰─", dim_card_style(background)));
+            lines.push(Line::styled("╰─", dim_card_style(theme, background)));
         }
     }
     Some(Text {
         alignment: None,
-        style: card_style(background),
+        style: card_style(theme, background),
         lines,
     })
 }
@@ -713,6 +720,7 @@ fn accounting_line(text: String, style: Style) -> Line<'static> {
 }
 
 fn assistant_text(
+    theme: &Theme,
     markdown_source: &str,
     accounting: Option<String>,
     #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
@@ -723,14 +731,14 @@ fn assistant_text(
             #[cfg(test)]
             construction_counts,
         ),
-        page_style(),
+        page_style(theme),
     );
     if let Some(accounting) = accounting {
         if !markdown_source.is_empty() {
             text.lines.push(Line::raw(""));
         }
         text.lines
-            .push(accounting_line(accounting, muted_page_style()));
+            .push(accounting_line(accounting, muted_page_style(theme)));
     }
     text
 }
@@ -1028,6 +1036,7 @@ impl ArenaText {
 }
 
 struct ArenaSection {
+    frame_style: Style,
     title: String,
     body: ArenaText,
     fallback_label: Option<ArenaText>,
@@ -1038,7 +1047,14 @@ struct ArenaSection {
 }
 
 impl ArenaSection {
-    fn new(title: impl Into<String>, body: Text<'static>, style: Style, width: u16) -> Self {
+    fn new(
+        theme: &Theme,
+        title: impl Into<String>,
+        body: Text<'static>,
+        style: Style,
+        width: u16,
+    ) -> Self {
+        let frame_style = muted_card_style(theme, style.bg.unwrap_or(Color::Reset));
         let title = title.into();
         let label_width = u16::try_from(Line::raw(&title).width()).unwrap_or(u16::MAX);
         let framed = width >= label_width.saturating_add(2);
@@ -1051,8 +1067,11 @@ impl ArenaSection {
         let body = ArenaText::new(body, style, body_width);
         let fallback_label = (!framed).then(|| {
             ArenaText::new(
-                literal_text(&title, muted_card_style(style.bg.unwrap_or(PAGE))),
-                muted_card_style(style.bg.unwrap_or(PAGE)),
+                literal_text(
+                    &title,
+                    muted_card_style(theme, style.bg.unwrap_or(Color::Reset)),
+                ),
+                muted_card_style(theme, style.bg.unwrap_or(Color::Reset)),
                 width,
             )
         });
@@ -1065,6 +1084,7 @@ impl ArenaSection {
                 .saturating_add(body.height)
         };
         Self {
+            frame_style,
             title,
             body,
             fallback_label,
@@ -1140,7 +1160,7 @@ impl ArenaSection {
                     x,
                     width: self.width,
                     title: Some(&self.title),
-                    style: muted_card_style(self.body.style.bg.unwrap_or(PAGE)),
+                    style: self.frame_style,
                 },
                 buffer,
             );
@@ -1210,6 +1230,7 @@ impl ArenaItem {
 }
 
 struct ArenaRenderBlock {
+    frame_style: Style,
     style: Style,
     bordered: bool,
     content_x: u16,
@@ -1219,18 +1240,15 @@ struct ArenaRenderBlock {
 
 impl ArenaRenderBlock {
     fn new(
+        theme: &Theme,
         arena: NormalisedArenaBlock,
         expanded: bool,
         highlighter: &mut PythonHighlighter,
         width: u16,
         #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
     ) -> Self {
-        let background = match arena.state {
-            ArenaState::InProgress => IN_PROGRESS_ARENA,
-            ArenaState::Complete => COMPLETE_ARENA,
-            ArenaState::Error => ERROR_ARENA,
-        };
-        let style = card_style(background);
+        let background = arena.state.background(theme);
+        let style = card_style(theme, background);
         let bordered = width >= 3;
         let outer_inner_width = width.saturating_sub(u16::from(bordered).saturating_mul(2));
         let outer_padding = u16::from(bordered && outer_inner_width >= 7);
@@ -1239,13 +1257,13 @@ impl ArenaRenderBlock {
         let mut items = Vec::new();
 
         for (text, row_style) in [
-            (arena.heading, muted_card_style(background)),
-            (arena.status, muted_card_style(background)),
+            (arena.heading, muted_card_style(theme, background)),
+            (arena.status, muted_card_style(theme, background)),
             (
                 arena
                     .progress_gap
                     .then(|| "display gap: some live progress was dropped".to_owned()),
-                dim_card_style(background),
+                dim_card_style(theme, background),
             ),
         ] {
             if let Some(text) = text.filter(|text| !text.is_empty()) {
@@ -1266,6 +1284,7 @@ impl ArenaRenderBlock {
             let code = own_styled_text(highlighter.highlight(&preview), style);
             let title = omission_title("code", omitted);
             items.push(ArenaItem::Section(ArenaSection::new(
+                theme,
                 title,
                 code,
                 style,
@@ -1273,10 +1292,15 @@ impl ArenaRenderBlock {
             )));
         }
 
-        if let Some(tool_calls) =
-            tool_call_text(&arena.tool_calls, &arena.run_previews, expanded, background)
-        {
+        if let Some(tool_calls) = tool_call_text(
+            theme,
+            &arena.tool_calls,
+            &arena.run_previews,
+            expanded,
+            background,
+        ) {
             items.push(ArenaItem::Section(ArenaSection::new(
+                theme,
                 "tool calls",
                 tool_calls,
                 style,
@@ -1286,6 +1310,7 @@ impl ArenaRenderBlock {
 
         for content in execution_preview(&arena.content, expanded) {
             items.push(ArenaItem::Section(ArenaSection::new(
+                theme,
                 omission_title(content.label, content.omitted),
                 literal_execution_text(&content.text, style),
                 style,
@@ -1300,10 +1325,13 @@ impl ArenaRenderBlock {
             items.push(ArenaItem::Text(ArenaText::new(
                 Text {
                     alignment: None,
-                    style: muted_card_style(background),
-                    lines: vec![accounting_line(accounting, muted_card_style(background))],
+                    style: muted_card_style(theme, background),
+                    lines: vec![accounting_line(
+                        accounting,
+                        muted_card_style(theme, background),
+                    )],
                 },
-                muted_card_style(background),
+                muted_card_style(theme, background),
                 content_width,
             )));
         }
@@ -1312,6 +1340,7 @@ impl ArenaRenderBlock {
             .iter()
             .fold(0_usize, |height, item| height.saturating_add(item.height()));
         Self {
+            frame_style: muted_card_style(theme, background),
             style,
             bordered,
             content_x,
@@ -1363,7 +1392,7 @@ impl ArenaRenderBlock {
                     x: 0,
                     width: viewport.width,
                     title: None,
-                    style: muted_card_style(self.style.bg.unwrap_or(PAGE)),
+                    style: self.frame_style,
                 },
                 buffer,
             );
@@ -1448,7 +1477,7 @@ impl NormalisedBlock {
             Self::Assistant {
                 markdown: source,
                 accounting,
-            } => assistant_text(source, accounting.clone(), None),
+            } => assistant_text(&crate::theme::DARK, source, accounting.clone(), None),
             _ => Text::raw(self.plain_text()),
         };
         Paragraph::new(text).wrap(Wrap { trim: false })
@@ -1486,8 +1515,13 @@ impl NormalisedArenaBlock {
         if let Some(source) = &self.source {
             lines.push(format!("code:\n{source}"));
         }
-        if let Some(tool_calls) = tool_call_text(&self.tool_calls, &self.run_previews, false, PAGE)
-        {
+        if let Some(tool_calls) = tool_call_text(
+            &crate::theme::DARK,
+            &self.tool_calls,
+            &self.run_previews,
+            false,
+            Color::Reset,
+        ) {
             lines.push(format!("tool calls:\n{tool_calls}"));
         }
         if self.source.is_some() && !self.content.is_empty() {
@@ -1670,9 +1704,9 @@ struct FooterField {
 }
 
 impl FooterField {
-    fn muted(text: impl Into<String>) -> Self {
+    fn muted(theme: &Theme, text: impl Into<String>) -> Self {
         Self {
-            spans: vec![Span::styled(text.into(), muted_page_style())],
+            spans: vec![Span::styled(text.into(), muted_page_style(theme))],
         }
     }
 
@@ -1706,10 +1740,10 @@ impl FooterIdentity {
         }
     }
 
-    fn truncated(&self, width: usize) -> Option<FooterField> {
+    fn truncated(&self, theme: &Theme, width: usize) -> Option<FooterField> {
         let full = self.full();
         if Line::raw(&full).width() <= width {
-            return Some(FooterField::muted(full));
+            return Some(FooterField::muted(theme, full));
         }
         let text = match (&self.cwd, &self.name) {
             (Some(cwd), Some(name)) => {
@@ -1726,7 +1760,7 @@ impl FooterIdentity {
             (None, Some(name)) => truncate_end(&format!("({name})"), width),
             (None, None) => String::new(),
         };
-        (!text.is_empty()).then(|| FooterField::muted(text))
+        (!text.is_empty()).then(|| FooterField::muted(theme, text))
     }
 }
 
@@ -1741,15 +1775,18 @@ impl ModelFooter {
         format!("{} • thinking {}", self.id, self.thinking)
     }
 
-    fn compact(&self) -> FooterField {
-        FooterField::muted(format!(
-            "{} • thinking {}",
-            unqualified_model_id(&self.id),
-            self.thinking
-        ))
+    fn compact(&self, theme: &Theme) -> FooterField {
+        FooterField::muted(
+            theme,
+            format!(
+                "{} • thinking {}",
+                unqualified_model_id(&self.id),
+                self.thinking
+            ),
+        )
     }
 
-    fn truncated(&self, width: usize) -> Option<FooterField> {
+    fn truncated(&self, theme: &Theme, width: usize) -> Option<FooterField> {
         let model = unqualified_model_id(&self.id);
         let thinking = format!("thinking {}", self.thinking);
         let separator = " • ";
@@ -1769,7 +1806,7 @@ impl ModelFooter {
         } else {
             truncate_end(&thinking, width)
         };
-        (!text.is_empty()).then(|| FooterField::muted(text))
+        (!text.is_empty()).then(|| FooterField::muted(theme, text))
     }
 }
 
@@ -1794,7 +1831,7 @@ struct FooterLayout {
 }
 
 impl FooterLayout {
-    fn right_spans(&self) -> Vec<Span<'static>> {
+    fn right_spans(&self, theme: &Theme) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
         for (index, field) in self.right.iter().enumerate() {
             if index > 0 {
@@ -1803,7 +1840,7 @@ impl FooterLayout {
                 } else {
                     " "
                 };
-                spans.push(Span::styled(separator, muted_page_style()));
+                spans.push(Span::styled(separator, muted_page_style(theme)));
             }
             spans.extend(field.spans.clone());
         }
@@ -1811,21 +1848,21 @@ impl FooterLayout {
     }
 
     #[cfg(test)]
-    fn spans(&self) -> Vec<Span<'static>> {
+    fn spans(&self, theme: &Theme) -> Vec<Span<'static>> {
         let mut spans = self
             .identity
             .as_ref()
             .map(|field| field.spans.clone())
             .unwrap_or_default();
         if self.identity.is_some() && !self.right.is_empty() {
-            spans.push(Span::styled(" ", muted_page_style()));
+            spans.push(Span::styled(" ", muted_page_style(theme)));
         }
-        spans.extend(self.right_spans());
+        spans.extend(self.right_spans(theme));
         spans
     }
 
-    fn rule_spans(&self, width: usize) -> Vec<Span<'static>> {
-        let right = self.right_spans();
+    fn rule_spans(&self, theme: &Theme, width: usize) -> Vec<Span<'static>> {
+        let right = self.right_spans(theme);
         let right_width = right.iter().map(Span::width).sum::<usize>();
         let identity_width = self.identity.as_ref().map_or(0, FooterField::width);
         let seams = footer_seam_width(self.identity.is_some(), !right.is_empty());
@@ -1835,7 +1872,7 @@ impl FooterLayout {
             .map(|field| field.spans.clone())
             .unwrap_or_default();
         if self.identity.is_some() {
-            spans.push(Span::styled(" ", muted_page_style()));
+            spans.push(Span::styled(" ", muted_page_style(theme)));
         }
         spans.push(Span::raw(
             "─".repeat(
@@ -1847,7 +1884,7 @@ impl FooterLayout {
             ),
         ));
         if !right.is_empty() {
-            spans.push(Span::styled(" ", muted_page_style()));
+            spans.push(Span::styled(" ", muted_page_style(theme)));
         }
         spans.extend(right);
         spans
@@ -1868,23 +1905,23 @@ impl Footer {
     }
 
     #[cfg(test)]
-    fn spans(&self) -> Vec<Span<'static>> {
-        self.layout(usize::MAX).spans()
+    fn spans(&self, theme: &Theme) -> Vec<Span<'static>> {
+        self.layout(theme, usize::MAX).spans(theme)
     }
 
-    fn layout(&self, width: usize) -> FooterLayout {
+    fn layout(&self, theme: &Theme, width: usize) -> FooterLayout {
         let mut statistics = self.statistics.clone();
         let mut model = self
             .model
             .as_ref()
-            .and_then(|model| model.truncated(usize::MAX));
+            .and_then(|model| model.truncated(theme, usize::MAX));
         let full_identity = self.identity.as_ref().and_then(|identity| {
             let text = identity.full();
-            (!text.is_empty()).then(|| FooterField::muted(text))
+            (!text.is_empty()).then(|| FooterField::muted(theme, text))
         });
         let preferred_identity = self.identity.as_ref().and_then(|identity| {
             let text = identity.preferred();
-            (!text.is_empty()).then(|| FooterField::muted(text))
+            (!text.is_empty()).then(|| FooterField::muted(theme, text))
         });
         let identity = if footer_fits(width, full_identity.as_ref(), &statistics, model.as_ref()) {
             full_identity
@@ -1895,7 +1932,7 @@ impl Footer {
                 &statistics,
                 model.as_ref(),
             ) {
-                model = self.model.as_ref().map(ModelFooter::compact);
+                model = self.model.as_ref().map(|model| model.compact(theme));
             }
             while !statistics.is_empty()
                 && !footer_fits(
@@ -1921,11 +1958,12 @@ impl Footer {
                     model = self
                         .model
                         .as_ref()
-                        .and_then(|model| model.truncated(width.saturating_sub(right_seam)));
+                        .and_then(|model| model.truncated(theme, width.saturating_sub(right_seam)));
                     None
                 } else {
                     self.identity.as_ref().and_then(|identity| {
                         identity.truncated(
+                            theme,
                             width
                                 .saturating_sub(right_width)
                                 .saturating_sub(footer_seam_width(true, right_width > 0)),
@@ -2161,6 +2199,7 @@ impl LayoutBlock {
 }
 
 pub(crate) struct TranscriptLayout {
+    page_style: Style,
     blocks: Vec<LayoutBlock>,
     width: u16,
     total_height: usize,
@@ -2172,28 +2211,31 @@ impl TranscriptLayout {
         self.total_height
     }
 
-    pub(crate) fn footer_rule(&self, width: u16) -> Line<'static> {
+    pub(crate) fn footer_rule(&self, theme: &Theme, width: u16) -> Line<'static> {
         let Some(footer) = &self.footer else {
             return Line::raw("─".repeat(usize::from(width)));
         };
         match width {
             0 => Line::raw(""),
-            1 => Line::from(Span::styled("…", muted_page_style())),
-            2 => Line::from(vec![Span::raw("─"), Span::styled("…", muted_page_style())]),
+            1 => Line::from(Span::styled("…", muted_page_style(theme))),
+            2 => Line::from(vec![
+                Span::raw("─"),
+                Span::styled("…", muted_page_style(theme)),
+            ]),
             3 => Line::from(vec![
                 Span::raw("─"),
-                Span::styled("…", muted_page_style()),
+                Span::styled("…", muted_page_style(theme)),
                 Span::raw("─"),
             ]),
             4 => Line::from(vec![
                 Span::raw("─"),
-                Span::styled("…", muted_page_style()),
+                Span::styled("…", muted_page_style(theme)),
                 Span::raw(" ─"),
             ]),
             _ => {
-                let layout = footer.layout(usize::from(width - 4));
+                let layout = footer.layout(theme, usize::from(width - 4));
                 let mut spans = vec![Span::raw("─ ")];
-                spans.extend(layout.rule_spans(usize::from(width - 4)));
+                spans.extend(layout.rule_spans(theme, usize::from(width - 4)));
                 spans.push(Span::raw(" ─"));
                 Line::from(spans)
             }
@@ -2214,7 +2256,7 @@ impl TranscriptLayout {
         if viewport.width == 0 || viewport.height == 0 {
             return;
         }
-        buffer.set_style(viewport, page_style());
+        buffer.set_style(viewport, self.page_style);
         let selection =
             selection.and_then(|selection| selection.project(Viewport::new(viewport, top)));
         let mut regions = Vec::new();
@@ -2923,32 +2965,34 @@ impl Transcript {
         visible
     }
 
-    pub(crate) fn layout(&mut self, width: u16) -> TranscriptLayout {
-        self.layout_with_cache(width, true, None)
+    pub(crate) fn layout(&mut self, theme: &Theme, width: u16) -> TranscriptLayout {
+        self.layout_with_cache(theme, width, true, None)
     }
 
     pub(crate) fn layout_with_footer(
         &mut self,
+        theme: &Theme,
         width: u16,
         context: FooterContext,
     ) -> TranscriptLayout {
-        self.layout_with_cache(width, true, Some(context))
+        self.layout_with_cache(theme, width, true, Some(context))
     }
 
     #[cfg(test)]
-    pub(crate) fn layout_fresh(&mut self, width: u16) -> TranscriptLayout {
-        self.layout_with_cache(width, false, None)
+    pub(crate) fn layout_fresh(&mut self, theme: &Theme, width: u16) -> TranscriptLayout {
+        self.layout_with_cache(theme, width, false, None)
     }
 
     fn layout_with_cache(
         &mut self,
+        theme: &Theme,
         width: u16,
         use_cache: bool,
         footer_context: Option<FooterContext>,
     ) -> TranscriptLayout {
         let show_reasoning = self.show_reasoning;
         let expand_arenas = self.expand_arenas;
-        let footer = self.footer(footer_context);
+        let footer = self.footer(theme, footer_context);
         let live_sources = self
             .live_step
             .as_ref()
@@ -2985,6 +3029,7 @@ impl Transcript {
                 settled.raster = None;
             }
             let render_block = build_render_block(
+                theme,
                 &settled.source,
                 show_reasoning,
                 expand_arenas,
@@ -3015,6 +3060,7 @@ impl Transcript {
         }
         for source in live_sources.iter().chain(&pending_sources) {
             blocks.push(LayoutBlock::Fresh(build_render_block(
+                theme,
                 source,
                 show_reasoning,
                 expand_arenas,
@@ -3028,6 +3074,7 @@ impl Transcript {
             height.saturating_add(block.height())
         });
         TranscriptLayout {
+            page_style: page_style(theme),
             blocks,
             width,
             total_height,
@@ -3076,7 +3123,7 @@ impl Transcript {
         DisplayProjection { blocks }
     }
 
-    fn footer(&self, context: Option<FooterContext>) -> Option<Footer> {
+    fn footer(&self, theme: &Theme, context: Option<FooterContext>) -> Option<Footer> {
         let mut foreground_attempts = Vec::new();
         let mut normal_foreground_attempts = Vec::new();
         for displayed in &self.records {
@@ -3102,7 +3149,7 @@ impl Transcript {
                 .flat_map(|record| record.attempts()),
         );
         attempts.extend(&self.footer_adjustment);
-        session_footer(&attempts, latest_foreground_attempt, context)
+        session_footer(theme, &attempts, latest_foreground_attempt, context)
     }
 
     fn append_settled_blocks(&mut self, blocks: impl IntoIterator<Item = TranscriptBlock>) {
@@ -3505,12 +3552,14 @@ impl ModelChangeCard {
 }
 
 pub(crate) fn model_change_card(
+    theme: &Theme,
     selection: ModelSelection,
     pending: bool,
     width: u16,
 ) -> ModelChangeCard {
     let prefix = if pending { "[pending] " } else { "" };
     ModelChangeCard(model_change_block(
+        theme,
         &format!("{prefix}{}", model_change_text(selection)),
         width,
     ))
@@ -3524,10 +3573,10 @@ fn model_change_text(selection: ModelSelection) -> String {
     )
 }
 
-fn model_change_block(text: &str, width: u16) -> RenderBlock {
+fn model_change_block(theme: &Theme, text: &str, width: u16) -> RenderBlock {
     RenderBlock::card(
-        own_styled_text(Text::raw(text), muted_page_style()),
-        muted_page_style(),
+        own_styled_text(Text::raw(text), muted_page_style(theme)),
+        muted_page_style(theme),
         width,
         1,
         1,
@@ -3535,6 +3584,7 @@ fn model_change_block(text: &str, width: u16) -> RenderBlock {
 }
 
 fn build_render_block(
+    theme: &Theme,
     source: &NormalisedBlock,
     show_reasoning: bool,
     expand_arenas: bool,
@@ -3550,16 +3600,16 @@ fn build_render_block(
     match source {
         NormalisedBlock::Startup { lines } | NormalisedBlock::Metadata { lines } => {
             RenderBlock::card(
-                own_styled_text(Text::raw(lines.join("\n")), page_style()),
-                page_style(),
+                own_styled_text(Text::raw(lines.join("\n")), page_style(theme)),
+                page_style(theme),
                 width,
                 0,
                 0,
             )
         }
-        NormalisedBlock::ModelChange { text } => model_change_block(text, width),
+        NormalisedBlock::ModelChange { text } => model_change_block(theme, text, width),
         NormalisedBlock::User { request } => {
-            let style = card_style(USER);
+            let style = card_style(theme, theme.user_message_bg);
             RenderBlock::card(
                 own_styled_text(Text::raw(request.as_str()), style),
                 style,
@@ -3569,7 +3619,7 @@ fn build_render_block(
             )
         }
         NormalisedBlock::SubagentSpawned(card) => {
-            let style = card_style(IN_PROGRESS_ARENA);
+            let style = card_style(theme, theme.tool_pending_bg);
             RenderBlock::card(
                 subagent_spawned_text(card, width, expand_arenas),
                 style,
@@ -3579,7 +3629,7 @@ fn build_render_block(
             )
         }
         NormalisedBlock::SubagentFinished(card) => {
-            let style = card_style(COMPLETE_ARENA);
+            let style = card_style(theme, theme.tool_success_bg);
             RenderBlock::card(
                 subagent_finished_text(card, width, expand_arenas),
                 style,
@@ -3589,7 +3639,8 @@ fn build_render_block(
             )
         }
         NormalisedBlock::Compaction(card) => {
-            let style = card_style(COMPLETE_ARENA);
+            let background = card.state.background(theme);
+            let style = card_style(theme, background);
             let mut text = if expand_arenas {
                 match &card.expanded {
                     CompactionContent::Markdown(source) => markdown(
@@ -3606,13 +3657,13 @@ fn build_render_block(
             if expand_arenas && let Some(accounting) = &card.accounting {
                 text.lines.push(accounting_line(
                     accounting.clone(),
-                    muted_card_style(COMPLETE_ARENA),
+                    muted_card_style(theme, background),
                 ));
             }
             RenderBlock::card(own_styled_text(text, style), style, width, 1, 1)
         }
         NormalisedBlock::SkillActivation(card) => {
-            let style = card_style(COMPLETE_ARENA);
+            let style = card_style(theme, theme.tool_success_bg);
             let mut lines = vec![Line::raw(if expand_arenas {
                 card.heading.clone()
             } else {
@@ -3629,7 +3680,9 @@ fn build_render_block(
             RenderBlock::card(text, style, width, 1, 1)
         }
         NormalisedBlock::Reasoning { markdown: source } => {
-            let style = muted_card_style(REASONING).add_modifier(Modifier::ITALIC);
+            let style = card_style(theme, theme.card_bg)
+                .fg(theme.thinking_text)
+                .add_modifier(Modifier::ITALIC);
             let text = if show_reasoning {
                 own_styled_text(
                     markdown(
@@ -3642,12 +3695,13 @@ fn build_render_block(
             } else {
                 own_styled_text(
                     Text::raw("thinking hidden · Ctrl-T to show"),
-                    dim_card_style(REASONING).add_modifier(Modifier::ITALIC),
+                    dim_card_style(theme, theme.card_bg).add_modifier(Modifier::ITALIC),
                 )
             };
             RenderBlock::card(text, style, width, 2, 1)
         }
         NormalisedBlock::Arena(arena) => RenderBlock::Arena(ArenaRenderBlock::new(
+            theme,
             arena.clone(),
             expand_arenas,
             highlighter,
@@ -3660,25 +3714,26 @@ fn build_render_block(
             accounting,
         } => RenderBlock::card(
             assistant_text(
+                theme,
                 source,
                 accounting.clone(),
                 #[cfg(test)]
                 construction_counts,
             ),
-            page_style(),
+            page_style(theme),
             width,
             0,
             1,
         ),
         NormalisedBlock::Status { text } => RenderBlock::card(
-            own_styled_text(Text::raw(text.as_str()), page_style()),
-            page_style(),
+            own_styled_text(Text::raw(text.as_str()), page_style(theme)),
+            page_style(theme),
             width,
             0,
             0,
         ),
         NormalisedBlock::SessionRestored => {
-            let style = card_style(COMPLETE_ARENA);
+            let style = card_style(theme, theme.tool_success_bg);
             RenderBlock::card(
                 own_styled_text(Text::raw("Session restored."), style),
                 style,
@@ -3690,13 +3745,13 @@ fn build_render_block(
         NormalisedBlock::Accounting { text } => RenderBlock::card(
             Text {
                 alignment: None,
-                style: page_style(),
+                style: page_style(theme),
                 lines: vec![
                     Line::raw(""),
-                    accounting_line(text.clone(), muted_page_style()),
+                    accounting_line(text.clone(), muted_page_style(theme)),
                 ],
             },
-            page_style(),
+            page_style(theme),
             width,
             0,
             0,
@@ -3914,6 +3969,7 @@ fn compaction_card(outcome: &CompactionOutcome) -> CompactionCard {
             context_tokens,
             ..
         } => CompactionCard {
+            state: ArenaState::Complete,
             heading,
             collapsed: format!(
                 "Compacted {} tokens · Ctrl-O to expand",
@@ -3923,12 +3979,14 @@ fn compaction_card(outcome: &CompactionOutcome) -> CompactionCard {
             accounting,
         },
         CompactionOutcome::Failed { diagnostic, .. } => CompactionCard {
+            state: ArenaState::Error,
             heading,
             collapsed: "Failed · Ctrl-O to expand".to_owned(),
             expanded: CompactionContent::Plain(diagnostic.clone()),
             accounting,
         },
         CompactionOutcome::Cancelled { .. } => CompactionCard {
+            state: ArenaState::Error,
             heading,
             collapsed: "Cancelled · Ctrl-O to expand".to_owned(),
             expanded: CompactionContent::Plain("Cancelled".to_owned()),
@@ -4268,7 +4326,7 @@ impl SessionAccounting {
     }
 }
 
-fn latest_context_field(usage: &ModelUsage) -> Option<FooterField> {
+fn latest_context_field(theme: &Theme, usage: &ModelUsage) -> Option<FooterField> {
     let total = usage.total_tokens?;
     let model = model_by_id(&usage.model).unwrap_or(DEFAULT_MODEL);
     let (capacity, denominator) = if total <= model.pricing.long_context_threshold {
@@ -4281,35 +4339,35 @@ fn latest_context_field(usage: &ModelUsage) -> Option<FooterField> {
     };
     let tenths = (u128::from(total) * 1_000 + u128::from(capacity) / 2) / u128::from(capacity);
     let style = if tenths >= 900 {
-        Style::new().fg(Color::Red)
+        Style::new().fg(theme.error)
     } else if tenths >= 800 {
-        Style::new().fg(Color::Yellow)
+        Style::new().fg(theme.warning)
     } else {
-        muted_page_style()
+        muted_page_style(theme)
     };
     Some(FooterField {
         spans: vec![
             Span::styled(format!("{}.{}%", tenths / 10, tenths % 10), style),
-            Span::styled(format!("/{denominator}"), muted_page_style()),
+            Span::styled(format!("/{denominator}"), muted_page_style(theme)),
         ],
     })
 }
 
-fn latest_cache_hit_field(usage: &ModelUsage) -> Option<FooterField> {
+fn latest_cache_hit_field(theme: &Theme, usage: &ModelUsage) -> Option<FooterField> {
     match (usage.input_tokens, usage.cached_input_tokens) {
         (Some(input), Some(cached)) if input > 0 && cached <= input => {
             let tenths = (u128::from(cached) * 1_000 + u128::from(input) / 2) / u128::from(input);
-            Some(FooterField::muted(format!(
-                "CH{}.{}%",
-                tenths / 10,
-                tenths % 10
-            )))
+            Some(FooterField::muted(
+                theme,
+                format!("CH{}.{}%", tenths / 10, tenths % 10),
+            ))
         }
         _ => None,
     }
 }
 
 fn session_footer(
+    theme: &Theme,
     attempts: &[&AttemptAccounting],
     latest_foreground_attempt: Option<&AttemptAccounting>,
     context: Option<FooterContext>,
@@ -4320,24 +4378,24 @@ fn session_footer(
     }
     let mut statistics = footer_accounting_fields(&accounting)
         .into_iter()
-        .map(FooterField::muted)
+        .map(|text| FooterField::muted(theme, text))
         .collect::<Vec<_>>();
     if let Some(
         AttemptAccounting::KnownUsage(usage)
         | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
     ) = latest_foreground_attempt
-        && let Some(cache_hit) = latest_cache_hit_field(usage)
+        && let Some(cache_hit) = latest_cache_hit_field(theme, usage)
     {
         statistics.push(cache_hit);
     }
     if let Some(cost) = footer_estimated_cost(attempts.iter().copied()) {
-        statistics.push(FooterField::muted(cost));
+        statistics.push(FooterField::muted(theme, cost));
     }
     if let Some(
         AttemptAccounting::KnownUsage(usage)
         | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
     ) = latest_foreground_attempt
-        && let Some(context) = latest_context_field(usage)
+        && let Some(context) = latest_context_field(theme, usage)
     {
         statistics.push(context);
     }
@@ -4610,6 +4668,8 @@ pub(crate) fn normalise_terminal_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::theme::DARK;
+
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -4620,12 +4680,12 @@ mod tests {
     use ratatui::widgets::{Paragraph, Widget, Wrap};
 
     use super::{
-        ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, Footer, FooterContext,
-        FooterField, FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, LivePhase, MUTED, ModelFooter,
-        NormalisedBlock, RenderBlock, SubagentCardPhase, SubagentFinishedCard, SubagentSpawnedCard,
-        TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER, assistant_text,
-        format_footer_usd, format_token_count, markdown, muted_page_style, normalise_terminal_text,
-        own_styled_text, page_style, step_accounting, subagent_preview, tool_call_label,
+        ArenaBlock, CardRenderBlock, Footer, FooterContext, FooterField, FooterIdentity,
+        LayoutBlock, LivePhase, ModelFooter, NormalisedBlock, RenderBlock, SubagentCardPhase,
+        SubagentFinishedCard, SubagentSpawnedCard, Transcript, TranscriptBlock, TranscriptLayout,
+        assistant_text, format_footer_usd, format_token_count, markdown, muted_page_style,
+        normalise_terminal_text, own_styled_text, page_style, step_accounting, subagent_preview,
+        tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -4649,7 +4709,7 @@ mod tests {
 
     #[test]
     fn page_uses_terminal_background() {
-        assert_eq!(page_style().bg, Some(Color::Reset));
+        assert_eq!(page_style(&DARK).bg, Some(Color::Reset));
     }
 
     #[test]
@@ -4978,7 +5038,7 @@ mod tests {
         assert_eq!(live.attempt, Some(1));
         assert!(live.settled_attempts.is_empty());
         assert!(
-            footer_text(&transcript.layout(128))
+            footer_text(&transcript.layout(&DARK, 128))
                 .expect("footer")
                 .contains("↑3 ↓2")
         );
@@ -5028,8 +5088,9 @@ mod tests {
                 accounting,
             },
         };
-        let footer =
-            |transcript: &mut Transcript| footer_text(&transcript.layout(128)).unwrap_or_default();
+        let footer = |transcript: &mut Transcript| {
+            footer_text(&transcript.layout(&DARK, 128)).unwrap_or_default()
+        };
         let assert_initial_only = |transcript: &mut Transcript, context: &str| {
             let footer = footer(transcript);
             assert!(footer.contains("↑100k"), "{context}: {footer}");
@@ -5159,7 +5220,7 @@ mod tests {
             false,
         ));
         assert!(
-            footer_text(&transcript.layout(128))
+            footer_text(&transcript.layout(&DARK, 128))
                 .expect("footer")
                 .contains("↑3 ↓2")
         );
@@ -5171,7 +5232,7 @@ mod tests {
             false,
         ));
         assert!(
-            footer_text(&transcript.layout(128))
+            footer_text(&transcript.layout(&DARK, 128))
                 .expect("footer after storage failure")
                 .contains("↑3 ↓2")
         );
@@ -5193,7 +5254,7 @@ mod tests {
             false,
         );
         assert!(
-            footer_text(&transcript.layout(128))
+            footer_text(&transcript.layout(&DARK, 128))
                 .expect("footer")
                 .contains("↑3 ↓2")
         );
@@ -5215,6 +5276,7 @@ mod tests {
                 "Compacted 1.25k tokens · Ctrl-O to expand",
                 "guide (https://example.com)",
                 true,
+                DARK.tool_success_bg,
             ),
             (
                 CompactionOutcome::Failed {
@@ -5225,6 +5287,7 @@ mod tests {
                 "Failed · Ctrl-O to expand",
                 "[plain](https://example.com)",
                 true,
+                DARK.tool_error_bg,
             ),
             (
                 CompactionOutcome::Cancelled {
@@ -5234,10 +5297,12 @@ mod tests {
                 "Cancelled · Ctrl-O to expand",
                 "Cancelled",
                 false,
+                DARK.tool_error_bg,
             ),
         ];
 
-        for (outcome, collapsed_line, expanded_content, hides_expanded_content) in cases {
+        for (outcome, collapsed_line, expanded_content, hides_expanded_content, background) in cases
+        {
             let mut transcript = Transcript::default();
             transcript.apply(
                 RuntimeEvent::RecordAppended {
@@ -5257,11 +5322,19 @@ mod tests {
                 assert!(!collapsed.contains(expanded_content), "{collapsed}");
             }
             assert!(!collapsed.contains(&accounting), "{collapsed}");
+            let buffer = rendered_buffer(&mut transcript, 80);
+            assert_row_background(&buffer, row_containing(&buffer, collapsed_line), background);
 
             assert!(transcript.toggle_arena_expansion());
             let expanded = rendered_layout_text(&mut transcript);
             assert!(expanded.contains(expanded_content), "{expanded}");
             assert!(expanded.contains(&accounting), "{expanded}");
+            let buffer = rendered_buffer(&mut transcript, 80);
+            assert_row_background(
+                &buffer,
+                row_containing(&buffer, expanded_content),
+                background,
+            );
         }
     }
 
@@ -5501,7 +5574,7 @@ mod tests {
         assert!(card_row < row_containing(&buffer, "request 2"));
         for column in 0..buffer.area.width {
             let cell = &buffer[(column, card_row as u16)];
-            assert_eq!(cell.fg, Color::Rgb(128, 128, 128));
+            assert_eq!(cell.fg, DARK.muted);
             assert_eq!(cell.bg, Color::Reset);
         }
     }
@@ -5643,6 +5716,7 @@ mod tests {
         selection: ModelSelection,
     ) -> Vec<String> {
         let layout = transcript.layout_with_footer(
+            &DARK,
             80,
             FooterContext {
                 workspace_root: None,
@@ -6338,9 +6412,9 @@ mod tests {
             },
             false,
         ));
-        transcript.layout(20);
+        transcript.layout(&DARK, 20);
         let spawned = transcript.construction_counts();
-        transcript.layout(20);
+        transcript.layout(&DARK, 20);
         assert_eq!(transcript.construction_counts(), spawned);
 
         assert!(!transcript.apply(
@@ -6351,7 +6425,7 @@ mod tests {
             },
             false,
         ));
-        transcript.layout(20);
+        transcript.layout(&DARK, 20);
         assert_eq!(transcript.construction_counts(), spawned);
 
         assert!(!transcript.apply(
@@ -6367,7 +6441,7 @@ mod tests {
             },
             false
         ));
-        transcript.layout(20);
+        transcript.layout(&DARK, 20);
         let finished = transcript.construction_counts();
         assert_eq!(finished.rasterisations, spawned.rasterisations + 1);
         assert_eq!(
@@ -6389,12 +6463,12 @@ mod tests {
             },
             false,
         ));
-        transcript.layout(20);
+        transcript.layout(&DARK, 20);
         assert_eq!(transcript.construction_counts(), finished);
         assert_eq!(transcript.settled_blocks.len(), 2);
 
         assert!(transcript.toggle_arena_expansion());
-        transcript.layout(20);
+        transcript.layout(&DARK, 20);
         let expanded = transcript.construction_counts();
         assert_eq!(expanded.rasterisations, finished.rasterisations + 2);
         assert_eq!(
@@ -6623,7 +6697,7 @@ mod tests {
                 NormalisedBlock::Assistant {
                     markdown: source,
                     accounting,
-                } => assistant_text(source, accounting.clone(), None).to_string(),
+                } => assistant_text(&DARK, source, accounting.clone(), None).to_string(),
                 block => block.plain_text(),
             })
             .collect::<Vec<_>>()
@@ -6631,7 +6705,7 @@ mod tests {
     }
 
     fn rendered_layout_text(transcript: &mut Transcript) -> String {
-        let layout = transcript.layout(1024);
+        let layout = transcript.layout(&DARK, 1024);
         let height = u16::try_from(layout.total_height()).expect("test transcript height");
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1024, height));
         layout.render(buffer.area, 0, &mut buffer);
@@ -6644,7 +6718,7 @@ mod tests {
     }
 
     fn rendered_buffer(transcript: &mut Transcript, width: u16) -> Buffer {
-        let layout = transcript.layout(width);
+        let layout = transcript.layout(&DARK, width);
         let height = u16::try_from(layout.total_height()).expect("test transcript height");
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
         layout.render(buffer.area, 0, &mut buffer);
@@ -6652,7 +6726,7 @@ mod tests {
     }
 
     fn copied_text(transcript: &mut Transcript, width: u16) -> String {
-        let layout = transcript.layout(width);
+        let layout = transcript.layout(&DARK, width);
         layout.extract_selection(Selection::new(
             DocumentPosition::new(0, 0),
             DocumentPosition::new(layout.total_height(), 0),
@@ -6662,7 +6736,7 @@ mod tests {
     fn footer_text(layout: &TranscriptLayout) -> Option<String> {
         layout.footer.as_ref().map(|footer| {
             footer
-                .spans()
+                .spans(&DARK)
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect()
@@ -6671,12 +6745,13 @@ mod tests {
 
     fn render_footer_rule(footer: Footer, width: u16) -> Line<'static> {
         TranscriptLayout {
+            page_style: page_style(&DARK),
             blocks: Vec::new(),
             width,
             total_height: 0,
             footer: Some(footer),
         }
-        .footer_rule(width)
+        .footer_rule(&DARK, width)
     }
 
     fn layout_buffer(
@@ -6695,11 +6770,14 @@ mod tests {
     }
 
     fn assert_cached_layout_matches_fresh(transcript: &mut Transcript, width: u16) {
-        let cached = transcript.layout(width);
-        let fresh = transcript.layout_fresh(width);
+        let cached = transcript.layout(&DARK, width);
+        let fresh = transcript.layout_fresh(&DARK, width);
         assert_eq!(cached.total_height(), fresh.total_height());
         assert_eq!(footer_text(&cached), footer_text(&fresh));
-        assert_eq!(cached.footer_rule(width), fresh.footer_rule(width));
+        assert_eq!(
+            cached.footer_rule(&DARK, width),
+            fresh.footer_rule(&DARK, width)
+        );
 
         let selection = Selection::new(
             DocumentPosition::new(0, 0),
@@ -6778,7 +6856,7 @@ mod tests {
             .expect("outer frame");
         for (column, row) in [(0, outer_top as u16), (section_left, section_top as u16)] {
             let cell = &buffer[(column, row)];
-            assert_eq!(cell.fg, MUTED);
+            assert_eq!(cell.fg, DARK.muted);
             assert_eq!(cell.bg, background);
         }
     }
@@ -7090,7 +7168,7 @@ mod tests {
             false,
         );
 
-        transcript.layout(40);
+        transcript.layout(&DARK, 40);
         let first = transcript.construction_counts();
         assert!(first.rasterisations > 0);
         assert!(first.markdown > 0);
@@ -7098,7 +7176,7 @@ mod tests {
         assert!(first.render_block_builds > 0);
         assert!(first.selection_region_builds > 0);
 
-        transcript.layout(40);
+        transcript.layout(&DARK, 40);
 
         assert_eq!(transcript.construction_counts(), first);
     }
@@ -7171,7 +7249,7 @@ mod tests {
     #[should_panic(expected = "cached raster width must match viewport width")]
     fn cached_raster_rejects_a_different_viewport_width() {
         let mut transcript = cached_transcript();
-        let layout = transcript.layout(24);
+        let layout = transcript.layout(&DARK, 24);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 25, 1));
 
         layout.render(buffer.area, 0, &mut buffer);
@@ -7180,7 +7258,7 @@ mod tests {
     #[test]
     fn settled_cache_appends_and_invalidates_only_affected_rasters() {
         let mut transcript = cached_transcript();
-        transcript.layout(24);
+        transcript.layout(&DARK, 24);
         let initial = transcript.construction_counts();
         assert_eq!(initial.normalisations, 4);
         assert_eq!(initial.rasterisations, 4);
@@ -7199,7 +7277,7 @@ mod tests {
             },
             false,
         );
-        transcript.layout(24);
+        transcript.layout(&DARK, 24);
         let appended = transcript.construction_counts();
         assert_eq!(appended.normalisations, initial.normalisations + 1);
         assert_eq!(appended.rasterisations, initial.rasterisations + 1);
@@ -7215,20 +7293,20 @@ mod tests {
         );
 
         assert!(transcript.toggle_reasoning());
-        transcript.layout(24);
+        transcript.layout(&DARK, 24);
         let reasoning = transcript.construction_counts();
         assert_eq!(reasoning.rasterisations, appended.rasterisations + 1);
         assert_eq!(reasoning.markdown, appended.markdown);
         assert_eq!(reasoning.highlighting, appended.highlighting);
 
         assert!(transcript.toggle_arena_expansion());
-        transcript.layout(24);
+        transcript.layout(&DARK, 24);
         let arena = transcript.construction_counts();
         assert_eq!(arena.rasterisations, reasoning.rasterisations + 1);
         assert_eq!(arena.markdown, reasoning.markdown);
         assert_eq!(arena.highlighting, reasoning.highlighting + 1);
 
-        transcript.layout(48);
+        transcript.layout(&DARK, 48);
         let width = transcript.construction_counts();
         let block_count = transcript.settled_blocks.len();
         assert_eq!(width.rasterisations, arena.rasterisations + block_count);
@@ -7243,7 +7321,7 @@ mod tests {
             arena.selection_region_builds + block_count
         );
         assert!(transcript.toggle_reasoning());
-        transcript.layout(48);
+        transcript.layout(&DARK, 48);
         let shown_reasoning = transcript.construction_counts();
         assert_eq!(shown_reasoning.markdown, width.markdown + 1);
         assert!(transcript.settled_blocks.iter().all(|block| {
@@ -7254,7 +7332,7 @@ mod tests {
         }));
 
         for width in [17, 48, 17, 48] {
-            transcript.layout(width);
+            transcript.layout(&DARK, width);
             assert!(transcript.settled_blocks.iter().all(|block| {
                 block
                     .raster
@@ -7267,7 +7345,7 @@ mod tests {
     #[test]
     fn live_progress_and_settlement_preserve_settled_rasters_and_footer() {
         let mut transcript = cached_transcript();
-        let initial_layout = transcript.layout(24);
+        let initial_layout = transcript.layout(&DARK, 24);
         let initial_footer = footer_text(&initial_layout);
         let initial_counts = transcript.construction_counts();
 
@@ -7284,7 +7362,7 @@ mod tests {
             },
             false,
         ));
-        let live_layout = transcript.layout(24);
+        let live_layout = transcript.layout(&DARK, 24);
         assert_eq!(transcript.construction_counts(), initial_counts);
         assert_ne!(footer_text(&live_layout), initial_footer);
         assert!(
@@ -7304,7 +7382,7 @@ mod tests {
             },
             false,
         ));
-        transcript.layout(24);
+        transcript.layout(&DARK, 24);
         assert_eq!(transcript.construction_counts(), initial_counts);
 
         assert!(transcript.apply(
@@ -7312,7 +7390,7 @@ mod tests {
             false,
         ));
         assert!(transcript.live_step.is_none());
-        let settled_layout = transcript.layout(24);
+        let settled_layout = transcript.layout(&DARK, 24);
         let settled_counts = transcript.construction_counts();
         assert_eq!(
             settled_counts.rasterisations,
@@ -7345,7 +7423,7 @@ mod tests {
             },
             false,
         ));
-        transcript.layout(24);
+        transcript.layout(&DARK, 24);
         assert_eq!(transcript.construction_counts(), settled_counts);
     }
 
@@ -7366,9 +7444,9 @@ mod tests {
             false,
         );
 
-        let cached = transcript.layout(1);
+        let cached = transcript.layout(&DARK, 1);
         let first = transcript.construction_counts();
-        let fresh = transcript.layout_fresh(1);
+        let fresh = transcript.layout_fresh(&DARK, 1);
         assert_eq!(transcript.construction_counts(), first);
         assert!(cached.total_height() > usize::from(u16::MAX));
         assert_eq!(first.rasterisations, 0);
@@ -7380,7 +7458,7 @@ mod tests {
             layout_buffer(&fresh, viewport, 1, None)
         );
 
-        transcript.layout(1);
+        transcript.layout(&DARK, 1);
         let rebuilt = transcript.construction_counts();
         assert_eq!(rebuilt.rasterisations, 0);
         assert_eq!(rebuilt.selection_region_builds, 0);
@@ -7395,12 +7473,12 @@ mod tests {
             false,
         );
 
-        transcript.layout(40);
+        transcript.layout(&DARK, 40);
         let first = transcript.construction_counts();
-        transcript.layout_fresh(40);
+        transcript.layout_fresh(&DARK, 40);
         assert_eq!(transcript.construction_counts(), first);
 
-        transcript.layout(40);
+        transcript.layout(&DARK, 40);
 
         assert_eq!(transcript.construction_counts(), first);
     }
@@ -7413,7 +7491,7 @@ mod tests {
             false,
         );
 
-        let layout = transcript.layout(8);
+        let layout = transcript.layout(&DARK, 8);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7432,7 +7510,7 @@ mod tests {
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7451,7 +7529,7 @@ mod tests {
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7479,7 +7557,7 @@ mod tests {
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7511,7 +7589,7 @@ mod tests {
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7595,7 +7673,7 @@ line 66"
             false,
         );
 
-        let layout = transcript.layout(8);
+        let layout = transcript.layout(&DARK, 8);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7634,7 +7712,7 @@ line 66"
             false,
         );
 
-        let layout = transcript.layout(24);
+        let layout = transcript.layout(&DARK, 24);
         let height = u16::try_from(layout.total_height()).expect("test transcript height");
         let area = Rect::new(0, 0, 24, height);
         let mut rendered = Buffer::empty(area);
@@ -7662,7 +7740,7 @@ line 66"
             },
             false,
         );
-        let layout = transcript.layout(24);
+        let layout = transcript.layout(&DARK, 24);
         let selection = Selection::new(
             DocumentPosition::new(0, 0),
             DocumentPosition::new(layout.total_height(), 0),
@@ -7689,7 +7767,7 @@ line 66"
         );
         assert!(transcript.toggle_reasoning());
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7752,7 +7830,7 @@ result
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7790,7 +7868,7 @@ result
         );
         transcript.apply(final_message(1, 1, "second card", Vec::new(), false), false);
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7806,7 +7884,7 @@ result
         let mut transcript = Transcript::default();
         transcript.apply(completed_execution(1, 1, "XYZ", "", Vec::new()), false);
 
-        let narrow = transcript.layout(8);
+        let narrow = transcript.layout(&DARK, 8);
         assert_eq!(
             narrow.extract_selection(Selection::new(
                 DocumentPosition::new(0, 0),
@@ -7815,7 +7893,7 @@ result
             "code\nXYZ\nstdout\nauthoritative stdout\nresult\n42"
         );
 
-        let zero = transcript.layout(0);
+        let zero = transcript.layout(&DARK, 0);
         assert_eq!(
             zero.extract_selection(Selection::new(
                 DocumentPosition::new(0, 0),
@@ -7828,7 +7906,7 @@ result
     #[test]
     fn selection_copies_visible_startup_text() {
         let mut transcript = Transcript::configured(ready_snapshot_for_test());
-        let layout = transcript.layout(512);
+        let layout = transcript.layout(&DARK, 512);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7866,7 +7944,7 @@ Problems: none"
             false,
         );
 
-        let layout = transcript.layout(1);
+        let layout = transcript.layout(&DARK, 1);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7916,7 +7994,7 @@ Problems: none"
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -7958,7 +8036,7 @@ warning body"
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -8017,7 +8095,7 @@ warning body"
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
 
         assert_eq!(
             layout.extract_selection(Selection::new(
@@ -8042,7 +8120,7 @@ truncated"
     fn selection_highlights_framed_title_text_but_not_its_rule() {
         let mut transcript = Transcript::default();
         transcript.apply(completed_execution(1, 1, "source()", "", Vec::new()), false);
-        let layout = transcript.layout(80);
+        let layout = transcript.layout(&DARK, 80);
         let selection = Selection::new(
             DocumentPosition::new(0, 0),
             DocumentPosition::new(layout.total_height(), 0),
@@ -8367,7 +8445,7 @@ truncated"
                     name: None,
                 }),
                 right
-                    .then(|| FooterField::muted("model"))
+                    .then(|| FooterField::muted(&DARK, "model"))
                     .into_iter()
                     .collect(),
                 None,
@@ -8415,7 +8493,10 @@ truncated"
                     cwd: Some("identity".to_owned()),
                     name: None,
                 }),
-                vec![FooterField::muted("first"), FooterField::muted("last")],
+                vec![
+                    FooterField::muted(&DARK, "first"),
+                    FooterField::muted(&DARK, "last"),
+                ],
                 None,
             )
             .expect("footer"),
@@ -8453,7 +8534,7 @@ truncated"
             selection: ModelSelection::new(&SOL, "high").expect("supported thinking"),
         };
 
-        let layout = transcript.layout_with_footer(128, context.clone());
+        let layout = transcript.layout_with_footer(&DARK, 128, context.clone());
         assert_eq!(
             footer_text(&layout).as_deref(),
             Some(
@@ -8462,8 +8543,8 @@ truncated"
         );
 
         let rule = transcript
-            .layout_with_footer(64, context.clone())
-            .footer_rule(64);
+            .layout_with_footer(&DARK, 64, context.clone())
+            .footer_rule(&DARK, 64);
         assert_eq!(rule.width(), 64);
         for metric in [
             "↑218k",
@@ -8486,8 +8567,8 @@ truncated"
         );
 
         let rule = transcript
-            .layout_with_footer(52, context.clone())
-            .footer_rule(52);
+            .layout_with_footer(&DARK, 52, context.clone())
+            .footer_rule(&DARK, 52);
         assert!(!rule.to_string().contains("$0.2829"), "{rule}");
         assert!(rule.to_string().contains("Refactor auth"), "{rule}");
         assert!(
@@ -8496,20 +8577,20 @@ truncated"
         );
 
         let model_only = transcript
-            .layout_with_footer(31, context.clone())
-            .footer_rule(31);
+            .layout_with_footer(&DARK, 31, context.clone())
+            .footer_rule(&DARK, 31);
         assert_eq!(model_only.to_string(), "─  …t-5.6-sol • thinking high ─");
         assert_eq!(model_only.width(), 31);
         for width in 0..=30 {
             let rule = transcript
-                .layout_with_footer(width, context.clone())
-                .footer_rule(width);
+                .layout_with_footer(&DARK, width, context.clone())
+                .footer_rule(&DARK, width);
             assert_eq!(rule.width(), usize::from(width), "{rule}");
         }
 
         let model = Transcript::default()
-            .layout_with_footer(80, context)
-            .footer_rule(80);
+            .layout_with_footer(&DARK, 80, context)
+            .footer_rule(&DARK, 80);
         assert!(
             model.to_string().contains("~/…/kiki (Refactor auth)"),
             "{model}"
@@ -8550,8 +8631,8 @@ truncated"
         };
 
         let footer = transcript
-            .layout_with_footer(79, context)
-            .footer_rule(79)
+            .layout_with_footer(&DARK, 79, context)
+            .footer_rule(&DARK, 79)
             .to_string();
 
         assert_eq!(
@@ -8567,7 +8648,7 @@ truncated"
                 id: SOL.id.to_owned(),
                 thinking: "medium".to_owned(),
             }
-            .truncated(width)
+            .truncated(&DARK, width)
             .expect("model footer");
 
             assert_eq!(field.spans[0].content, expected);
@@ -8580,7 +8661,7 @@ truncated"
             cwd: Some("/home/kiki/worktrees/interactive/settings/kiki".to_owned()),
             name: Some("Refactor auth".to_owned()),
         }
-        .truncated(3)
+        .truncated(&DARK, 3)
         .expect("identity footer");
 
         assert_eq!(field.spans[0].content, "(R…");
@@ -8600,7 +8681,7 @@ truncated"
             false,
         );
 
-        let footer = footer_text(&transcript.layout(80)).expect("footer");
+        let footer = footer_text(&transcript.layout(&DARK, 80)).expect("footer");
         assert!(footer.contains("$0.0006000"), "{footer}");
         let history = rendered_text(&transcript);
         assert!(history.contains("2 attempts · ↑200 ↓0 R0 W0 r0 Σ200 · $0.0006"));
@@ -8628,7 +8709,7 @@ truncated"
         );
 
         assert_eq!(
-            footer_text(&transcript.layout(80)).as_deref(),
+            footer_text(&transcript.layout(&DARK, 80)).as_deref(),
             Some("↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k")
         );
     }
@@ -8637,32 +8718,39 @@ truncated"
     fn footer_context_metric_switches_capacity_and_alert_styles() {
         for (total, context, percentage, denominator, style) in [
             (
+                217_328,
+                "79.9%/272k",
+                "79.9%",
+                "/272k",
+                Style::reset().fg(DARK.muted).bg(Color::Reset),
+            ),
+            (
                 217_600,
                 "80.0%/272k",
                 "80.0%",
                 "/272k",
-                Style::new().fg(Color::Yellow),
+                Style::new().fg(DARK.warning),
             ),
             (
                 244_800,
                 "90.0%/272k",
                 "90.0%",
                 "/272k",
-                Style::new().fg(Color::Red),
+                Style::new().fg(DARK.error),
             ),
             (
                 272_000,
                 "100.0%/272k",
                 "100.0%",
                 "/272k",
-                Style::new().fg(Color::Red),
+                Style::new().fg(DARK.error),
             ),
             (
                 272_001,
                 "25.9%/1.05m",
                 "25.9%",
                 "/1.05m",
-                muted_page_style(),
+                muted_page_style(&DARK),
             ),
         ] {
             let mut transcript = Transcript::default();
@@ -8684,7 +8772,7 @@ truncated"
                 false,
             );
 
-            let footer = transcript.layout(128).footer_rule(128);
+            let footer = transcript.layout(&DARK, 128).footer_rule(&DARK, 128);
             assert!(footer.to_string().contains(context), "{footer}");
             assert_eq!(
                 footer
@@ -8702,7 +8790,7 @@ truncated"
                     .find(|span| span.content == denominator)
                     .expect("context denominator span")
                     .style,
-                muted_page_style()
+                muted_page_style(&DARK)
             );
         }
     }
@@ -8733,17 +8821,17 @@ truncated"
                 false,
             );
 
-            let layout = transcript.layout(80);
+            let layout = transcript.layout(&DARK, 80);
             assert!(footer_text(&layout).expect("footer").contains(expected));
             assert_eq!(
                 layout
-                    .footer_rule(80)
+                    .footer_rule(&DARK, 80)
                     .spans
                     .iter()
                     .find(|span| span.content == expected)
                     .expect("cache-hit span")
                     .style,
-                muted_page_style()
+                muted_page_style(&DARK)
             );
         }
 
@@ -8759,7 +8847,7 @@ truncated"
             );
 
             assert!(
-                !footer_text(&transcript.layout(80))
+                !footer_text(&transcript.layout(&DARK, 80))
                     .expect("footer")
                     .contains("CH")
             );
@@ -8794,7 +8882,7 @@ truncated"
             false,
         );
 
-        let footer = footer_text(&transcript.layout(128)).expect("footer");
+        let footer = footer_text(&transcript.layout(&DARK, 128)).expect("footer");
         assert!(footer.contains("↑120 ↓15 R80 W0"), "{footer}");
         assert!(footer.contains("CH75.0%"), "{footer}");
         assert!(!footer.contains("CH25.0%"), "{footer}");
@@ -8914,7 +9002,7 @@ truncated"
         let footer = |event| {
             let mut transcript = Transcript::default();
             transcript.apply(event, false);
-            footer_text(&transcript.layout(128)).unwrap_or_default()
+            footer_text(&transcript.layout(&DARK, 128)).unwrap_or_default()
         };
         let known = detailed_usage(
             Some(100_000),
@@ -8976,7 +9064,7 @@ truncated"
             false,
         );
 
-        let settled_footer = footer_text(&transcript.layout(128)).expect("footer");
+        let settled_footer = footer_text(&transcript.layout(&DARK, 128)).expect("footer");
         assert!(settled_footer.contains("CH75.0%"));
         assert!(settled_footer.contains("80.0%/272k"));
         assert!(!settled_footer.contains("CH25.0%"));
@@ -8991,7 +9079,7 @@ truncated"
             false,
         );
         assert_eq!(
-            footer_text(&transcript.layout(128)).as_deref(),
+            footer_text(&transcript.layout(&DARK, 128)).as_deref(),
             Some(settled_footer.as_str())
         );
 
@@ -9007,7 +9095,7 @@ truncated"
             },
             false,
         );
-        let unavailable_layout = transcript.layout(128);
+        let unavailable_layout = transcript.layout(&DARK, 128);
         let unavailable_footer = footer_text(&unavailable_layout).expect("footer");
         assert!(!unavailable_footer.contains("%/"));
         assert!(!unavailable_footer.contains("CH"));
@@ -9021,7 +9109,7 @@ truncated"
         transcript.apply(completed_execution(1, 1, "root()", "", vec![root]), false);
         transcript.apply(RuntimeEvent::RunSettled { run_id: RunId(1) }, false);
 
-        let before = footer_text(&transcript.layout(128)).expect("root footer");
+        let before = footer_text(&transcript.layout(&DARK, 128)).expect("root footer");
         assert!(before.contains("CH50.0%"), "{before}");
         assert!(before.contains("0.0%/272k"), "{before}");
 
@@ -9039,7 +9127,7 @@ truncated"
             },
             false,
         ));
-        let footer = footer_text(&transcript.layout(128)).expect("aggregated footer");
+        let footer = footer_text(&transcript.layout(&DARK, 128)).expect("aggregated footer");
         assert!(footer.contains("↑300 ↓10 R50 W0"), "{footer}");
         assert!(footer.contains("CH50.0%"), "{footer}");
         assert!(footer.contains("0.0%/272k"), "{footer}");
@@ -9073,7 +9161,7 @@ truncated"
             false,
         ));
         assert_eq!(
-            footer_text(&transcript.layout(128)).as_deref(),
+            footer_text(&transcript.layout(&DARK, 128)).as_deref(),
             Some(footer.as_str())
         );
     }
@@ -9128,7 +9216,7 @@ truncated"
             final_message(1, 1, "root", vec![root.clone()], false),
             false,
         );
-        let before = footer_text(&transcript.layout(128)).expect("root footer");
+        let before = footer_text(&transcript.layout(&DARK, 128)).expect("root footer");
 
         assert_eq!(child.attempts(), std::slice::from_ref(&child_attempt));
         assert_eq!(nested.parent(), Some(child.id()));
@@ -9155,7 +9243,7 @@ truncated"
             false,
         ));
 
-        let footer = footer_text(&transcript.layout(128)).expect("mixed-model footer");
+        let footer = footer_text(&transcript.layout(&DARK, 128)).expect("mixed-model footer");
         assert!(footer.contains("↑600 ↓60 R50 W0"), "{footer}");
         let RunCostEstimate::Complete(cost) =
             estimate_run_cost([&root, &child_attempt, &nested_attempt])
@@ -9247,7 +9335,7 @@ truncated"
             },
             false,
         ));
-        let partial_footer = footer_text(&transcript.layout(128)).expect("partial footer");
+        let partial_footer = footer_text(&transcript.layout(&DARK, 128)).expect("partial footer");
         assert!(
             partial_footer.contains("↑100 ↓10 R0 W0"),
             "{partial_footer}"
@@ -9259,7 +9347,7 @@ truncated"
             },
             false,
         ));
-        let footer = footer_text(&transcript.layout(128)).expect("terminal footer");
+        let footer = footer_text(&transcript.layout(&DARK, 128)).expect("terminal footer");
         assert!(footer.contains("↑300 ↓30 R0 W0"), "{footer}");
         let RunCostEstimate::Complete(cost) =
             estimate_run_cost([&partial_attempt, &additional_attempt])
@@ -9305,7 +9393,7 @@ truncated"
         ));
         assert_eq!(transcript.subagent_lifecycle_cards.len(), 1);
         assert_eq!(
-            footer_text(&transcript.layout(128)).as_deref(),
+            footer_text(&transcript.layout(&DARK, 128)).as_deref(),
             Some(footer.as_str())
         );
     }
@@ -9331,7 +9419,7 @@ truncated"
             false,
         );
 
-        let full = transcript.layout(128).footer_rule(128);
+        let full = transcript.layout(&DARK, 128).footer_rule(&DARK, 128);
         assert_eq!(full.width(), 128);
         assert!(full.to_string().starts_with('─'), "{full}");
         assert!(full.to_string().ends_with(" ─"), "{full}");
@@ -9341,10 +9429,10 @@ truncated"
                 .find(|span| span.content == "80.0%")
                 .expect("context percentage span")
                 .style,
-            Style::new().fg(Color::Yellow)
+            Style::new().fg(DARK.warning)
         );
 
-        let narrow = transcript.layout(29).footer_rule(29);
+        let narrow = transcript.layout(&DARK, 29).footer_rule(&DARK, 29);
         assert_eq!(narrow.width(), 29);
         assert_eq!(narrow.to_string(), "─ ────── $0.2829 80.0%/272k ─");
         assert_eq!(
@@ -9354,15 +9442,17 @@ truncated"
                 .find(|span| span.content == "80.0%")
                 .expect("context percentage span")
                 .style,
-            Style::new().fg(Color::Yellow)
+            Style::new().fg(DARK.warning)
         );
 
         for width in 0..=12 {
-            let rule = Transcript::default().layout(width).footer_rule(width);
+            let rule = Transcript::default()
+                .layout(&DARK, width)
+                .footer_rule(&DARK, width);
             assert_eq!(rule.width(), usize::from(width));
             assert_eq!(rule.to_string(), "─".repeat(usize::from(width)));
 
-            let populated_rule = transcript.layout(width).footer_rule(width);
+            let populated_rule = transcript.layout(&DARK, width).footer_rule(&DARK, width);
             assert_eq!(populated_rule.width(), usize::from(width));
         }
     }
@@ -9403,7 +9493,7 @@ truncated"
                 },
             ]
         );
-        assert_eq!(footer_text(&transcript.layout(120)), None);
+        assert_eq!(footer_text(&transcript.layout(&DARK, 120)), None);
         let rendered = rendered_layout_text(&mut transcript);
         assert!(rendered.contains("3 attempts"), "{rendered}");
     }
@@ -9440,7 +9530,7 @@ truncated"
         );
 
         assert_eq!(
-            footer_text(&transcript.layout(1)).as_deref(),
+            footer_text(&transcript.layout(&DARK, 1)).as_deref(),
             Some("↑100 ↓20 R10 W5 $0.0007690")
         );
 
@@ -9460,7 +9550,7 @@ truncated"
             panic!("unavailable accounting arena")
         };
         assert_eq!(unavailable_arena.accounting, None);
-        assert_eq!(footer_text(&unavailable.layout(1)), None);
+        assert_eq!(footer_text(&unavailable.layout(&DARK, 1)), None);
 
         let AttemptAccounting::KnownUsage(mut partial_usage) =
             detailed_usage(Some(7), None, None, None, None, None)
@@ -9484,7 +9574,10 @@ truncated"
             panic!("unpriceable accounting arena")
         };
         assert_eq!(unpriceable_arena.accounting.as_deref(), Some("↑7"));
-        assert_eq!(footer_text(&unpriceable.layout(1)).as_deref(), Some("↑7"));
+        assert_eq!(
+            footer_text(&unpriceable.layout(&DARK, 1)).as_deref(),
+            Some("↑7")
+        );
 
         let mut zeroes = Transcript::default();
         zeroes.apply(
@@ -9510,7 +9603,7 @@ truncated"
         };
         assert_eq!(zeroes_arena.accounting.as_deref(), Some("↑0 R0 r0 Σ0"));
         assert_eq!(
-            footer_text(&zeroes.layout(1)).as_deref(),
+            footer_text(&zeroes.layout(&DARK, 1)).as_deref(),
             Some("↑0 R0 0.0%/272k")
         );
 
@@ -9814,7 +9907,7 @@ truncated"
             false,
         );
 
-        let layout = transcript.layout_fresh(80);
+        let layout = transcript.layout_fresh(&DARK, 80);
         let assistant = card_with_text(&layout.blocks, "Settled heading");
         assert!(
             assistant.text.lines[0]
@@ -9912,7 +10005,7 @@ truncated"
             );
         }
 
-        let live = transcript.layout(80);
+        let live = transcript.layout(&DARK, 80);
         let live_markdown = live
             .blocks
             .iter()
@@ -9934,7 +10027,7 @@ truncated"
             completed_execution(1, 1, "print('settled')", "# Settled reasoning", Vec::new()),
             false,
         );
-        let settled_layout = transcript.layout_fresh(80);
+        let settled_layout = transcript.layout_fresh(&DARK, 80);
         let settled_reasoning = card_with_text(&settled_layout.blocks, "Settled reasoning");
         assert!(
             settled_reasoning.text.lines[0]
@@ -10660,8 +10753,8 @@ truncated"
             .into_iter()
             .map(|text| {
                 RenderBlock::card(
-                    own_styled_text(ratatui::text::Text::raw(text), page_style()),
-                    page_style(),
+                    own_styled_text(ratatui::text::Text::raw(text), page_style(&DARK)),
+                    page_style(&DARK),
                     20,
                     0,
                     0,
@@ -10669,6 +10762,7 @@ truncated"
             })
             .collect::<Vec<_>>();
         let layout = TranscriptLayout {
+            page_style: page_style(&DARK),
             total_height: blocks.iter().map(RenderBlock::height).sum(),
             width: 20,
             blocks: blocks.into_iter().map(LayoutBlock::Fresh).collect(),
@@ -10812,15 +10906,15 @@ truncated"
             .find(|column| collapsed_buffer[(*column, marker_row as u16)].symbol() == "[")
             .expect("tool-call omission marker");
         let marker_cell = &collapsed_buffer[(marker_column, marker_row as u16)];
-        assert_eq!(marker_cell.fg, DIM);
-        assert_eq!(marker_cell.bg, COMPLETE_ARENA);
+        assert_eq!(marker_cell.fg, DARK.dim);
+        assert_eq!(marker_cell.bg, DARK.tool_success_bg);
         let ordinary_row = row_containing(&collapsed_buffer, "read · 5 bytes");
         let ordinary_column = (0..collapsed_buffer.area.width)
             .find(|column| collapsed_buffer[(*column, ordinary_row as u16)].symbol() == "r")
             .expect("tool-call row");
         let ordinary_cell = &collapsed_buffer[(ordinary_column, ordinary_row as u16)];
-        assert_eq!(ordinary_cell.fg, TEXT);
-        assert_eq!(ordinary_cell.bg, COMPLETE_ARENA);
+        assert_eq!(ordinary_cell.fg, DARK.text);
+        assert_eq!(ordinary_cell.bg, DARK.tool_success_bg);
 
         let collapsed = rendered_layout_text(&mut transcript);
         for marker in [
@@ -10874,7 +10968,7 @@ truncated"
         let full = rendered_buffer(&mut transcript, 16);
         let (calls_top, calls_bottom, calls_left) = closed_section(&full, "tool calls");
         assert!(calls_bottom > calls_top + 2);
-        let layout = transcript.layout(16);
+        let layout = transcript.layout(&DARK, 16);
         let mut clipped = Buffer::empty(Rect::new(0, 0, 16, 2));
         layout.render(clipped.area, calls_top + 1, &mut clipped);
         assert_eq!(clipped[(0, 0)].symbol(), "│");
@@ -10908,17 +11002,17 @@ truncated"
             false,
         );
 
-        let layout = transcript.layout(40);
+        let layout = transcript.layout(&DARK, 40);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, layout.total_height() as u16));
         layout.render(buffer.area, 0, &mut buffer);
 
         let user = buffer
             .content
             .iter()
-            .find(|cell| cell.symbol() == "i" && cell.bg == USER)
+            .find(|cell| cell.symbol() == "i" && cell.bg == DARK.user_message_bg)
             .expect("user request cell");
-        assert_eq!(user.bg, Color::Rgb(52, 53, 65));
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(52, 53, 65));
+        assert_eq!(user.bg, DARK.user_message_bg);
+        assert_eq!(buffer[(0, 0)].bg, DARK.user_message_bg);
 
         let outer_top = (0..buffer.area.height)
             .find(|row| buffer[(0, *row)].symbol() == "╭")
@@ -10929,14 +11023,31 @@ truncated"
             .expect("code frame");
         for (column, row) in [(0, outer_top), (code_left, code_top as u16)] {
             let cell = &buffer[(column, row)];
-            assert_eq!(cell.fg, MUTED);
-            assert_eq!(cell.bg, COMPLETE_ARENA);
+            assert_eq!(cell.fg, DARK.muted);
+            assert_eq!(cell.bg, DARK.tool_success_bg);
         }
-        assert_row_background(&buffer, outer_top as usize, COMPLETE_ARENA);
+        assert_row_background(&buffer, outer_top as usize, DARK.tool_success_bg);
         assert_eq!(
             buffer[(code_left + 2, (code_top + 1) as u16)].bg,
-            COMPLETE_ARENA
+            DARK.tool_success_bg
         );
+    }
+
+    #[test]
+    fn reasoning_card_uses_italic_thinking_text_on_card_background() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "answer()", "reasoning", Vec::new()),
+            false,
+        );
+        let buffer = rendered_buffer(&mut transcript, 40);
+        let row = row_containing(&buffer, "reasoning");
+        for column in 0..buffer.area.width {
+            let cell = &buffer[(column, row as u16)];
+            assert_eq!(cell.fg, DARK.thinking_text);
+            assert_eq!(cell.bg, DARK.card_bg);
+            assert!(cell.modifier.contains(Modifier::ITALIC));
+        }
     }
 
     #[test]
@@ -11281,7 +11392,7 @@ truncated"
             .find(|row| buffer[(0, *row as u16)].symbol() == "╭")
             .expect("rounded outer frame");
         assert_eq!(buffer[(59, outer_top as u16)].symbol(), "╮");
-        assert_row_background(&buffer, outer_top, COMPLETE_ARENA);
+        assert_row_background(&buffer, outer_top, DARK.tool_success_bg);
 
         let mut sections = Vec::new();
         for (label, body) in [
@@ -12073,7 +12184,7 @@ truncated"
             assert!(rendered.contains(text), "{rendered}");
         }
 
-        let layout = transcript.layout(12);
+        let layout = transcript.layout(&DARK, 12);
         let mut clipped = Buffer::empty(Rect::new(0, 0, 12, 2));
         layout.render(clipped.area, code_top + 1, &mut clipped);
         assert_eq!(clipped[(0, 0)].symbol(), "│");
@@ -12112,7 +12223,7 @@ truncated"
         );
 
         for width in 0..=8 {
-            let layout = transcript.layout(width);
+            let layout = transcript.layout(&DARK, width);
             let height = u16::try_from(layout.total_height()).expect("test transcript height");
             let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
             layout.render(buffer.area, 0, &mut buffer);
@@ -12149,9 +12260,9 @@ truncated"
         assert_row_background(
             &live_buffer,
             row_containing(&live_buffer, "live_source"),
-            IN_PROGRESS_ARENA,
+            DARK.tool_pending_bg,
         );
-        assert_arena_frame_style(&live_buffer, "code", IN_PROGRESS_ARENA);
+        assert_arena_frame_style(&live_buffer, "code", DARK.tool_pending_bg);
 
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -12253,10 +12364,10 @@ truncated"
         assert_row_background(
             &buffer,
             row_containing(&buffer, "complete_source"),
-            COMPLETE_ARENA,
+            DARK.tool_success_bg,
         );
         for source in ["python_error_source", "cancelled_source", "failed_source"] {
-            assert_row_background(&buffer, row_containing(&buffer, source), ERROR_ARENA);
+            assert_row_background(&buffer, row_containing(&buffer, source), DARK.tool_error_bg);
         }
         closed_section(&buffer, "error");
         let mut decoded = Transcript::default();
@@ -12286,9 +12397,9 @@ truncated"
         assert_row_background(
             &decoded_buffer,
             row_containing(&decoded_buffer, "terminal_decoded_source"),
-            ERROR_ARENA,
+            DARK.tool_error_bg,
         );
-        assert_arena_frame_style(&decoded_buffer, "code", ERROR_ARENA);
+        assert_arena_frame_style(&decoded_buffer, "code", DARK.tool_error_bg);
     }
 
     #[test]
@@ -12530,7 +12641,7 @@ truncated"
             .iter()
             .find(|cell| cell.symbol() == "d" && cell.fg == Color::Magenta)
             .expect("highlighted def");
-        assert_eq!(def.bg, COMPLETE_ARENA);
+        assert_eq!(def.bg, DARK.tool_success_bg);
 
         let mut live = Transcript::default();
         live.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
@@ -12548,7 +12659,7 @@ truncated"
         let live_buffer = rendered_buffer(&mut live, 60);
         assert!(live_buffer.content.iter().any(|cell| cell.symbol() == "d"
             && cell.fg == Color::Magenta
-            && cell.bg == IN_PROGRESS_ARENA));
+            && cell.bg == DARK.tool_pending_bg));
 
         let mut fallback = Transcript {
             highlighter: PythonHighlighter::fallback_for_test(),
@@ -12563,7 +12674,9 @@ truncated"
             fallback_buffer
                 .content
                 .iter()
-                .any(|cell| cell.symbol() == "d" && cell.fg == TEXT && cell.bg == COMPLETE_ARENA)
+                .any(|cell| cell.symbol() == "d"
+                    && cell.fg == DARK.text
+                    && cell.bg == DARK.tool_success_bg)
         );
         assert!(rendered_layout_text(&mut fallback).contains("def fallback("));
     }
@@ -12638,7 +12751,7 @@ truncated"
         );
 
         for width in 1..=4 {
-            let layout = transcript.layout_fresh(width);
+            let layout = transcript.layout_fresh(&DARK, width);
             assert!(
                 layout
                     .blocks
@@ -12873,7 +12986,7 @@ truncated"
             TranscriptBlock::User { request },
             TranscriptBlock::Metadata { .. },
         ] if request == "request"));
-        let layout = transcript.layout_fresh(40);
+        let layout = transcript.layout_fresh(&DARK, 40);
         let user = card_with_text(&layout.blocks, "request");
         assert_eq!(user.height, 3);
     }
@@ -12903,7 +13016,7 @@ truncated"
             false,
         );
 
-        let layout = transcript.layout_fresh(64);
+        let layout = transcript.layout_fresh(&DARK, 64);
         let reasoning = card_with_text(&layout.blocks, "reasoning");
         assert_eq!((reasoning.left_padding, reasoning.right_padding), (2, 2));
         assert_eq!((reasoning.top_padding, reasoning.bottom_padding), (1, 1));
@@ -12914,8 +13027,8 @@ truncated"
         let buffer = rendered_buffer(&mut transcript, 64);
         let user_row = row_containing(&buffer, "user request");
         assert_eq!(buffer[(1, user_row as u16)].symbol(), "u");
-        assert_row_background(&buffer, user_row - 1, USER);
-        assert_row_background(&buffer, user_row + 1, USER);
+        assert_row_background(&buffer, user_row - 1, DARK.user_message_bg);
+        assert_row_background(&buffer, user_row + 1, DARK.user_message_bg);
 
         let source_row = row_containing(&buffer, "pass");
         let stdout_row = row_containing(&buffer, "stdout");
