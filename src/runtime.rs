@@ -2717,7 +2717,7 @@ mod tests {
                         text: format!("{label} reply"),
                         reasoning_summary: String::new(),
                         replay: ProviderReplay::new(
-                            crate::config::auth::provider_id(DEFAULT_MODEL.provider()),
+                            DEFAULT_MODEL.provider().id(),
                             vec![OpaqueReplayItem::new(vec![b'x'; 100_000])],
                         ),
                         attempts: Vec::new(),

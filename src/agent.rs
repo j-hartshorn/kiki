@@ -2106,7 +2106,7 @@ mod tests {
                 .await
                 .expect("start compaction fixture step");
             let replay = ProviderReplay::new(
-                crate::config::auth::provider_id(DEFAULT_MODEL.provider()),
+                DEFAULT_MODEL.provider().id(),
                 vec![crate::model::OpaqueReplayItem::new(vec![b'x'; 100_000])],
             );
             writer
@@ -2852,7 +2852,7 @@ mod tests {
                     .step(selection, history, cancellation, progress)
                     .await?;
                 step.replay = ProviderReplay::new(
-                    crate::config::auth::provider_id(selection.model().provider()),
+                    selection.model().provider().id(),
                     step.replay.items().to_vec(),
                 );
                 Ok(step)
@@ -2907,10 +2907,7 @@ mod tests {
                     step_id,
                     text: "earlier reply".to_owned(),
                     reasoning_summary: String::new(),
-                    replay: ProviderReplay::new(
-                        crate::config::auth::provider_id(DEFAULT_MODEL.provider()),
-                        Vec::new(),
-                    ),
+                    replay: ProviderReplay::new(DEFAULT_MODEL.provider().id(), Vec::new()),
                     attempts: vec![AttemptAccounting::KnownUsage(crate::model::ModelUsage {
                         model: DEFAULT_MODEL.id.to_owned(),
                         service_tier: None,

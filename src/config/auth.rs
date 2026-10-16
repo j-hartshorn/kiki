@@ -36,15 +36,6 @@ pub(crate) fn auth_path(home: &Path) -> PathBuf {
     home.join(".kiki").join("auth.toml")
 }
 
-/// The table name (and `kiki login` argument) for a provider.
-pub(crate) fn provider_id(provider: Provider) -> &'static str {
-    match provider {
-        Provider::OpenAi => "openai",
-        Provider::Anthropic => "anthropic",
-        Provider::Google => "google",
-    }
-}
-
 pub(crate) fn parse_provider(id: &str) -> Option<Provider> {
     match id {
         "openai" => Some(Provider::OpenAi),
@@ -177,7 +168,7 @@ pub(crate) fn store(home: &Path, provider: Provider, api_key: &str) -> Result<()
     update(home, |document| {
         let mut table = Table::new();
         table.insert(API_KEY_FIELD, value(api_key.trim()));
-        document.insert(provider_id(provider), Item::Table(table));
+        document.insert(provider.id(), Item::Table(table));
         true
     })
     .map(|_| ())
@@ -192,9 +183,7 @@ pub(crate) fn remove(home: &Path, provider: Provider) -> Result<bool, AuthError>
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(AuthError::Unreadable(error)),
     }
-    update(home, |document| {
-        document.remove(provider_id(provider)).is_some()
-    })
+    update(home, |document| document.remove(provider.id()).is_some())
 }
 
 /// Removes group and other write access from an existing `~/.kiki` owned by
@@ -434,9 +423,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{
-        AuthError, StoredKeys, auth_path, load, parse_provider, provider_id, remove, store,
-    };
+    use super::{AuthError, StoredKeys, auth_path, load, parse_provider, remove, store};
     use crate::config::models::Provider;
 
     fn write_auth(home: &std::path::Path, content: &str) {
@@ -463,7 +450,7 @@ mod tests {
         assert_eq!(parse_provider("google"), Some(Provider::Google));
         assert_eq!(parse_provider("gemini"), None);
         for provider in [Provider::OpenAi, Provider::Anthropic, Provider::Google] {
-            assert_eq!(parse_provider(provider_id(provider)), Some(provider));
+            assert_eq!(parse_provider(provider.id()), Some(provider));
         }
     }
 

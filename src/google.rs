@@ -22,7 +22,7 @@ use crate::{
     provider::{bounded_body, redact, retry_delay},
 };
 
-const GOOGLE_PROVIDER: &str = "google";
+const GOOGLE_PROVIDER: &str = Provider::Google.id();
 const GOOGLE_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const EXECUTE_PYTHON: &str = "execute_python";
 // Base64 of "skip_thought_signature_validator"; required for stateless foreign tool calls.

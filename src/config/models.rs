@@ -45,6 +45,14 @@ pub enum Provider {
 }
 
 impl Provider {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
+        }
+    }
+
     pub fn display_name(self) -> &'static str {
         match self {
             Self::OpenAi => "OpenAI",

@@ -26,7 +26,7 @@ use crate::{
     provider::{bounded_body, redact, retry_delay},
 };
 
-const ANTHROPIC_PROVIDER: &str = "anthropic";
+const ANTHROPIC_PROVIDER: &str = Provider::Anthropic.id();
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";

@@ -32,7 +32,7 @@ use crate::{
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
 };
 
-const OPENAI_PROVIDER: &str = "openai";
+const OPENAI_PROVIDER: &str = Provider::OpenAi.id();
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 const CONTEXT_OVERFLOW_CODES: [&str; 2] =

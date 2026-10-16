@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crate::config::models::Provider;
 use crate::config::settings::CrossProviderReasoning;
 use crate::config::{CompactionSettings, ModelSelection};
 use crate::model::{
@@ -273,14 +272,8 @@ struct Destination {
 
 impl Destination {
     fn new(selection: ModelSelection, reasoning: CrossProviderReasoning) -> Self {
-        // Must match the replay provider names written by each adapter.
-        let provider = match selection.model().provider() {
-            Provider::OpenAi => "openai",
-            Provider::Anthropic => "anthropic",
-            Provider::Google => "google",
-        };
         Self {
-            provider,
+            provider: selection.model().provider().id(),
             reasoning,
         }
     }

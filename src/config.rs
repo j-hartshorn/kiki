@@ -741,7 +741,7 @@ fn api_key_problem(kind: StartupProblemKind, provider: Provider, resuming: bool)
         (
             "is missing or empty",
             "a non-empty",
-            format!(" or run `kiki login {}`", auth::provider_id(provider)),
+            format!(" or run `kiki login {}`", provider.id()),
         )
     };
     let saved_model = if resuming {

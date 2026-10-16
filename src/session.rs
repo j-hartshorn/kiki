@@ -13740,7 +13740,7 @@ mod tests {
                     text: "recovered".to_owned(),
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new(
-                        crate::config::auth::provider_id(DEFAULT_MODEL.provider()),
+                        DEFAULT_MODEL.provider().id(),
                         vec![crate::model::OpaqueReplayItem::new(b"done".to_vec())],
                     ),
                     attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
