@@ -38,6 +38,7 @@ pub(crate) fn provider_id(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAi => "openai",
         Provider::Anthropic => "anthropic",
+        Provider::Google => "google",
     }
 }
 
@@ -53,6 +54,7 @@ pub(crate) fn parse_provider(id: &str) -> Option<Provider> {
 pub(crate) struct StoredKeys {
     openai: Option<String>,
     anthropic: Option<String>,
+    google: Option<String>,
 }
 
 impl StoredKeys {
@@ -60,6 +62,7 @@ impl StoredKeys {
         match provider {
             Provider::OpenAi => self.openai.as_deref(),
             Provider::Anthropic => self.anthropic.as_deref(),
+            Provider::Google => self.google.as_deref(),
         }
     }
 
@@ -67,6 +70,7 @@ impl StoredKeys {
         match provider {
             Provider::OpenAi => &mut self.openai,
             Provider::Anthropic => &mut self.anthropic,
+            Provider::Google => &mut self.google,
         }
     }
 }

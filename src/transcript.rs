@@ -152,9 +152,14 @@ impl LivePhase {
 
 fn disabled_status(reason: &RuntimeDisabledReason) -> &'static str {
     match reason {
-        RuntimeDisabledReason::OpenAiAuthentication => "OpenAI authentication failed; restart Kiki",
-        RuntimeDisabledReason::AnthropicAuthentication => {
+        RuntimeDisabledReason::Authentication(Provider::OpenAi) => {
+            "OpenAI authentication failed; restart Kiki"
+        }
+        RuntimeDisabledReason::Authentication(Provider::Anthropic) => {
             "Anthropic authentication failed; restart Kiki"
+        }
+        RuntimeDisabledReason::Authentication(Provider::Google) => {
+            "Google authentication failed; restart Kiki"
         }
         RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
             "Arena recovery failed; restart Kiki"
@@ -4632,7 +4637,7 @@ mod tests {
         Execution, ExecutionOutcome, Observation, PythonError, RunPreview, ToolCall,
         ToolCallSummary, ToolCallToken, ToolName,
     };
-    use crate::config::models::{LUNA, SOL, TERRA};
+    use crate::config::models::{LUNA, Provider, SOL, TERRA};
     use crate::config::{ModelSelection, ready_snapshot_for_test};
     use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage, SkillActivation};
@@ -5355,7 +5360,7 @@ mod tests {
         ));
         assert!(replacement.apply(
             RuntimeEvent::SubmissionRejectedDisabled {
-                reason: RuntimeDisabledReason::OpenAiAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
             },
             false,
         ));
@@ -9607,7 +9612,7 @@ truncated"
         transcript.begin_submission();
         assert!(transcript.apply(
             RuntimeEvent::SubmissionRejectedDisabled {
-                reason: RuntimeDisabledReason::OpenAiAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
             },
             false,
         ));
@@ -9626,7 +9631,7 @@ truncated"
 
         assert!(transcript.apply(
             RuntimeEvent::RuntimeDisabled {
-                reason: RuntimeDisabledReason::AnthropicAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::Anthropic),
             },
             false,
         ));
@@ -9635,6 +9640,24 @@ truncated"
         assert_eq!(
             transcript.status(),
             "Anthropic authentication failed; restart Kiki"
+        );
+    }
+
+    #[test]
+    fn google_authentication_failure_shows_the_google_status() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::Authentication(Provider::Google),
+            },
+            false,
+        ));
+
+        assert!(transcript.is_disabled());
+        assert_eq!(
+            transcript.status(),
+            "Google authentication failed; restart Kiki"
         );
     }
 

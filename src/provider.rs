@@ -60,6 +60,7 @@ fn missing_adapter(provider: Provider) -> ModelError {
     ModelError::InvalidSelection(match provider {
         Provider::OpenAi => "OPENAI_API_KEY is not set",
         Provider::Anthropic => "ANTHROPIC_API_KEY is not set",
+        Provider::Google => "GEMINI_API_KEY is not set",
     })
 }
 
@@ -80,6 +81,7 @@ impl Model for ProviderModel {
                 .as_ref()
                 .ok_or(missing_adapter(Provider::Anthropic))?
                 .validate_history(history, selection),
+            Provider::Google => Err(missing_adapter(Provider::Google)),
         }
     }
 
@@ -106,6 +108,7 @@ impl Model for ProviderModel {
                         .summarise(request, cancellation, attempt_started)
                         .await
                 }
+                Provider::Google => Err(missing_adapter(Provider::Google).into()),
             }
         }
     }
@@ -134,6 +137,7 @@ impl Model for ProviderModel {
                         .step(selection, history, cancellation, progress)
                         .await
                 }
+                Provider::Google => Err(missing_adapter(Provider::Google).into()),
             }
         }
     }

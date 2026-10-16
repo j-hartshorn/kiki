@@ -2079,9 +2079,14 @@ pub(crate) mod tests {
             super::OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
         let cancellation = CancellationToken::new();
 
-        for id in ["anthropic/claude-opus-5-5", "anthropic/claude-fable-5-1"] {
+        for id in [
+            "anthropic/claude-opus-5-5",
+            "anthropic/claude-fable-5-1",
+            "google/gemini-4-argon",
+            "google/gemini-3.8-flash",
+        ] {
             let configuration =
-                crate::config::model_by_id(id).expect("Anthropic model is in the catalogue");
+                crate::config::model_by_id(id).expect("foreign model is in the catalogue");
             let selection =
                 ModelSelection::new(configuration, configuration.default_thinking).unwrap();
             let mut progress_events = 0;
@@ -6764,6 +6769,7 @@ pub(crate) mod tests {
         let setup_failure = match effective_model.provider() {
             Provider::OpenAi => LIVE_SETUP_OPENAI,
             Provider::Anthropic => LIVE_SETUP_ANTHROPIC,
+            Provider::Google => LIVE_SETUP_MODEL,
         };
         let persisted_settings = configuration.snapshot().settings().clone();
         let (worker_path, workspace_root, model, prompt_base, selection, policy) = {

@@ -200,8 +200,8 @@ mod tests {
         config::{
             DEFAULT_MODEL,
             models::{
-                ASTRA, CATALOGUE, FABLE_5_1, GPT6_1_SOL, LUNA, OPUS_5_5, Provider, SOL, SONNET_5_5,
-                TERRA,
+                ASTRA, CATALOGUE, FABLE_5_1, GEMINI_3_8_FLASH, GEMINI_4_ARGON, GPT6_1_SOL, LUNA,
+                OPUS_5_5, Provider, SOL, SONNET_5_5, TERRA,
             },
         },
         model::{AttemptAccounting, ModelUsage},
@@ -353,6 +353,31 @@ mod tests {
             };
 
             assert_eq!(amount(estimate_usage(&usage).unwrap()), expected_amount);
+        }
+    }
+
+    #[test]
+    fn prices_google_models_for_uncached_cached_and_thinking_tokens() {
+        for (model, uncached_only, with_cached, with_thinking) in [
+            (&GEMINI_4_ARGON, 400_000_000, 286_000_000, 336_000_000),
+            (&GEMINI_3_8_FLASH, 150_000_000, 109_500_000, 128_250_000),
+        ] {
+            let standard = |input, cached, output, reasoning| ModelUsage {
+                service_tier: Some("standard".to_owned()),
+                ..usage_for(model.id, input, cached, 0, output, reasoning)
+            };
+
+            let uncached = estimate_usage(&standard(100_000, 0, 20_000, 0)).unwrap();
+            assert_eq!(amount(uncached), uncached_only);
+            assert_eq!(uncached.pricing(), model.pricing.identity);
+
+            let cached = estimate_usage(&standard(100_000, 60_000, 20_000, 0)).unwrap();
+            assert_eq!(amount(cached), with_cached);
+            assert_eq!(cached.pricing(), model.pricing.identity);
+
+            let thinking = estimate_usage(&standard(100_000, 60_000, 25_000, 5_000)).unwrap();
+            assert_eq!(amount(thinking), with_thinking);
+            assert_eq!(thinking.pricing(), model.pricing.identity);
         }
     }
 

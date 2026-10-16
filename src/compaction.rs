@@ -277,6 +277,7 @@ impl Destination {
         let provider = match selection.model().provider() {
             Provider::OpenAi => "openai",
             Provider::Anthropic => "anthropic",
+            Provider::Google => "google",
         };
         Self {
             provider,

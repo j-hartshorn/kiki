@@ -41,6 +41,7 @@ pub struct ModelConfiguration {
 pub enum Provider {
     OpenAi,
     Anthropic,
+    Google,
 }
 
 impl Provider {
@@ -48,6 +49,7 @@ impl Provider {
         match self {
             Self::OpenAi => "OpenAI",
             Self::Anthropic => "Anthropic",
+            Self::Google => "Google",
         }
     }
 
@@ -55,6 +57,7 @@ impl Provider {
         match self {
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::Google => "GEMINI_API_KEY",
         }
     }
 }
@@ -82,6 +85,7 @@ impl ModelSelection {
 }
 
 pub static THINKING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub static GOOGLE_THINKING_LEVELS: &[&str] = &["low", "medium", "high"];
 
 pub static ASTRA: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-6-astra",
@@ -433,7 +437,77 @@ pub static FABLE_5_1: ModelConfiguration = ModelConfiguration {
     },
 };
 
-pub static CATALOGUE: [&ModelConfiguration; 10] = [
+pub static GEMINI_4_ARGON: ModelConfiguration = ModelConfiguration {
+    id: "google/gemini-4-argon",
+    thinking_levels: GOOGLE_THINKING_LEVELS,
+    default_thinking: "medium",
+    service_tier: "standard",
+    context_window_tokens: 1_048_576,
+    context_window_display: "1m",
+    max_output_tokens: 65_536,
+    max_output_display: "64k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "google/gemini-4-argon",
+            service_tier: "standard",
+            version: "2026-10-14",
+            source: "https://ai.google.dev/gemini-api/docs/pricing",
+        },
+        long_context_threshold: 1_048_576,
+        long_context_threshold_display: "1m",
+        short_context: Rates {
+            uncached_input_nanos: 2_000,
+            cached_input_nanos: 100,
+            cache_write_nanos: 0,
+            cache_write_1h_nanos: 0,
+            output_nanos: 10_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 2_000,
+            cached_input_nanos: 100,
+            cache_write_nanos: 0,
+            cache_write_1h_nanos: 0,
+            output_nanos: 10_000,
+        },
+    },
+};
+
+pub static GEMINI_3_8_FLASH: ModelConfiguration = ModelConfiguration {
+    id: "google/gemini-3.8-flash",
+    thinking_levels: GOOGLE_THINKING_LEVELS,
+    default_thinking: "medium",
+    service_tier: "standard",
+    context_window_tokens: 1_048_576,
+    context_window_display: "1m",
+    max_output_tokens: 65_536,
+    max_output_display: "64k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "google/gemini-3.8-flash",
+            service_tier: "standard",
+            version: "2026-10-14",
+            source: "https://ai.google.dev/gemini-api/docs/pricing",
+        },
+        long_context_threshold: 1_048_576,
+        long_context_threshold_display: "1m",
+        short_context: Rates {
+            uncached_input_nanos: 750,
+            cached_input_nanos: 75,
+            cache_write_nanos: 0,
+            cache_write_1h_nanos: 0,
+            output_nanos: 3_750,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 750,
+            cached_input_nanos: 75,
+            cache_write_nanos: 0,
+            cache_write_1h_nanos: 0,
+            output_nanos: 3_750,
+        },
+    },
+};
+
+pub static CATALOGUE: [&ModelConfiguration; 12] = [
     &ASTRA,
     &GPT6_1_SOL,
     &GPT6_SOL,
@@ -444,6 +518,8 @@ pub static CATALOGUE: [&ModelConfiguration; 10] = [
     &OPUS_5_5,
     &SONNET_5_5,
     &FABLE_5_1,
+    &GEMINI_4_ARGON,
+    &GEMINI_3_8_FLASH,
 ];
 pub static DEFAULT_MODEL: &ModelConfiguration = &SOL;
 
@@ -464,6 +540,7 @@ impl ModelConfiguration {
         match self.id.split_once('/') {
             Some(("openai", wire_id)) => (Provider::OpenAi, wire_id),
             Some(("anthropic", wire_id)) => (Provider::Anthropic, wire_id),
+            Some(("google", wire_id)) => (Provider::Google, wire_id),
             _ => panic!("model id `{}` has no known provider prefix", self.id),
         }
     }
@@ -492,12 +569,14 @@ mod tests {
                 "openai/gpt-5.6-luna",
                 "anthropic/claude-opus-5-5",
                 "anthropic/claude-sonnet-5-5",
-                "anthropic/claude-fable-5-1"
+                "anthropic/claude-fable-5-1",
+                "google/gemini-4-argon",
+                "google/gemini-3.8-flash"
             ]
         );
         assert_eq!(
             CATALOGUE.iter().map(|m| m.id).collect::<HashSet<_>>().len(),
-            10
+            12
         );
         assert!(std::ptr::eq(DEFAULT_MODEL, &SOL));
     }
@@ -532,6 +611,12 @@ mod tests {
                     Provider::Anthropic,
                     "claude-fable-5-1"
                 ),
+                ("google/gemini-4-argon", Provider::Google, "gemini-4-argon"),
+                (
+                    "google/gemini-3.8-flash",
+                    Provider::Google,
+                    "gemini-3.8-flash"
+                ),
             ]
         );
         assert_eq!(
@@ -547,6 +632,13 @@ mod tests {
                 Provider::Anthropic.api_key_variable()
             ),
             ("Anthropic", "ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            (
+                Provider::Google.display_name(),
+                Provider::Google.api_key_variable()
+            ),
+            ("Google", "GEMINI_API_KEY")
         );
     }
 
@@ -721,21 +813,99 @@ mod tests {
     }
 
     #[test]
-    fn universal_capacities_and_identity_invariants_hold() {
-        for model in CATALOGUE {
-            assert!(std::ptr::eq(model.thinking_levels, THINKING_LEVELS));
+    fn google_models_match_the_spec_catalogue_and_pricing() {
+        for (model, id, wire_id, rates) in [
+            (
+                &GEMINI_4_ARGON,
+                "google/gemini-4-argon",
+                "gemini-4-argon",
+                Rates {
+                    uncached_input_nanos: 2_000,
+                    cached_input_nanos: 100,
+                    cache_write_nanos: 0,
+                    cache_write_1h_nanos: 0,
+                    output_nanos: 10_000,
+                },
+            ),
+            (
+                &GEMINI_3_8_FLASH,
+                "google/gemini-3.8-flash",
+                "gemini-3.8-flash",
+                Rates {
+                    uncached_input_nanos: 750,
+                    cached_input_nanos: 75,
+                    cache_write_nanos: 0,
+                    cache_write_1h_nanos: 0,
+                    output_nanos: 3_750,
+                },
+            ),
+        ] {
+            assert_eq!(model.id, id);
+            assert_eq!(model.provider(), Provider::Google);
+            assert_eq!(model.wire_id(), wire_id);
+            assert!(std::ptr::eq(model_by_id(id).unwrap(), model));
+            assert!(std::ptr::eq(model.thinking_levels, GOOGLE_THINKING_LEVELS));
+            assert_eq!(model.thinking_levels, &["low", "medium", "high"]);
+            assert_eq!(model.default_thinking, "medium");
+            for &thinking in GOOGLE_THINKING_LEVELS {
+                assert!(model.supports_thinking(thinking));
+                assert_eq!(
+                    ModelSelection::new(model, thinking).unwrap().thinking(),
+                    thinking
+                );
+            }
+            for unsupported in ["none", "minimal", "xhigh", "max"] {
+                assert!(!model.supports_thinking(unsupported));
+                assert_eq!(ModelSelection::new(model, unsupported), None);
+            }
+            assert_eq!(model.service_tier, "standard");
             assert_eq!(
-                model.thinking_levels,
-                &["low", "medium", "high", "xhigh", "max"]
+                (model.context_window_tokens, model.context_window_display),
+                (1_048_576, "1m")
             );
-            assert!(!model.supports_thinking("none"));
-            assert!(model.thinking_levels.contains(&model.default_thinking));
             assert_eq!(
                 (model.max_output_tokens, model.max_output_display),
-                (128_000, "128k")
+                (65_536, "64k")
             );
+            assert_eq!(
+                model.pricing.identity,
+                PricingIdentity {
+                    model: id,
+                    service_tier: "standard",
+                    version: "2026-10-14",
+                    source: "https://ai.google.dev/gemini-api/docs/pricing",
+                }
+            );
+            assert_eq!(
+                (
+                    model.pricing.long_context_threshold,
+                    model.pricing.long_context_threshold_display
+                ),
+                (1_048_576, "1m")
+            );
+            assert_eq!(model.pricing.short_context, rates);
+            assert_eq!(model.pricing.long_context, rates);
+        }
+    }
+
+    #[test]
+    fn universal_capacities_and_identity_invariants_hold() {
+        for model in CATALOGUE {
+            assert!(!model.supports_thinking("none"));
+            assert!(model.thinking_levels.contains(&model.default_thinking));
             assert_eq!(model.pricing.identity.model, model.id);
             assert_eq!(model.pricing.identity.service_tier, model.service_tier);
+            if model.provider() != Provider::Google {
+                assert!(std::ptr::eq(model.thinking_levels, THINKING_LEVELS));
+                assert_eq!(
+                    model.thinking_levels,
+                    &["low", "medium", "high", "xhigh", "max"]
+                );
+                assert_eq!(
+                    (model.max_output_tokens, model.max_output_display),
+                    (128_000, "128k")
+                );
+            }
             match model.provider() {
                 Provider::OpenAi => {
                     assert_eq!(model.service_tier, "default");
@@ -751,7 +921,7 @@ mod tests {
                         (272_000, "272k")
                     );
                 }
-                Provider::Anthropic => {
+                Provider::Anthropic | Provider::Google => {
                     assert_eq!(model.service_tier, "standard");
                     assert_eq!(
                         (

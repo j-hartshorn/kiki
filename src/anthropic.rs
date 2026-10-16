@@ -1315,7 +1315,7 @@ mod tests {
             constants::{
                 ACCEPTED_MODEL_CONTENT_LIMIT, PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT,
             },
-            models::{OPUS_5_5, SOL, SONNET_5_5},
+            models::{GEMINI_3_8_FLASH, GEMINI_4_ARGON, OPUS_5_5, SOL, SONNET_5_5},
             settings::{CacheTtl, CrossProviderReasoning},
         },
         model::{
@@ -3039,6 +3039,10 @@ mod tests {
             )
             .unwrap();
         let openai = ModelSelection::new(&SOL, SOL.default_thinking).unwrap();
+        let google_argon =
+            ModelSelection::new(&GEMINI_4_ARGON, GEMINI_4_ARGON.default_thinking).unwrap();
+        let google_flash =
+            ModelSelection::new(&GEMINI_3_8_FLASH, GEMINI_3_8_FLASH.default_thinking).unwrap();
 
         for (history, selection, expected) in [
             (
@@ -3054,6 +3058,16 @@ mod tests {
             (
                 &history("inspect"),
                 openai,
+                ModelError::InvalidSelection("unsupported Anthropic model"),
+            ),
+            (
+                &history("inspect"),
+                google_argon,
+                ModelError::InvalidSelection("unsupported Anthropic model"),
+            ),
+            (
+                &history("inspect"),
+                google_flash,
                 ModelError::InvalidSelection("unsupported Anthropic model"),
             ),
         ] {
@@ -3914,10 +3928,24 @@ mod tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let openai = ModelSelection::new(&SOL, SOL.default_thinking).unwrap();
+        let google_argon =
+            ModelSelection::new(&GEMINI_4_ARGON, GEMINI_4_ARGON.default_thinking).unwrap();
+        let google_flash =
+            ModelSelection::new(&GEMINI_3_8_FLASH, GEMINI_3_8_FLASH.default_thinking).unwrap();
 
         for (selection, cancellation, expected) in [
             (
                 openai,
+                CancellationToken::new(),
+                ModelError::InvalidSelection("unsupported Anthropic model"),
+            ),
+            (
+                google_argon,
+                CancellationToken::new(),
+                ModelError::InvalidSelection("unsupported Anthropic model"),
+            ),
+            (
+                google_flash,
                 CancellationToken::new(),
                 ModelError::InvalidSelection("unsupported Anthropic model"),
             ),

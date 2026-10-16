@@ -7558,7 +7558,7 @@ mod tests {
 
         let mut disabled = App::default();
         disabled.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         });
         set_prompt(&mut disabled, "locked");
         for event in [
@@ -7692,7 +7692,7 @@ mod tests {
         let mut disabled = App::default();
         set_prompt(&mut disabled, "locked");
         disabled.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         });
         let disabled_update = disabled.handle_paste("discarded");
         assert!(disabled_update.commands.is_empty());
@@ -7785,7 +7785,7 @@ mod tests {
         let mut app = app_with_prompt("hello");
         cursor(&mut app, 20, 12);
         app.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         });
         let now = Instant::now();
         app.handle_mouse(
@@ -7904,7 +7904,7 @@ mod tests {
 
         let mut disabled = App::default();
         disabled.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         });
         assert!(!cursor(&mut disabled, 12, 8).0);
 
@@ -8174,7 +8174,7 @@ mod tests {
         }
         rendered(&mut app, 20, 7);
         app.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         });
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
@@ -9177,7 +9177,7 @@ mod tests {
     fn disabled_authentication_disables_tui_input() {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
         assert!(app.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         }));
         let disabled_screen = rendered(&mut app, 120, 15);
         assert!(disabled_screen.contains("Input disabled"));
@@ -9936,7 +9936,7 @@ mod tests {
 
         let mut disabled = App::default();
         disabled.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         });
         let disabled_now = queue_copy(&mut disabled, text, 60, 12);
         let mut disabled_clipboard = FakeClipboard::available();
@@ -11197,7 +11197,7 @@ mod tests {
         let mut read_only = armed_settled_escape(now);
         read_only.handle_event_at(
             RuntimeEvent::RuntimeDisabled {
-                reason: RuntimeDisabledReason::OpenAiAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
             },
             now,
         );
@@ -11568,7 +11568,7 @@ mod tests {
         let mut disabled = App::default();
         disabled.handle_event_at(
             RuntimeEvent::RuntimeDisabled {
-                reason: RuntimeDisabledReason::OpenAiAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
             },
             now,
         );
@@ -12751,7 +12751,7 @@ mod tests {
             progress_gap: false,
         });
         disabled.handle_event(RuntimeEvent::RuntimeDisabled {
-            reason: RuntimeDisabledReason::OpenAiAuthentication,
+            reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
         });
         assert!(
             disabled

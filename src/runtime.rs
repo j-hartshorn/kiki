@@ -156,20 +156,10 @@ pub(crate) enum Record {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeDisabledReason {
-    OpenAiAuthentication,
-    AnthropicAuthentication,
+    Authentication(Provider),
     ArenaCheckpointRecoveryFailed,
     SessionStorageWriteFailed,
     SessionRestoreFailed,
-}
-
-impl RuntimeDisabledReason {
-    fn authentication(provider: Provider) -> Self {
-        match provider {
-            Provider::OpenAi => Self::OpenAiAuthentication,
-            Provider::Anthropic => Self::AnthropicAuthentication,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1468,8 +1458,7 @@ impl<M: Model> RuntimeController<M> {
                 self.subagents.latch_storage_failure().await;
                 self.disable_session_storage(events).await;
             }
-            RuntimeDisabledReason::OpenAiAuthentication
-            | RuntimeDisabledReason::AnthropicAuthentication
+            RuntimeDisabledReason::Authentication(_)
             | RuntimeDisabledReason::SessionRestoreFailed => {
                 unreachable!("restoration only disables for Arena or storage recovery")
             }
@@ -2291,7 +2280,7 @@ impl<M: Model> RuntimeController<M> {
                             .or_else(|| {
                                 outcome
                                     .authentication_failure
-                                    .then(|| RuntimeDisabledReason::authentication(provider))
+                                    .then_some(RuntimeDisabledReason::Authentication(provider))
                             });
                         let correction = correction_requested
                             && matches!(&record, Record::CancelledRun { .. })
@@ -6747,7 +6736,7 @@ mod tests {
         assert!(!first_events.iter().any(|event| matches!(
             event,
             RuntimeEvent::RuntimeDisabled {
-                reason: RuntimeDisabledReason::OpenAiAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
             }
         )));
         assert!(!first_events.iter().any(|event| matches!(
@@ -8834,7 +8823,7 @@ mod tests {
                     ..
                 },
                 RuntimeEvent::RuntimeDisabled {
-                    reason: RuntimeDisabledReason::OpenAiAuthentication,
+                    reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
                 },
                 RuntimeEvent::RunSettled { run_id: RunId(1) },
             ] if request == "disable runtime"
@@ -8863,7 +8852,7 @@ mod tests {
         assert_eq!(
             next_event(&mut events).await,
             RuntimeEvent::SubmissionRejectedDisabled {
-                reason: RuntimeDisabledReason::OpenAiAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -15044,7 +15033,7 @@ mod tests {
                     ..
                 },
                 RuntimeEvent::RuntimeDisabled {
-                    reason: RuntimeDisabledReason::OpenAiAuthentication,
+                    reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
                 },
                 RuntimeEvent::RunSettled { .. },
             ]
@@ -15063,7 +15052,7 @@ mod tests {
         assert_eq!(
             rejection,
             RuntimeEvent::SubmissionRejectedDisabled {
-                reason: RuntimeDisabledReason::OpenAiAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::OpenAi),
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -15192,7 +15181,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             disabled,
-            [RuntimeDisabledReason::AnthropicAuthentication],
+            [RuntimeDisabledReason::Authentication(Provider::Anthropic)],
             "{settled:?}"
         );
     }
@@ -15215,7 +15204,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             disabled,
-            [RuntimeDisabledReason::OpenAiAuthentication],
+            [RuntimeDisabledReason::Authentication(Provider::OpenAi)],
             "{settled:?}"
         );
     }
@@ -15269,7 +15258,7 @@ mod tests {
         assert_eq!(fixture.request_count(), 1);
         assert!(
             settled.contains(&RuntimeEvent::RuntimeDisabled {
-                reason: RuntimeDisabledReason::AnthropicAuthentication,
+                reason: RuntimeDisabledReason::Authentication(Provider::Anthropic),
             }),
             "{settled:?}"
         );

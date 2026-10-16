@@ -252,6 +252,7 @@ impl StartupSnapshot {
         match provider {
             Provider::OpenAi => self.openai_api_key_presence,
             Provider::Anthropic => self.anthropic_api_key_presence,
+            Provider::Google => ApiKeyPresence::Missing,
         }
     }
 
@@ -401,6 +402,7 @@ impl ApiKeys {
         match provider {
             Provider::OpenAi => self.openai.as_ref(),
             Provider::Anthropic => self.anthropic.as_ref(),
+            Provider::Google => None,
         }
     }
 
@@ -567,6 +569,7 @@ fn resolve_startup_with_session_preferences(
     let selected_api_key = match model.provider() {
         Provider::OpenAi => &openai_api_key,
         Provider::Anthropic => &anthropic_api_key,
+        Provider::Google => &Err(StartupProblemKind::ApiKeyMissing),
     };
     let auth_file_issue = stored_api_keys.as_ref().err().map(auth_file_problem);
     let api_key_problem = selected_api_key
@@ -1577,7 +1580,7 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
             );
             assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
             assert_eq!(
@@ -1613,7 +1616,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.problems()[0].remediation(),
-            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
+            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
         );
         assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
