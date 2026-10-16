@@ -1094,7 +1094,7 @@ impl App {
             .checked_add(1)
             .expect("tree revision overflowed");
         let revision = self.next_tree_revision;
-        self.tree_navigator = Some(TreeNavigator::new(revision, initial_filter));
+        self.tree_navigator = Some(TreeNavigator::new(self.theme, revision, initial_filter));
         Update {
             commands: vec![RuntimeCommand::RequestTree { revision }],
             visible_changed: true,
@@ -2908,7 +2908,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             frame,
             Rect::new(area.x, monitor_top, area.width, monitor.height()),
         );
-        let rule_style = thinking_rule_style(app.settings_selection);
+        let rule_style = thinking_rule_style(app.theme, app.settings_selection);
         frame.render_widget(
             Paragraph::new(layout.footer_rule(app.theme, bottom_rule.width)).style(rule_style),
             bottom_rule,
@@ -2931,7 +2931,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
 
     if area.height <= 3 {
         let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
-        let rule_style = thinking_rule_style(app.settings_selection);
+        let rule_style = thinking_rule_style(app.theme, app.settings_selection);
         if area.height == 3 {
             render_rule(
                 frame,
@@ -3045,13 +3045,14 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         );
     }
     render_slash_overlay(frame, app, completion_area);
-    let rule_style = thinking_rule_style(app.settings_selection);
+    let rule_style = thinking_rule_style(app.theme, app.settings_selection);
     render_rule(
         frame,
         Rect::new(area.x, prompt_top, area.width, 1),
         rule_style,
     );
     render_prompt(
+        app.theme,
         frame,
         &prompt,
         content,
@@ -3078,7 +3079,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         bottom_rule,
     );
     if let Some(picker) = &mut app.picker {
-        picker.render(frame, area);
+        picker.render(app.theme, frame, area);
     }
 }
 
@@ -3154,7 +3155,7 @@ fn render_slash_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         let text = format!("{} {}", row.token, row.purpose);
         let padding = usize::from(width).saturating_sub(Line::raw(&text).width());
         let style = if row.selected {
-            Style::new().add_modifier(Modifier::REVERSED)
+            Style::new().fg(app.theme.text).bg(app.theme.selected_bg)
         } else {
             Style::default()
         };
@@ -3173,6 +3174,7 @@ fn prompt_content_capacity(height: u16) -> usize {
 }
 
 fn render_prompt(
+    theme: &Theme,
     frame: &mut Frame,
     prompt: &PromptLayout,
     content: Rect,
@@ -3199,7 +3201,7 @@ fn render_prompt(
     let text: Text<'_> = prompt
         .rows()
         .iter()
-        .map(|row| prompt_line(row, recognised_token.as_ref()))
+        .map(|row| prompt_line(theme, row, recognised_token.as_ref()))
         .collect();
     frame.render_widget(
         Paragraph::new(text),
@@ -3249,7 +3251,11 @@ fn render_prompt(
     }
 }
 
-fn prompt_line<'a>(row: &'a PromptRow, recognised_token: Option<&Range<usize>>) -> Line<'a> {
+fn prompt_line<'a>(
+    theme: &Theme,
+    row: &'a PromptRow,
+    recognised_token: Option<&Range<usize>>,
+) -> Line<'a> {
     let source = row.source();
     let Some(token) =
         recognised_token.filter(|token| token.start < source.end && source.start < token.end)
@@ -3263,47 +3269,43 @@ fn prompt_line<'a>(row: &'a PromptRow, recognised_token: Option<&Range<usize>>) 
         Span::raw(&text[..start]),
         Span::styled(
             &text[start..end],
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw(&text[end..]),
     ])
 }
 
-const THINKING_RULE_COLOURS: [Color; 6] = [
-    Color::Rgb(102, 102, 102),
-    Color::Rgb(63, 94, 158),
-    Color::Rgb(91, 77, 169),
-    Color::Rgb(139, 63, 192),
-    Color::Rgb(190, 45, 209),
-    Color::Rgb(255, 0, 255),
-];
-
-fn thinking_rule_style(selection: ModelSelection) -> Style {
+fn thinking_rule_style(theme: &Theme, selection: ModelSelection) -> Style {
     Style::new().fg(thinking_rule_colour(
+        theme,
         selection.model().thinking_levels,
         selection.thinking(),
     ))
 }
 
-fn thinking_rule_colour(levels: &[&str], selected: &str) -> Color {
+fn thinking_rule_colour(theme: &Theme, levels: &[&str], selected: &str) -> Color {
+    let colours = [
+        theme.thinking_off,
+        theme.thinking_minimal,
+        theme.thinking_low,
+        theme.thinking_medium,
+        theme.thinking_high,
+        theme.thinking_xhigh,
+        theme.thinking_max,
+    ];
     let index = levels
         .iter()
         .position(|level| *level == selected)
         .expect("selection thinking must be supported by its model");
     let denominator = levels.len().saturating_sub(1);
     if denominator == 0 {
-        return THINKING_RULE_COLOURS[0];
+        return colours[0];
     }
-    let position = index * (THINKING_RULE_COLOURS.len() - 1);
+    let position = index * (colours.len() - 1);
     let lower = position / denominator;
     let remainder = position % denominator;
-    let upper = (lower + usize::from(remainder > 0)).min(THINKING_RULE_COLOURS.len() - 1);
-    interpolate_colour(
-        THINKING_RULE_COLOURS[lower],
-        THINKING_RULE_COLOURS[upper],
-        remainder,
-        denominator,
-    )
+    let upper = (lower + usize::from(remainder > 0)).min(colours.len() - 1);
+    interpolate_colour(colours[lower], colours[upper], remainder, denominator)
 }
 
 fn interpolate_colour(start: Color, end: Color, remainder: usize, denominator: usize) -> Color {
@@ -3353,7 +3355,8 @@ mod tests {
         MouseEventKind,
     };
     use ratatui::layout::Position;
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Color;
+    use ratatui::style::Modifier;
 
     use super::{
         App, DocumentPosition, HistoryPosition, Selection, TitlePublisher, compaction_throbber,
@@ -3382,6 +3385,7 @@ mod tests {
     use crate::skills::{ProjectScope, SkillCatalog, SkillDiagnostic, write_skill};
     use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
+    use crate::theme::{DARK, DISTINCT_TEST_THEME};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
@@ -4816,33 +4820,62 @@ mod tests {
     }
 
     #[test]
-    fn prompt_rules_follow_active_and_preview_thinking_colours() {
-        let levels = ["low", "medium", "high", "xhigh", "max"];
+    fn thinking_rule_spreads_model_levels_across_theme_stops() {
+        let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+        let stops = [
+            DARK.thinking_off,
+            DARK.thinking_minimal,
+            DARK.thinking_low,
+            DARK.thinking_medium,
+            DARK.thinking_high,
+            DARK.thinking_xhigh,
+            DARK.thinking_max,
+        ];
+        for count in [1, 3, 5, 7] {
+            let model_levels = &levels[..count];
+            assert_eq!(
+                super::thinking_rule_colour(&DARK, model_levels, model_levels[0]),
+                stops[0],
+                "{count} levels"
+            );
+            if count > 1 {
+                assert_eq!(
+                    super::thinking_rule_colour(&DARK, model_levels, model_levels[count - 1]),
+                    stops[6],
+                    "{count} levels"
+                );
+            }
+        }
+        for (level, stop) in levels.into_iter().zip(stops) {
+            assert_eq!(
+                super::thinking_rule_colour(&DARK, &levels, level),
+                stop,
+                "{level}"
+            );
+        }
         assert_eq!(
-            super::thinking_rule_colour(&levels, "low"),
-            super::THINKING_RULE_COLOURS[0],
+            super::thinking_rule_colour(&DARK, &levels[..3], "minimal"),
+            stops[3]
         );
         assert_eq!(
-            super::thinking_rule_colour(&levels, "max"),
-            super::THINKING_RULE_COLOURS[5],
+            super::thinking_rule_colour(&DARK, &levels[..5], "minimal"),
+            Color::Rgb(94, 133, 153)
         );
         assert_eq!(
-            super::thinking_rule_colour(&["low", "medium", "max"], "medium"),
-            super::interpolate_colour(
-                super::THINKING_RULE_COLOURS[2],
-                super::THINKING_RULE_COLOURS[3],
-                1,
-                2,
-            )
+            super::thinking_rule_colour(&DARK, &levels[..5], "medium"),
+            Color::Rgb(187, 101, 211)
         );
+    }
 
+    #[test]
+    fn prompt_rules_follow_active_and_preview_thinking_colours() {
         let mut app = App::default();
         let now = Instant::now();
         assert!(app.cycle_thinking_preview(now).visible_changed);
         let buffer = rendered_buffer(&mut app, 80, 8);
         assert_eq!(
             buffer[(0, 7)].fg,
-            super::thinking_rule_colour(SOL.thinking_levels, "high")
+            super::thinking_rule_colour(&DARK, SOL.thinking_levels, "high")
         );
     }
 
@@ -5248,6 +5281,7 @@ mod tests {
     #[test]
     fn slash_completion_lists_catalogue_in_order_and_clamps_keyboard_selection() {
         let mut app = app_with_prompt("/");
+        app.theme = &DISTINCT_TEST_THEME;
         let initial = rendered_buffer(&mut app, 40, 10);
         let overlay = app.slash_overlay.expect("slash overlay");
         let (compact_column, compact_row) = cell_start(&initial, "/compact");
@@ -5263,29 +5297,58 @@ mod tests {
                 && name_row < thinking_row
                 && thinking_row < tree_row
         );
+        assert_eq!(
+            initial[(compact_column, compact_row)].fg,
+            DISTINCT_TEST_THEME.text
+        );
+        assert_eq!(
+            initial[(compact_column, compact_row)].bg,
+            DISTINCT_TEST_THEME.selected_bg
+        );
         assert!(
-            initial[(compact_column, compact_row)]
+            !initial[(compact_column, compact_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let model = rendered_buffer(&mut app, 40, 10);
+        assert_eq!(
+            model[(model_column, model_row)].fg,
+            DISTINCT_TEST_THEME.text
+        );
+        assert_eq!(
+            model[(model_column, model_row)].bg,
+            DISTINCT_TEST_THEME.selected_bg
+        );
         assert!(
-            model[(model_column, model_row)]
+            !model[(model_column, model_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let name = rendered_buffer(&mut app, 40, 10);
+        assert_eq!(name[(name_column, name_row)].fg, DISTINCT_TEST_THEME.text);
+        assert_eq!(
+            name[(name_column, name_row)].bg,
+            DISTINCT_TEST_THEME.selected_bg
+        );
         assert!(
-            name[(name_column, name_row)]
+            !name[(name_column, name_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let thinking = rendered_buffer(&mut app, 40, 10);
+        assert_eq!(
+            thinking[(thinking_column, thinking_row)].fg,
+            DISTINCT_TEST_THEME.text
+        );
+        assert_eq!(
+            thinking[(thinking_column, thinking_row)].bg,
+            DISTINCT_TEST_THEME.selected_bg
+        );
         assert!(
-            thinking[(thinking_column, thinking_row)]
+            !thinking[(thinking_column, thinking_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
@@ -5296,8 +5359,13 @@ mod tests {
                 .visible_changed
         );
         let tree = rendered_buffer(&mut app, 40, 10);
+        assert_eq!(tree[(tree_column, tree_row)].fg, DISTINCT_TEST_THEME.text);
+        assert_eq!(
+            tree[(tree_column, tree_row)].bg,
+            DISTINCT_TEST_THEME.selected_bg
+        );
         assert!(
-            tree[(tree_column, tree_row)]
+            !tree[(tree_column, tree_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
@@ -5380,20 +5448,20 @@ mod tests {
         let (argument_column, argument_row) = cell_start(&buffer, "arg");
 
         for column in token_column..token_column + 3 {
-            assert_eq!(buffer[(column, token_row)].fg, Color::Cyan);
+            assert_eq!(buffer[(column, token_row)].fg, DARK.accent);
             assert!(
                 buffer[(column, token_row)]
                     .modifier
                     .contains(ratatui::style::Modifier::BOLD)
             );
-            assert_eq!(buffer[(column, token_row + 1)].fg, Color::Cyan);
+            assert_eq!(buffer[(column, token_row + 1)].fg, DARK.accent);
             assert!(
                 buffer[(column, token_row + 1)]
                     .modifier
                     .contains(ratatui::style::Modifier::BOLD)
             );
         }
-        assert_ne!(buffer[(argument_column + 1, argument_row)].fg, Color::Cyan);
+        assert_ne!(buffer[(argument_column + 1, argument_row)].fg, DARK.accent);
         assert!(
             !buffer[(argument_column + 1, argument_row)]
                 .modifier
@@ -5402,7 +5470,7 @@ mod tests {
 
         assert!(wrapped.handle_key(key(KeyCode::Left)).visible_changed);
         let interior = rendered_buffer(&mut wrapped, 5, 21);
-        assert_eq!(interior[(token_column, token_row)].fg, Color::Cyan);
+        assert_eq!(interior[(token_column, token_row)].fg, DARK.accent);
         assert!(
             interior[(token_column, token_row)]
                 .modifier
@@ -5413,7 +5481,7 @@ mod tests {
             let mut app = app_with_prompt(draft);
             let buffer = rendered_buffer(&mut app, 40, 12);
             let (column, row) = cell_start(&buffer, token);
-            assert_ne!(buffer[(column, row)].fg, Color::Cyan, "{draft}");
+            assert_ne!(buffer[(column, row)].fg, DARK.accent, "{draft}");
             assert!(
                 !buffer[(column, row)]
                     .modifier
@@ -5448,11 +5516,13 @@ mod tests {
         assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
         let buffer = rendered_buffer(&mut tiny, 5, 5);
         let (column, row) = cell_start(&buffer, "/thin");
-        assert!(
-            buffer[(column, row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        for selected_column in 0..5 {
+            let cell = &buffer[(selected_column, row)];
+            assert_eq!(cell.fg, DARK.text);
+            assert_eq!(cell.bg, DARK.selected_bg);
+            assert!(!cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+        }
+        assert_eq!(column, 0);
 
         rendered_buffer(&mut tiny, 5, 4);
         assert!(tiny.slash_overlay.is_none());
@@ -12081,7 +12151,7 @@ mod tests {
         let buffer = rendered_buffer(&mut app, 33, 2);
         assert_eq!(
             buffer[(0, 1)].fg,
-            super::thinking_rule_colour(SOL.thinking_levels, SOL.default_thinking)
+            super::thinking_rule_colour(&DARK, SOL.thinking_levels, SOL.default_thinking)
         );
 
         for width in 0..=4 {
@@ -12106,7 +12176,7 @@ mod tests {
         let buffer = rendered_buffer(&mut app, 33, 3);
         assert_eq!(
             buffer[(0, 2)].fg,
-            super::thinking_rule_colour(SOL.thinking_levels, SOL.default_thinking)
+            super::thinking_rule_colour(&DARK, SOL.thinking_levels, SOL.default_thinking)
         );
 
         for width in 0..=4 {

@@ -1281,7 +1281,7 @@ impl ArenaRenderBlock {
             if let Some(construction_counts) = construction_counts {
                 construction_counts.highlighting += 1;
             }
-            let code = own_styled_text(highlighter.highlight(&preview), style);
+            let code = own_styled_text(highlighter.highlight(&preview, theme), style);
             let title = omission_title("code", omitted);
             items.push(ArenaItem::Section(ArenaSection::new(
                 theme,
@@ -12639,7 +12639,7 @@ truncated"
         let def = complete_buffer
             .content
             .iter()
-            .find(|cell| cell.symbol() == "d" && cell.fg == Color::Magenta)
+            .find(|cell| cell.symbol() == "d" && cell.fg == DARK.syntax_keyword)
             .expect("highlighted def");
         assert_eq!(def.bg, DARK.tool_success_bg);
 
@@ -12658,7 +12658,7 @@ truncated"
         );
         let live_buffer = rendered_buffer(&mut live, 60);
         assert!(live_buffer.content.iter().any(|cell| cell.symbol() == "d"
-            && cell.fg == Color::Magenta
+            && cell.fg == DARK.syntax_keyword
             && cell.bg == DARK.tool_pending_bg));
 
         let mut fallback = Transcript {

@@ -12,6 +12,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::session::{CompactionOutcome, SessionCatalogue, SessionCatalogueKind, SessionEntryId};
+use crate::theme::Theme;
 use crate::transcript::{
     compaction_reason_label, format_token_count, normalise_terminal_text, observation_text,
     tool_call_label, truncate_front,
@@ -26,16 +27,6 @@ const PICKER_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const INITIAL_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const LOADING_ENTRY: SessionEntryId = SessionEntryId(0);
 
-const TEXT: Color = Color::Rgb(212, 212, 212);
-const ACCENT: Color = Color::Rgb(138, 190, 183);
-const SUCCESS: Color = Color::Rgb(181, 189, 104);
-const ERROR: Color = Color::Rgb(204, 102, 102);
-const WARNING: Color = Color::Rgb(255, 255, 0);
-const COMPACTION: Color = Color::Rgb(118, 150, 86);
-const MUTED: Color = Color::Rgb(128, 128, 128);
-const DIM: Color = Color::Rgb(102, 102, 102);
-const SELECTED_BACKGROUND: Color = Color::Rgb(58, 58, 74);
-const BORDER: Color = Color::Rgb(95, 135, 255);
 const HEADER_SEPARATOR: &str = " · ";
 const HEADER_HINTS: [&str; 7] = [
     "Enter restore",
@@ -229,6 +220,7 @@ impl<'a> TreeProjection<'a> {
 }
 
 struct SessionTree {
+    theme: &'static Theme,
     entry_indexes: BTreeMap<SessionEntryId, usize>,
     nodes: Vec<TreeNode>,
     full_topology: TreeTopology,
@@ -240,7 +232,7 @@ struct SessionTree {
 }
 
 impl SessionTree {
-    fn from_catalogue(catalogue: &SessionCatalogue) -> Self {
+    fn from_catalogue(theme: &'static Theme, catalogue: &SessionCatalogue) -> Self {
         let entry_indexes = catalogue
             .entries
             .iter()
@@ -298,6 +290,7 @@ impl SessionTree {
         let conversation_topology =
             TreeTopology::conversation(&nodes, &full_topology, &preorder, active);
         Self {
+            theme,
             entry_indexes,
             nodes,
             full_topology,
@@ -465,14 +458,22 @@ impl SessionTree {
         row_width: usize,
     ) -> (Line<'static>, Line<'static>) {
         let active = self.nodes[index].active_path;
-        let connector_style = colour_style(if active { ACCENT } else { DIM });
-        let content_style = colour_style(if active { TEXT } else { MUTED });
+        let connector_style = colour_style(if active {
+            self.theme.accent
+        } else {
+            self.theme.dim
+        });
+        let content_style = colour_style(if active {
+            self.theme.text
+        } else {
+            self.theme.muted
+        });
         let mut body = StyledRow::new(row_width.saturating_sub(2));
 
         for &continues in connectors {
             body.push(if continues { "│  " } else { "   " }, connector_style);
             if body.is_truncated() {
-                return row_variants(body.into_spans(), row_width);
+                return row_variants(self.theme, body.into_spans(), row_width);
             }
         }
         let folded = folded_heads.contains(&self.nodes[index].entry);
@@ -497,15 +498,20 @@ impl SessionTree {
         }
         if !body.is_truncated() {
             if index == self.active_index {
-                body.push("● ", colour_style(ACCENT));
+                body.push("● ", colour_style(self.theme.accent));
             } else if active {
-                body.push("• ", colour_style(ACCENT));
+                body.push("• ", colour_style(self.theme.accent));
             }
         }
         if !body.is_truncated() {
-            append_kind_row(&mut body, &self.nodes[index].kind, content_style);
+            append_kind_row(
+                self.theme,
+                &mut body,
+                &self.nodes[index].kind,
+                content_style,
+            );
         }
-        row_variants(body.into_spans(), row_width)
+        row_variants(self.theme, body.into_spans(), row_width)
     }
 
     fn draws_joint(&self, index: usize, topology: &TreeTopology) -> bool {
@@ -526,6 +532,7 @@ pub(crate) enum TreeNavigatorAction {
 }
 
 pub(crate) struct TreeNavigator {
+    theme: &'static Theme,
     revision: u64,
     row_width: usize,
     mode: TreeMode,
@@ -544,9 +551,10 @@ enum TreeNavigatorState {
 }
 
 impl TreeNavigator {
-    pub(crate) fn new(revision: u64, query: &str) -> Self {
+    pub(crate) fn new(theme: &'static Theme, revision: u64, query: &str) -> Self {
         let loading_row = row_variants(
-            vec![Span::styled("Loading…", colour_style(TEXT))],
+            theme,
+            vec![Span::styled("Loading…", colour_style(theme.text))],
             INITIAL_ROW_WIDTH,
         )
         .0;
@@ -563,6 +571,7 @@ impl TreeNavigator {
         );
         picker.set_filter(query);
         Self {
+            theme,
             revision,
             row_width: INITIAL_ROW_WIDTH,
             mode: TreeMode::Full,
@@ -587,7 +596,7 @@ impl TreeNavigator {
             return false;
         };
         let query = picker.filter().to_owned();
-        let tree = SessionTree::from_catalogue(catalogue);
+        let tree = SessionTree::from_catalogue(self.theme, catalogue);
         let mut picker = tree.picker_for_width(self.row_width, self.mode, &self.folded_heads);
         picker.set_filter(&query);
         tree.refresh_for_query(
@@ -633,7 +642,7 @@ impl TreeNavigator {
             return;
         }
         frame.render_widget(Clear, dock);
-        render_rule(frame, Rect::new(dock.x, dock.y, dock.width, 1));
+        render_rule(self.theme, frame, Rect::new(dock.x, dock.y, dock.width, 1));
         if dock.height == 1 {
             return;
         }
@@ -645,11 +654,14 @@ impl TreeNavigator {
             return;
         }
         render_rule(
+            self.theme,
             frame,
             Rect::new(dock.x, dock.y.saturating_add(2), dock.width, 1),
         );
         if dock.height > 3 {
+            let theme = self.theme;
             self.picker_mut().render_frameless(
+                theme,
                 frame,
                 Rect::new(
                     dock.x,
@@ -922,9 +934,9 @@ impl TreeNavigator {
     }
 }
 
-fn render_rule(frame: &mut Frame, area: Rect) {
+fn render_rule(theme: &Theme, frame: &mut Frame, area: Rect) {
     frame.render_widget(
-        Paragraph::new("─".repeat(usize::from(area.width))).style(Style::new().fg(BORDER)),
+        Paragraph::new("─".repeat(usize::from(area.width))).style(Style::new().fg(theme.border)),
         area,
     );
 }
@@ -1008,7 +1020,11 @@ impl StyledRow {
     }
 }
 
-fn row_variants(body: Vec<Span<'static>>, row_width: usize) -> (Line<'static>, Line<'static>) {
+fn row_variants(
+    theme: &Theme,
+    body: Vec<Span<'static>>,
+    row_width: usize,
+) -> (Line<'static>, Line<'static>) {
     let normal_gutter = match row_width {
         0 => "",
         1 => " ",
@@ -1019,26 +1035,31 @@ fn row_variants(body: Vec<Span<'static>>, row_width: usize) -> (Line<'static>, L
         1 => "›",
         _ => "› ",
     };
-    let mut normal = vec![Span::styled(normal_gutter, colour_style(TEXT))];
+    let mut normal = vec![Span::styled(normal_gutter, colour_style(theme.text))];
     normal.extend(body.iter().cloned());
-    let mut focused = vec![Span::styled(focused_gutter, colour_style(ACCENT))];
+    let mut focused = vec![Span::styled(focused_gutter, colour_style(theme.accent))];
     focused.extend(body);
     let mut focused = Line::from(focused);
     for span in &mut focused.spans {
-        span.style = span.style.bg(SELECTED_BACKGROUND);
+        span.style = span.style.bg(theme.selected_bg);
     }
     (Line::from(normal), focused)
 }
 
-fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_style: Style) {
+fn append_kind_row(
+    theme: &Theme,
+    row: &mut StyledRow,
+    kind: &SessionCatalogueKind,
+    content_style: Style,
+) {
     match kind {
         SessionCatalogueKind::Start => row.push("Session start", content_style),
         SessionCatalogueKind::Request { text } => {
-            row.push("User:", colour_style(ACCENT));
+            row.push("User:", colour_style(theme.accent));
             append_preview(row, text, content_style);
         }
         SessionCatalogueKind::SkillActivation { name } => {
-            row.push("Skill:", colour_style(ACCENT));
+            row.push("Skill:", colour_style(theme.accent));
             append_preview(row, name, content_style);
         }
         SessionCatalogueKind::Execution {
@@ -1050,7 +1071,7 @@ fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_sty
             crate::arena::ExecutionOutcome::TypeCheckError(_)
         ) =>
         {
-            row.push("Type check failed", colour_style(ERROR));
+            row.push("Type check failed", colour_style(theme.error));
             if let Some(commentary) = commentary {
                 append_preview(row, commentary, content_style);
             }
@@ -1060,19 +1081,20 @@ fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_sty
             execution,
             ..
         } => append_execution_row(
+            theme,
             row,
             commentary.as_deref(),
             &execution.tool_calls,
             content_style,
         ),
         SessionCatalogueKind::Final { text } => {
-            row.push("Kiki:", colour_style(SUCCESS));
+            row.push("Kiki:", colour_style(theme.success));
             append_preview(row, text, content_style);
         }
-        SessionCatalogueKind::Cancelled => row.push("Cancelled", colour_style(WARNING)),
-        SessionCatalogueKind::Failed => row.push("Failed", colour_style(ERROR)),
+        SessionCatalogueKind::Cancelled => row.push("Cancelled", colour_style(theme.warning)),
+        SessionCatalogueKind::Failed => row.push("Failed", colour_style(theme.error)),
         SessionCatalogueKind::Compaction { outcome } => {
-            row.push(&compaction_row(outcome), colour_style(COMPACTION));
+            row.push(&compaction_row(outcome), colour_style(theme.border_accent));
         }
     }
 }
@@ -1086,6 +1108,7 @@ fn append_preview(row: &mut StyledRow, text: &str, content_style: Style) {
 }
 
 fn append_execution_row(
+    theme: &Theme,
     row: &mut StyledRow,
     commentary: Option<&str>,
     tool_calls: &[crate::arena::ToolCall],
@@ -1101,27 +1124,27 @@ fn append_execution_row(
     let succeeded = tool_calls.len().saturating_sub(failed);
 
     if tool_calls.is_empty() && commentary.is_none() {
-        row.push("Python", colour_style(MUTED));
+        row.push("Python", colour_style(theme.muted));
         return;
     }
-    row.push("Python:", colour_style(MUTED));
+    row.push("Python:", colour_style(theme.muted));
     if !tool_calls.is_empty() {
-        row.push(" [tools: ", colour_style(DIM));
+        row.push(" [tools: ", colour_style(theme.dim));
         match (tool_calls.len(), failed) {
-            (total, 0) => row.push(&total.to_string(), colour_style(DIM)),
+            (total, 0) => row.push(&total.to_string(), colour_style(theme.dim)),
             (_, failed) if succeeded == 0 => {
-                row.push(&failed.to_string(), colour_style(DIM));
-                row.push("✗", colour_style(ERROR));
+                row.push(&failed.to_string(), colour_style(theme.dim));
+                row.push("✗", colour_style(theme.error));
             }
             (_, failed) => {
-                row.push(&succeeded.to_string(), colour_style(DIM));
-                row.push("✓", colour_style(SUCCESS));
-                row.push(" ", colour_style(DIM));
-                row.push(&failed.to_string(), colour_style(DIM));
-                row.push("✗", colour_style(ERROR));
+                row.push(&succeeded.to_string(), colour_style(theme.dim));
+                row.push("✓", colour_style(theme.success));
+                row.push(" ", colour_style(theme.dim));
+                row.push(&failed.to_string(), colour_style(theme.dim));
+                row.push("✗", colour_style(theme.error));
             }
         }
-        row.push("]", colour_style(DIM));
+        row.push("]", colour_style(theme.dim));
     }
     if let Some(commentary) = commentary {
         row.push(" ", content_style);
@@ -1360,11 +1383,12 @@ mod tests {
         CompactionOutcome, CompactionReason, SessionCatalogue, SessionCatalogueEntry,
         SessionCatalogueKind, SessionEntryId,
     };
+    use crate::theme::{DARK, DISTINCT_TEST_THEME, Theme};
     use crate::tui::picker::{Picker, PickerAction};
 
     #[test]
     fn navigator_tokenises_search_and_clears_it_before_closing() {
-        let mut loading = TreeNavigator::new(7, "credentials python");
+        let mut loading = TreeNavigator::new(&DARK, 7, "credentials python");
         assert_eq!(
             loading.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             TreeNavigatorAction::None
@@ -1374,7 +1398,7 @@ mod tests {
             TreeNavigatorAction::Close
         );
 
-        let mut navigator = TreeNavigator::new(8, "  CREDENTIALS\tpython ");
+        let mut navigator = TreeNavigator::new(&DARK, 8, "  CREDENTIALS\tpython ");
         assert!(navigator.install_catalogue(
             8,
             &catalogue(
@@ -1411,7 +1435,7 @@ mod tests {
 
     #[test]
     fn navigator_does_not_rebuild_rows_for_focus_movement() {
-        let mut navigator = TreeNavigator::new(23, "");
+        let mut navigator = TreeNavigator::new(&DARK, 23, "");
         assert!(navigator.install_catalogue(
             23,
             &catalogue(
@@ -1445,7 +1469,7 @@ mod tests {
 
     #[test]
     fn header_prioritises_live_state_on_one_line() {
-        let mut navigator = TreeNavigator::new(17, "credentials");
+        let mut navigator = TreeNavigator::new(&DARK, 17, "credentials");
         assert!(navigator.install_catalogue(
             17,
             &catalogue(
@@ -1491,12 +1515,12 @@ mod tests {
             "Session tree · Search: credentials · 1/1 · [conversation] · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy · Ctrl-U conversation · PgUp/PgDn page"
         );
 
-        let loading = TreeNavigator::new(18, "credentials");
+        let loading = TreeNavigator::new(&DARK, 18, "credentials");
         assert_eq!(
             loading.header(200, None),
             "Session tree · Search: credentials · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy · Ctrl-U conversation · PgUp/PgDn page"
         );
-        let mut no_match = TreeNavigator::new(19, "missing");
+        let mut no_match = TreeNavigator::new(&DARK, 19, "missing");
         assert!(no_match.install_catalogue(
             19,
             &catalogue(1, [entry(1, None, 1, SessionCatalogueKind::Start)])
@@ -1506,10 +1530,10 @@ mod tests {
             "Session tree · Search: missing · 0/0 · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy · Ctrl-U conversation · PgUp/PgDn page"
         );
 
-        let unicode = TreeNavigator::new(20, "needle 🧑‍💻");
+        let unicode = TreeNavigator::new(&DARK, 20, "needle 🧑‍💻");
         assert_eq!(unicode.header(25, None), "Session tree · Search: …");
 
-        let repeated_spaces = TreeNavigator::new(21, "  repeated  spaces  \nnext  ");
+        let repeated_spaces = TreeNavigator::new(&DARK, 21, "  repeated  spaces  \nnext  ");
         let repeated_header = repeated_spaces.header(200, None);
         assert!(
             repeated_header.contains("Search:   repeated  spaces  \\nnext  "),
@@ -1517,7 +1541,7 @@ mod tests {
         );
         assert!(!repeated_header.contains('\n'), "{repeated_header}");
 
-        let mut whitespace_only = TreeNavigator::new(22, "   ");
+        let mut whitespace_only = TreeNavigator::new(&DARK, 22, "   ");
         assert!(whitespace_only.install_catalogue(
             22,
             &catalogue(1, [entry(1, None, 1, SessionCatalogueKind::Start)])
@@ -1536,7 +1560,7 @@ mod tests {
 
     #[test]
     fn dock_renders_full_width_rules_and_frameless_content() {
-        let mut navigator = TreeNavigator::new(21, "");
+        let mut navigator = TreeNavigator::new(&DARK, 21, "");
         assert!(navigator.install_catalogue(
             21,
             &catalogue(
@@ -1556,7 +1580,7 @@ mod tests {
         for row in [0, 2] {
             for column in 0..40 {
                 assert_eq!(buffer[(column, row)].symbol(), "─");
-                assert_eq!(buffer[(column, row)].fg, Color::Rgb(95, 135, 255));
+                assert_eq!(buffer[(column, row)].fg, DARK.border);
             }
         }
         assert!(row_text(buffer, 1).starts_with("Session tree"));
@@ -1715,7 +1739,7 @@ mod tests {
                 }),
                 row
             );
-            let tree = SessionTree::from_catalogue(&catalogue(
+            let tree = session_tree(&catalogue(
                 2,
                 [
                     entry(1, None, 1, SessionCatalogueKind::Start),
@@ -1769,7 +1793,7 @@ mod tests {
                 entry(5, Some(4), 5, outcomes[2].clone()),
             ],
         );
-        let mut navigator = TreeNavigator::new(5, "");
+        let mut navigator = TreeNavigator::new(&DARK, 5, "");
         assert!(navigator.install_catalogue(5, &catalogue));
         for expected in ["applied", "failed", "cancelled"] {
             assert!(
@@ -1795,21 +1819,26 @@ mod tests {
             );
         }
 
-        let mut hidden = TreeNavigator::new(5, "hidden summary");
+        let mut hidden = TreeNavigator::new(&DARK, 5, "hidden summary");
         assert!(hidden.install_catalogue(5, &catalogue));
         assert!(tree_rows(hidden.picker_mut()).is_empty());
 
+        let theme = &DISTINCT_TEST_THEME;
         let mut row = super::StyledRow::new(PICKER_ROW_WIDTH);
-        super::append_kind_row(&mut row, &outcomes[0], super::colour_style(super::TEXT));
-        assert_eq!(super::COMPACTION, Color::Rgb(118, 150, 86));
-        assert_ne!(super::COMPACTION, super::ACCENT);
-        assert_ne!(super::COMPACTION, super::SUCCESS);
-        assert_ne!(super::COMPACTION, super::ERROR);
-        assert_ne!(super::COMPACTION, super::WARNING);
+        super::append_kind_row(
+            theme,
+            &mut row,
+            &outcomes[0],
+            super::colour_style(theme.text),
+        );
+        assert_ne!(theme.border_accent, DARK.accent);
+        assert_ne!(theme.border_accent, DARK.success);
+        assert_ne!(theme.border_accent, DARK.error);
+        assert_ne!(theme.border_accent, DARK.warning);
         assert!(
             row.spans
                 .iter()
-                .all(|span| span.style.fg == Some(super::COMPACTION))
+                .all(|span| span.style.fg == Some(theme.border_accent))
         );
     }
 
@@ -1828,7 +1857,7 @@ mod tests {
         );
         assert_eq!(super::row_text(&kind), "Type check failed");
         let mut row = super::StyledRow::new(PICKER_ROW_WIDTH);
-        super::append_kind_row(&mut row, &kind, super::colour_style(super::TEXT));
+        super::append_kind_row(&DARK, &mut row, &kind, super::colour_style(DARK.text));
         assert_eq!(
             row.spans
                 .iter()
@@ -1839,7 +1868,7 @@ mod tests {
         assert!(
             row.spans
                 .iter()
-                .all(|span| span.style.fg == Some(super::ERROR))
+                .all(|span| span.style.fg == Some(DARK.error))
         );
     }
 
@@ -1865,7 +1894,7 @@ mod tests {
                 entry(2, Some(1), 2, kind.clone()),
             ],
         );
-        let tree = SessionTree::from_catalogue(&catalogue);
+        let tree = session_tree(&catalogue);
         let mut picker = tree.picker();
         let rows = tree_rows(&mut picker);
         assert!(
@@ -1887,13 +1916,13 @@ mod tests {
 
     #[test]
     fn copy_ignores_loading_and_no_match_trees() {
-        let mut loading = TreeNavigator::new(13, "");
+        let mut loading = TreeNavigator::new(&DARK, 13, "");
         assert_eq!(
             loading.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
             TreeNavigatorAction::None
         );
 
-        let mut no_match = TreeNavigator::new(14, "missing");
+        let mut no_match = TreeNavigator::new(&DARK, 14, "missing");
         assert!(no_match.install_catalogue(
             14,
             &catalogue(1, [entry(1, None, 1, SessionCatalogueKind::Start)])
@@ -1906,7 +1935,7 @@ mod tests {
 
     #[test]
     fn copy_preserves_ready_tree_view_state() {
-        let mut navigator = TreeNavigator::new(16, "needle");
+        let mut navigator = TreeNavigator::new(&DARK, 16, "needle");
         assert!(navigator.install_catalogue(
             16,
             &catalogue(
@@ -1964,7 +1993,7 @@ mod tests {
 
     #[test]
     fn conversation_mode_reparents_history_and_keeps_current_python() {
-        let mut navigator = TreeNavigator::new(4, "");
+        let mut navigator = TreeNavigator::new(&DARK, 4, "");
         assert!(navigator.install_catalogue(
             4,
             &catalogue(
@@ -2042,7 +2071,7 @@ mod tests {
 
     #[test]
     fn conversation_mode_keeps_terminal_outcomes_and_reconstructs_forks() {
-        let mut navigator = TreeNavigator::new(5, "");
+        let mut navigator = TreeNavigator::new(&DARK, 5, "");
         assert!(navigator.install_catalogue(
             5,
             &catalogue(
@@ -2088,7 +2117,7 @@ mod tests {
 
     #[test]
     fn conversation_mode_filtered_focus_prefers_a_matching_ancestor_or_first_match() {
-        let mut ancestor = TreeNavigator::new(6, "needle");
+        let mut ancestor = TreeNavigator::new(&DARK, 6, "needle");
         assert!(ancestor.install_catalogue(
             6,
             &catalogue(
@@ -2126,7 +2155,7 @@ mod tests {
             TreeNavigatorAction::Navigate(SessionEntryId(2))
         );
 
-        let mut fallback = TreeNavigator::new(7, "needle");
+        let mut fallback = TreeNavigator::new(&DARK, 7, "needle");
         assert!(fallback.install_catalogue(
             7,
             &catalogue(
@@ -2166,7 +2195,7 @@ mod tests {
 
     #[test]
     fn conversation_mode_searches_eligible_rows_and_keeps_context() {
-        let mut navigator = TreeNavigator::new(7, "");
+        let mut navigator = TreeNavigator::new(&DARK, 7, "");
         assert!(navigator.install_catalogue(
             7,
             &catalogue(
@@ -2227,7 +2256,7 @@ mod tests {
     fn conversation_mode_reuses_deep_topology_across_query_and_width_refreshes() {
         let depth = 2_048;
         let active_entry = SessionEntryId(depth * 2 + 1);
-        let mut navigator = TreeNavigator::new(8, "");
+        let mut navigator = TreeNavigator::new(&DARK, 8, "");
         assert!(navigator.install_catalogue(8, &deep_conversation_catalogue(depth),));
         assert_eq!(
             navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
@@ -2256,7 +2285,7 @@ mod tests {
 
     #[test]
     fn conversation_mode_preserves_complete_durable_recency_order() {
-        let mut navigator = TreeNavigator::new(8, "");
+        let mut navigator = TreeNavigator::new(&DARK, 8, "");
         assert!(navigator.install_catalogue(
             8,
             &catalogue(
@@ -2329,7 +2358,7 @@ mod tests {
                 entry(9, Some(1), 9, request("root sibling needle")),
             ],
         );
-        let mut navigator = TreeNavigator::new(9, "");
+        let mut navigator = TreeNavigator::new(&DARK, 9, "");
         assert!(navigator.install_catalogue(9, &catalogue));
         assert_eq!(
             tree_rows(navigator.picker_mut()),
@@ -2460,7 +2489,7 @@ mod tests {
                 .any(|row| row.contains("flat continuation needle"))
         );
 
-        let mut escaped = TreeNavigator::new(10, "needle");
+        let mut escaped = TreeNavigator::new(&DARK, 10, "needle");
         assert!(escaped.install_catalogue(10, &catalogue));
         assert!(escaped.picker_mut().focus_value(SessionEntryId(2)));
         assert_eq!(
@@ -2477,7 +2506,7 @@ mod tests {
                 .any(|row| row.contains("flat continuation needle"))
         );
 
-        let mut conversation = TreeNavigator::new(11, "");
+        let mut conversation = TreeNavigator::new(&DARK, 11, "");
         assert!(conversation.install_catalogue(11, &catalogue));
         assert!(conversation.picker_mut().focus_value(SessionEntryId(2)));
         assert_eq!(
@@ -2494,7 +2523,7 @@ mod tests {
                 .any(|row| row.contains("flat continuation needle"))
         );
 
-        let mut filtered = TreeNavigator::new(12, "flat continuation");
+        let mut filtered = TreeNavigator::new(&DARK, 12, "flat continuation");
         assert!(filtered.install_catalogue(12, &catalogue));
         assert_eq!(
             filtered.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
@@ -2508,67 +2537,65 @@ mod tests {
 
     #[test]
     fn semantic_rows_preserve_colours_under_subtle_selection() {
-        let tree = SessionTree::from_catalogue(&catalogue(
-            11,
-            [
-                entry(1, None, 1, SessionCatalogueKind::Start),
-                entry(2, Some(1), 2, request("alternative request")),
-                entry(
-                    3,
-                    Some(1),
-                    3,
-                    execution(
-                        Some("alternative execution"),
-                        vec![ToolCallSummary::Count(1)],
+        let theme = &DISTINCT_TEST_THEME;
+        let tree = SessionTree::from_catalogue(
+            theme,
+            &catalogue(
+                11,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("alternative request")),
+                    entry(
+                        3,
+                        Some(1),
+                        3,
+                        execution(
+                            Some("alternative execution"),
+                            vec![ToolCallSummary::Count(1)],
+                        ),
                     ),
-                ),
-                entry(
-                    4,
-                    Some(1),
-                    4,
-                    SessionCatalogueKind::Final {
-                        text: "alternative final".to_owned(),
-                    },
-                ),
-                entry(5, Some(1), 5, SessionCatalogueKind::Cancelled),
-                entry(6, Some(1), 6, SessionCatalogueKind::Failed),
-                entry(7, Some(1), 7, request("active request")),
-                entry(
-                    8,
-                    Some(7),
-                    8,
-                    execution(
-                        Some("active execution"),
-                        vec![ToolCallSummary::Count(1), ToolCallSummary::Failed],
+                    entry(
+                        4,
+                        Some(1),
+                        4,
+                        SessionCatalogueKind::Final {
+                            text: "alternative final".to_owned(),
+                        },
                     ),
-                ),
-                entry(
-                    9,
-                    Some(8),
-                    9,
-                    SessionCatalogueKind::Final {
-                        text: "active final".to_owned(),
-                    },
-                ),
-                entry(10, Some(9), 10, SessionCatalogueKind::Cancelled),
-                entry(11, Some(10), 11, SessionCatalogueKind::Failed),
-            ],
-        ));
+                    entry(5, Some(1), 5, SessionCatalogueKind::Cancelled),
+                    entry(6, Some(1), 6, SessionCatalogueKind::Failed),
+                    entry(7, Some(1), 7, request("active request")),
+                    entry(
+                        8,
+                        Some(7),
+                        8,
+                        execution(
+                            Some("active execution"),
+                            vec![ToolCallSummary::Count(1), ToolCallSummary::Failed],
+                        ),
+                    ),
+                    entry(
+                        9,
+                        Some(8),
+                        9,
+                        SessionCatalogueKind::Final {
+                            text: "active final".to_owned(),
+                        },
+                    ),
+                    entry(10, Some(9), 10, SessionCatalogueKind::Cancelled),
+                    entry(11, Some(10), 11, SessionCatalogueKind::Failed),
+                ],
+            ),
+        );
         let mut picker = tree.picker();
-        let buffer = rendered_buffer(&mut picker, 72, 20);
+        let buffer = rendered_buffer_with_theme(&mut picker, theme, 72, 20);
 
         let (failed_column, failed_row) = cell_start(&buffer, "Failed");
         assert_eq!(buffer[(1, failed_row)].symbol(), "›");
-        assert_eq!(buffer[(1, failed_row)].fg, Color::Rgb(138, 190, 183));
-        assert_eq!(buffer[(1, failed_row)].bg, Color::Rgb(58, 58, 74));
-        assert_eq!(
-            buffer[(failed_column, failed_row)].fg,
-            Color::Rgb(204, 102, 102)
-        );
-        assert_eq!(
-            buffer[(failed_column, failed_row)].bg,
-            Color::Rgb(58, 58, 74)
-        );
+        assert_eq!(buffer[(1, failed_row)].fg, DARK.accent);
+        assert_eq!(buffer[(1, failed_row)].bg, theme.selected_bg);
+        assert_eq!(buffer[(failed_column, failed_row)].fg, DARK.error);
+        assert_eq!(buffer[(failed_column, failed_row)].bg, theme.selected_bg);
         assert!(
             !buffer[(failed_column, failed_row)]
                 .modifier
@@ -2578,79 +2605,55 @@ mod tests {
         let (current_marker_column, current_marker_row) = cell_start(&buffer, "● Failed");
         assert_eq!(
             buffer[(current_marker_column, current_marker_row)].fg,
-            Color::Rgb(138, 190, 183)
+            DARK.accent
         );
         assert_eq!(
             buffer[(current_marker_column, current_marker_row)].bg,
-            Color::Rgb(58, 58, 74)
+            theme.selected_bg
         );
 
         let (root_marker_column, root_marker_row) = cell_start(&buffer, "• Session start");
         assert_eq!(
             buffer[(root_marker_column, root_marker_row)].fg,
-            Color::Rgb(138, 190, 183)
+            DARK.accent
         );
         assert_eq!(
             buffer[(root_marker_column + 2, root_marker_row)].fg,
-            Color::Rgb(212, 212, 212)
+            theme.text
         );
 
         let (active_connector_column, active_connector_row) =
             cell_start(&buffer, "├⊟ • User: active request");
         assert_eq!(
             buffer[(active_connector_column, active_connector_row)].fg,
-            Color::Rgb(138, 190, 183)
+            DARK.accent
         );
         assert_eq!(
             buffer[(active_connector_column + 3, active_connector_row)].fg,
-            Color::Rgb(138, 190, 183)
+            DARK.accent
         );
         assert_eq!(
             buffer[(active_connector_column + 5, active_connector_row)].fg,
-            Color::Rgb(138, 190, 183)
+            DARK.accent
         );
         assert_eq!(
             buffer[(active_connector_column + 11, active_connector_row)].fg,
-            Color::Rgb(212, 212, 212)
+            theme.text
         );
 
         let (python_column, python_row) =
             cell_start(&buffer, "Python: [tools: 1✓ 1✗] active execution");
-        assert_eq!(
-            buffer[(python_column, python_row)].fg,
-            Color::Rgb(128, 128, 128)
-        );
-        assert_eq!(
-            buffer[(python_column + 9, python_row)].fg,
-            Color::Rgb(102, 102, 102)
-        );
-        assert_eq!(
-            buffer[(python_column + 17, python_row)].fg,
-            Color::Rgb(181, 189, 104)
-        );
-        assert_eq!(
-            buffer[(python_column + 20, python_row)].fg,
-            Color::Rgb(204, 102, 102)
-        );
-        assert_eq!(
-            buffer[(python_column + 23, python_row)].fg,
-            Color::Rgb(212, 212, 212)
-        );
+        assert_eq!(buffer[(python_column, python_row)].fg, DARK.muted);
+        assert_eq!(buffer[(python_column + 9, python_row)].fg, DARK.dim);
+        assert_eq!(buffer[(python_column + 17, python_row)].fg, DARK.success);
+        assert_eq!(buffer[(python_column + 20, python_row)].fg, DARK.error);
+        assert_eq!(buffer[(python_column + 23, python_row)].fg, theme.text);
 
         let (kiki_column, kiki_row) = cell_start(&buffer, "Kiki: active final");
-        assert_eq!(
-            buffer[(kiki_column, kiki_row)].fg,
-            Color::Rgb(181, 189, 104)
-        );
-        assert_eq!(
-            buffer[(kiki_column + 6, kiki_row)].fg,
-            Color::Rgb(212, 212, 212)
-        );
+        assert_eq!(buffer[(kiki_column, kiki_row)].fg, DARK.success);
+        assert_eq!(buffer[(kiki_column + 6, kiki_row)].fg, theme.text);
         let (cancelled_column, cancelled_row) = cell_start(&buffer, "Cancelled");
-        assert_eq!(
-            buffer[(cancelled_column, cancelled_row)].fg,
-            Color::Rgb(255, 255, 0)
-        );
+        assert_eq!(buffer[(cancelled_column, cancelled_row)].fg, DARK.warning);
 
         let (alternative_connector_column, alternative_row) =
             cell_start(&buffer, "└─ User: alternative request");
@@ -2658,15 +2661,15 @@ mod tests {
         assert_eq!(buffer[(2, alternative_row)].symbol(), " ");
         assert_eq!(
             buffer[(alternative_connector_column, alternative_row)].fg,
-            Color::Rgb(102, 102, 102)
+            DARK.dim
         );
         assert_eq!(
             buffer[(alternative_connector_column + 3, alternative_row)].fg,
-            Color::Rgb(138, 190, 183)
+            DARK.accent
         );
         assert_eq!(
             buffer[(alternative_connector_column + 9, alternative_row)].fg,
-            Color::Rgb(128, 128, 128)
+            DARK.muted
         );
         let alternative = (buffer.area.left()..buffer.area.right())
             .map(|column| buffer[(column, alternative_row)].symbol())
@@ -2678,29 +2681,29 @@ mod tests {
             cell_start(&buffer, "Python: [tools: 1] alternative execution");
         assert_eq!(
             buffer[(alternative_python_column, alternative_python_row)].fg,
-            Color::Rgb(128, 128, 128)
+            DARK.muted
         );
         assert_eq!(
             buffer[(alternative_python_column + 19, alternative_python_row)].fg,
-            Color::Rgb(128, 128, 128)
+            DARK.muted
         );
 
         let (alternative_kiki_column, alternative_kiki_row) =
             cell_start(&buffer, "Kiki: alternative final");
         assert_eq!(
             buffer[(alternative_kiki_column, alternative_kiki_row)].fg,
-            Color::Rgb(181, 189, 104)
+            DARK.success
         );
         assert_eq!(
             buffer[(alternative_kiki_column + 6, alternative_kiki_row)].fg,
-            Color::Rgb(128, 128, 128)
+            DARK.muted
         );
         let cancelled_rows = cell_starts(&buffer, "Cancelled");
         let (alternative_cancelled_column, alternative_cancelled_row) =
             *cancelled_rows.last().expect("alternative cancelled row");
         assert_eq!(
             buffer[(alternative_cancelled_column, alternative_cancelled_row)].fg,
-            Color::Rgb(255, 255, 0)
+            DARK.warning
         );
         assert_eq!(
             buffer[(alternative_cancelled_column, alternative_cancelled_row)].bg,
@@ -2711,7 +2714,7 @@ mod tests {
             *failed_rows.last().expect("alternative failed row");
         assert_eq!(
             buffer[(alternative_failed_column, alternative_failed_row)].fg,
-            Color::Rgb(204, 102, 102)
+            DARK.error
         );
         assert_eq!(
             buffer[(alternative_failed_column, alternative_failed_row)].bg,
@@ -2721,7 +2724,7 @@ mod tests {
 
     #[test]
     fn orders_sibling_branches_by_latest_descendant_revision() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             4,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -2751,7 +2754,7 @@ mod tests {
 
     #[test]
     fn renders_linear_history_at_first_level_without_false_joints() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             4,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -2787,7 +2790,7 @@ mod tests {
 
     #[test]
     fn renders_one_fork_with_linear_continuations_by_latest_descendant() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             7,
             [
                 entry(
@@ -2847,7 +2850,7 @@ mod tests {
 
     #[test]
     fn marks_the_active_root() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             1,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -2871,7 +2874,7 @@ mod tests {
 
     #[test]
     fn orders_equal_latest_siblings_by_direct_revision_and_entry_id() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             5,
             [
                 entry(
@@ -2929,7 +2932,7 @@ mod tests {
 
     #[test]
     fn renders_complete_row_vocabulary_and_normalises_text() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             11,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -3021,7 +3024,7 @@ mod tests {
 
     #[test]
     fn renders_complete_connectors_at_depths_seven_and_eight() {
-        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(8));
+        let tree = session_tree(&nested_fork_catalogue(8));
         let mut picker = tree.picker();
         let rows = tree_rows(&mut picker);
 
@@ -3037,7 +3040,7 @@ mod tests {
 
     #[test]
     fn keeps_nested_parents_before_descendants() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             7,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -3073,7 +3076,7 @@ mod tests {
 
     #[test]
     fn filters_a_4096_entry_chain_to_its_matching_leaf() {
-        let tree = SessionTree::from_catalogue(&linear_catalogue(4_096));
+        let tree = session_tree(&linear_catalogue(4_096));
         assert_eq!(tree.preorder.len(), 4_096);
         let mut picker = tree.picker();
 
@@ -3089,7 +3092,7 @@ mod tests {
 
     #[test]
     fn projects_a_large_mixed_tree_without_quadratic_connector_materialisation() {
-        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(2_048));
+        let tree = session_tree(&nested_fork_catalogue(2_048));
         assert_eq!(tree.preorder.len(), 4_096);
 
         let mut positions = vec![0; tree.nodes.len()];
@@ -3122,7 +3125,7 @@ mod tests {
 
     #[test]
     fn filtering_keeps_full_tree_fork_levels_and_recomputes_endings() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             5,
             [
                 entry(
@@ -3209,7 +3212,7 @@ mod tests {
     #[test]
     fn finds_untruncated_previews_and_preserves_graphemes() {
         let request = "界🦀e\u{0301}".repeat(25) + " needle";
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             2,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -3230,7 +3233,7 @@ mod tests {
         assert_eq!(items[1].row.width(), 19);
         assert_eq!(
             items[1].row.spans.last().expect("ellipsis span").style.fg,
-            Some(Color::Rgb(212, 212, 212))
+            Some(DARK.text)
         );
 
         let mut picker = tree.picker();
@@ -3250,7 +3253,7 @@ mod tests {
 
     #[test]
     fn handles_empty_and_narrow_results() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             1,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -3288,7 +3291,7 @@ mod tests {
 
     #[test]
     fn builds_rows_at_tiny_widths() {
-        let tree = SessionTree::from_catalogue(&catalogue(
+        let tree = session_tree(&catalogue(
             2,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
@@ -3306,6 +3309,10 @@ mod tests {
                     .is_some_and(|row| row.width() <= row_width)
             }));
         }
+    }
+
+    fn session_tree(catalogue: &SessionCatalogue) -> SessionTree {
+        SessionTree::from_catalogue(&DARK, catalogue)
     }
 
     fn catalogue(
@@ -3405,7 +3412,7 @@ mod tests {
         if active_entry == 2 {
             entries.push(entry(2, Some(1), 2, kind));
         }
-        let mut navigator = TreeNavigator::new(15, "");
+        let mut navigator = TreeNavigator::new(&DARK, 15, "");
         assert!(navigator.install_catalogue(15, &catalogue(active_entry, entries)));
         navigator.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
     }
@@ -3565,9 +3572,18 @@ mod tests {
     }
 
     fn rendered_buffer(picker: &mut Picker<SessionEntryId>, width: u16, height: u16) -> Buffer {
+        rendered_buffer_with_theme(picker, &DARK, width, height)
+    }
+
+    fn rendered_buffer_with_theme(
+        picker: &mut Picker<SessionEntryId>,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal
-            .draw(|frame| picker.render(frame, frame.area()))
+            .draw(|frame| picker.render(theme, frame, frame.area()))
             .expect("render picker");
         terminal.backend().buffer().clone()
     }
