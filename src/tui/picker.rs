@@ -1,9 +1,10 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph};
+
+use crate::theme::Theme;
 
 pub(crate) const PICKER_MAX_WIDTH: u16 = 72;
 
@@ -215,11 +216,11 @@ impl<T: Copy + Eq> Picker<T> {
         .unwrap_or(u16::MAX)
     }
 
-    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
-        self.render_in(frame, popup_area(area, self.desired_height()));
+    pub(crate) fn render(&mut self, theme: &Theme, frame: &mut Frame, area: Rect) {
+        self.render_in(theme, frame, popup_area(area, self.desired_height()));
     }
 
-    fn render_in(&mut self, frame: &mut Frame, popup: Rect) {
+    fn render_in(&mut self, theme: &Theme, frame: &mut Frame, popup: Rect) {
         if popup.is_empty() {
             return;
         }
@@ -233,18 +234,21 @@ impl<T: Copy + Eq> Picker<T> {
 
         let result_rows = usize::from(inner.height.saturating_sub(1));
         let mut lines = vec![Line::raw(format!("Filter: {}", self.filter))];
-        lines.extend(self.rows(result_rows));
+        lines.extend(self.rows(theme, result_rows));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    pub(super) fn render_frameless(&mut self, frame: &mut Frame, area: Rect) {
+    pub(super) fn render_frameless(&mut self, theme: &Theme, frame: &mut Frame, area: Rect) {
         if area.is_empty() {
             return;
         }
-        frame.render_widget(Paragraph::new(self.rows(usize::from(area.height))), area);
+        frame.render_widget(
+            Paragraph::new(self.rows(theme, usize::from(area.height))),
+            area,
+        );
     }
 
-    fn rows(&mut self, result_rows: usize) -> Vec<Line<'static>> {
+    fn rows(&mut self, theme: &Theme, result_rows: usize) -> Vec<Line<'static>> {
         let matches = self.matches();
         if matches.is_empty() {
             return if result_rows > 0 {
@@ -289,7 +293,10 @@ impl<T: Copy + Eq> Picker<T> {
             lines.push(if focus == Some(index) {
                 item.focused_row.clone().unwrap_or_else(|| {
                     let mut row = item.row.clone();
-                    row.style = row.style.add_modifier(Modifier::REVERSED);
+                    row.style = row.style.fg(theme.text).bg(theme.selected_bg);
+                    for span in &mut row.spans {
+                        span.style = span.style.fg(theme.text).bg(theme.selected_bg);
+                    }
                     row
                 })
             } else {
@@ -497,6 +504,7 @@ mod tests {
     use ratatui::text::{Line, Span};
 
     use super::{DynamicPickerItem, DynamicPickerRole, Picker, PickerAction, PickerItem};
+    use crate::theme::{DARK, DISTINCT_TEST_THEME, Theme};
 
     const ITEMS: [PickerItem<&str>; 4] = [
         PickerItem {
@@ -581,6 +589,7 @@ mod tests {
 
     #[test]
     fn dynamic_roles_keep_non_focusable_context_rows() {
+        let theme = &DISTINCT_TEST_THEME;
         let normal = Style::new().fg(Color::White);
         let accent = Style::new().fg(Color::Cyan);
         let muted = Style::new().fg(Color::DarkGray);
@@ -628,7 +637,7 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             PickerAction::Save("step")
         );
-        let buffer = rendered_buffer(&mut picker, 60, 10);
+        let buffer = rendered_buffer_with_theme(&mut picker, theme, 60, 10);
         let (muted_column, muted_row) = cell_with_symbol(&buffer, "├");
         let (normal_column, normal_row) = cell_with_symbol(&buffer, "γ");
         let (accent_column, accent_row) = cell_with_symbol(&buffer, "α");
@@ -637,8 +646,10 @@ mod tests {
         assert_eq!(buffer[(muted_column, muted_row)].fg, Color::DarkGray);
         assert_eq!(buffer[(normal_column, normal_row)].fg, Color::White);
         assert_eq!(buffer[(accent_column, accent_row)].fg, Color::Cyan);
+        assert_eq!(buffer[(focused_column, focused_row)].fg, theme.text);
+        assert_eq!(buffer[(focused_column, focused_row)].bg, theme.selected_bg);
         assert!(
-            buffer[(focused_column, focused_row)]
+            !buffer[(focused_column, focused_row)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -651,10 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn focused_dynamic_rows_use_caller_variant_while_static_rows_remain_reversed() {
-        let accent = Style::new().fg(Color::Cyan);
-        let text = Style::new().fg(Color::White);
-        let selected = Color::Rgb(58, 58, 74);
+    fn focused_dynamic_rows_use_caller_variant_while_static_rows_use_theme_colours() {
+        let accent = Style::new().fg(DARK.accent);
+        let text = Style::new().fg(DARK.text);
+        let selected = DARK.selected_bg;
         let mut dynamic = Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
@@ -673,9 +684,9 @@ mod tests {
         let dynamic_buffer = rendered_buffer(&mut dynamic, 60, 10);
         let (gutter_column, gutter_row) = cell_with_symbol(&dynamic_buffer, "›");
         let (python_column, python_row) = cell_start(&dynamic_buffer, "Python");
-        assert_eq!(dynamic_buffer[(gutter_column, gutter_row)].fg, Color::Cyan);
+        assert_eq!(dynamic_buffer[(gutter_column, gutter_row)].fg, DARK.accent);
         assert_eq!(dynamic_buffer[(gutter_column, gutter_row)].bg, selected);
-        assert_eq!(dynamic_buffer[(python_column, python_row)].fg, Color::White);
+        assert_eq!(dynamic_buffer[(python_column, python_row)].fg, DARK.text);
         assert_eq!(dynamic_buffer[(python_column, python_row)].bg, selected);
         assert!(
             !dynamic_buffer[(python_column, python_row)]
@@ -686,8 +697,13 @@ mod tests {
         let mut static_picker = picker("sol");
         let static_buffer = rendered_buffer(&mut static_picker, 60, 10);
         let (static_column, static_row) = cell_start(&static_buffer, "openai/gpt-5.6-sol");
+        assert_eq!(static_buffer[(static_column, static_row)].fg, DARK.text);
+        assert_eq!(
+            static_buffer[(static_column, static_row)].bg,
+            DARK.selected_bg
+        );
         assert!(
-            static_buffer[(static_column, static_row)]
+            !static_buffer[(static_column, static_row)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -719,7 +735,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
         terminal
-            .draw(|frame| dynamic.render_frameless(frame, frame.area()))
+            .draw(|frame| dynamic.render_frameless(&DARK, frame, frame.area()))
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "S");
@@ -903,7 +919,9 @@ mod tests {
 
         let buffer = rendered_buffer(&mut picker, 60, 6);
         let (column, row) = cell_start(&buffer, "Python needle one");
-        assert!(buffer[(column, row)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(column, row)].fg, DARK.text);
+        assert_eq!(buffer[(column, row)].bg, DARK.selected_bg);
+        assert!(!buffer[(column, row)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -1014,8 +1032,10 @@ mod tests {
 
         let before = rendered_buffer(&mut current, 60, 7);
         let (column, claude_row) = cell_start(&before, "anthropic/claude");
+        assert_eq!(before[(column, claude_row)].fg, DARK.text);
+        assert_eq!(before[(column, claude_row)].bg, DARK.selected_bg);
         assert!(
-            before[(column, claude_row)]
+            !before[(column, claude_row)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -1023,8 +1043,10 @@ mod tests {
         assert_eq!(current.handle_key(key(KeyCode::Up)), PickerAction::Changed);
         let after = rendered_buffer(&mut current, 60, 7);
         let (column, terra_row) = cell_start(&after, "openai/gpt-5.6-terra");
+        assert_eq!(after[(column, terra_row)].fg, DARK.text);
+        assert_eq!(after[(column, terra_row)].bg, DARK.selected_bg);
         assert!(
-            after[(column, terra_row)]
+            !after[(column, terra_row)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -1079,9 +1101,18 @@ mod tests {
     }
 
     fn rendered_buffer(picker: &mut Picker<&str>, width: u16, height: u16) -> Buffer {
+        rendered_buffer_with_theme(picker, &DARK, width, height)
+    }
+
+    fn rendered_buffer_with_theme(
+        picker: &mut Picker<&str>,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| picker.render(frame, frame.area()))
+            .draw(|frame| picker.render(theme, frame, frame.area()))
             .unwrap();
         terminal.backend().buffer().clone()
     }

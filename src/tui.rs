@@ -41,6 +41,7 @@ use crate::runtime::{
 use crate::selection::{DocumentPosition, Selection};
 use crate::skills::{SkillCatalog, SkillDiagnostic, SkillLookupError};
 use crate::telemetry::{Trace, TraceEvent};
+use crate::theme::{self, Appearance, Theme, ThemeSetting};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
@@ -196,6 +197,8 @@ struct ThinkingPreview {
 }
 
 struct App {
+    theme: &'static Theme,
+    appearance: Appearance,
     mode: AppMode,
     prompt: PromptEditor,
     prompt_width: u16,
@@ -252,6 +255,8 @@ impl Default for App {
         let settings_selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
             .expect("default model thinking must be supported");
         Self {
+            theme: &theme::DARK,
+            appearance: Appearance::Dark,
             mode: AppMode::Configured,
             prompt: PromptEditor::default(),
             prompt_width: 80,
@@ -356,6 +361,16 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
 }
 
 impl App {
+    fn with_appearance(mut self, appearance: Appearance) -> Self {
+        self.appearance = appearance;
+        self.theme = self
+            .settings
+            .as_ref()
+            .map_or(ThemeSetting::Automatic, SettingsContext::theme)
+            .resolve(self.appearance);
+        self
+    }
+
     fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
         self.transcript
             .append_metadata(skill_diagnostic_report(&catalog));
@@ -382,6 +397,7 @@ impl App {
             .and_then(Path::parent)
             .map(Path::to_path_buf);
         Self {
+            theme: settings.theme().resolve(Appearance::Dark),
             transcript: Transcript::configured(startup),
             settings: Some(settings),
             workspace_root,
@@ -1091,7 +1107,7 @@ impl App {
             .checked_add(1)
             .expect("tree revision overflowed");
         let revision = self.next_tree_revision;
-        self.tree_navigator = Some(TreeNavigator::new(revision, initial_filter));
+        self.tree_navigator = Some(TreeNavigator::new(self.theme, revision, initial_filter));
         Update {
             commands: vec![RuntimeCommand::RequestTree { revision }],
             visible_changed: true,
@@ -2165,13 +2181,19 @@ fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
 
 pub(crate) struct TuiStartup {
     snapshot: StartupSnapshot,
+    appearance: Appearance,
     skills_catalog: Arc<SkillCatalog>,
 }
 
 impl TuiStartup {
-    pub(crate) fn new(snapshot: StartupSnapshot, skills_catalog: Arc<SkillCatalog>) -> Self {
+    pub(crate) fn new(
+        snapshot: StartupSnapshot,
+        skills_catalog: Arc<SkillCatalog>,
+        appearance: Appearance,
+    ) -> Self {
         Self {
             snapshot,
+            appearance,
             skills_catalog,
         }
     }
@@ -2205,8 +2227,9 @@ pub(crate) fn run_restored(
     mut progress: RuntimeProgressReceiver,
     trace: Trace,
 ) -> Result<(), TuiError> {
-    let mut app =
-        App::restored(startup.snapshot, &initial).with_skill_catalog(startup.skills_catalog);
+    let mut app = App::restored(startup.snapshot, &initial)
+        .with_appearance(startup.appearance)
+        .with_skill_catalog(startup.skills_catalog);
     app.providers = providers;
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
@@ -2241,8 +2264,11 @@ pub(crate) fn run_restored(
     )
 }
 
-pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError> {
-    let mut app = App::configuration(startup);
+pub(crate) fn run_configuration(
+    startup: StartupSnapshot,
+    appearance: Appearance,
+) -> Result<(), TuiError> {
+    let mut app = App::configuration(startup).with_appearance(appearance);
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
     let mut titles = TerminalTitlePublisher;
@@ -2260,6 +2286,8 @@ pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError
 
 pub(crate) fn run_project_skill_trust(
     scope: &Path,
+    setting: ThemeSetting,
+    appearance: Appearance,
     mut save: impl FnMut() -> Result<(), String>,
 ) -> Result<bool, TuiError> {
     let mut input = CrosstermEvents;
@@ -2268,7 +2296,13 @@ pub(crate) fn run_project_skill_trust(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
         |terminal| {
-            trusted = run_project_skill_trust_loop(terminal, &mut input, scope, &mut save)?;
+            trusted = run_project_skill_trust_loop(
+                terminal,
+                &mut input,
+                scope,
+                setting.resolve(appearance),
+                &mut save,
+            )?;
             Ok(())
         },
     )?;
@@ -2279,6 +2313,7 @@ fn run_project_skill_trust_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     input: &mut impl EventSource,
     scope: &Path,
+    theme: &Theme,
     mut save: impl FnMut() -> Result<(), String>,
 ) -> Result<bool, TuiError> {
     let mut trust_selected = false;
@@ -2291,6 +2326,7 @@ fn run_project_skill_trust_loop<B: Backend>(
             terminal
                 .draw(|frame| {
                     visible_path_rows = render_project_skill_trust(
+                        theme,
                         frame,
                         scope,
                         trust_selected,
@@ -2361,6 +2397,7 @@ fn run_project_skill_trust_loop<B: Backend>(
 }
 
 fn render_project_skill_trust(
+    theme: &Theme,
     frame: &mut Frame,
     scope: &Path,
     trust_selected: bool,
@@ -2371,7 +2408,7 @@ fn render_project_skill_trust(
     if area.is_empty() {
         return None;
     }
-    frame.buffer_mut().set_style(area, page_style());
+    frame.buffer_mut().set_style(area, page_style(theme));
     let width = area.width.min(100);
     let height = area.height.min(12);
     let popup = Rect::new(
@@ -2804,9 +2841,9 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     if let Some(stale_overlay) = app.slash_overlay.take() {
         frame.render_widget(Clear, stale_overlay.intersection(area));
     }
-    frame.buffer_mut().set_style(area, page_style());
+    frame.buffer_mut().set_style(area, page_style(app.theme));
     if area.width == 0 || area.height == 0 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
         app.history_unavailable();
         return;
     }
@@ -2847,7 +2884,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     }
 
     if configuration_only {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
         if area.height == 1 {
             app.history_unavailable();
             return;
@@ -2883,6 +2920,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             .min(area.height.saturating_sub(1));
         let dock_top = bottom_rule.y.saturating_sub(dock_height);
         let monitor = app.subagent_monitor.layout(
+            app.theme,
             area.width,
             dock_top.saturating_sub(area.y).saturating_sub(1),
             now,
@@ -2902,9 +2940,9 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             frame,
             Rect::new(area.x, monitor_top, area.width, monitor.height()),
         );
-        let rule_style = thinking_rule_style(app.settings_selection);
+        let rule_style = thinking_rule_style(app.theme, app.settings_selection);
         frame.render_widget(
-            Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
+            Paragraph::new(layout.footer_rule(app.theme, bottom_rule.width)).style(rule_style),
             bottom_rule,
         );
         if let Some(navigator) = &mut app.tree_navigator {
@@ -2918,14 +2956,14 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     }
 
     if area.height == 1 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
         app.history_unavailable();
         return;
     }
 
     if area.height <= 3 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
-        let rule_style = thinking_rule_style(app.settings_selection);
+        let _ = app.subagent_monitor.layout(app.theme, area.width, 0, now);
+        let rule_style = thinking_rule_style(app.theme, app.settings_selection);
         if area.height == 3 {
             render_rule(
                 frame,
@@ -2934,13 +2972,14 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             );
         }
         let layout = match app.footer_context() {
-            Some(context) => app
-                .transcript
-                .layout_with_footer(bottom_rule.width, context),
-            None => app.transcript.layout(bottom_rule.width),
+            Some(context) => {
+                app.transcript
+                    .layout_with_footer(app.theme, bottom_rule.width, context)
+            }
+            None => app.transcript.layout(app.theme, bottom_rule.width),
         };
         frame.render_widget(
-            Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
+            Paragraph::new(layout.footer_rule(app.theme, bottom_rule.width)).style(rule_style),
             bottom_rule,
         );
         app.history_unavailable();
@@ -2978,10 +3017,13 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     let pending_card = app
         .transcript
         .pending_model_change(app.settings_selection)
-        .map(|selection| model_change_card(selection, app.settings_pending(), area.width))
+        .map(|selection| {
+            model_change_card(app.theme, selection, app.settings_pending(), area.width)
+        })
         .filter(|card| card.height() < history_height.saturating_sub(throbber_height));
     let card_height = pending_card.as_ref().map_or(0, ModelChangeCard::height);
     let monitor = app.subagent_monitor.layout(
+        app.theme,
         area.width,
         history_height
             .saturating_sub(throbber_height)
@@ -3035,13 +3077,14 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         );
     }
     render_slash_overlay(frame, app, completion_area);
-    let rule_style = thinking_rule_style(app.settings_selection);
+    let rule_style = thinking_rule_style(app.theme, app.settings_selection);
     render_rule(
         frame,
         Rect::new(area.x, prompt_top, area.width, 1),
         rule_style,
     );
     render_prompt(
+        app.theme,
         frame,
         &prompt,
         content,
@@ -3064,18 +3107,20 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         prompt,
     ));
     frame.render_widget(
-        Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
+        Paragraph::new(layout.footer_rule(app.theme, bottom_rule.width)).style(rule_style),
         bottom_rule,
     );
     if let Some(picker) = &mut app.picker {
-        picker.render(frame, area);
+        picker.render(app.theme, frame, area);
     }
 }
 
 fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> TranscriptLayout {
     let layout = match app.footer_context() {
-        Some(context) => app.transcript.layout_with_footer(viewport.width, context),
-        None => app.transcript.layout(viewport.width),
+        Some(context) => app
+            .transcript
+            .layout_with_footer(app.theme, viewport.width, context),
+        None => app.transcript.layout(app.theme, viewport.width),
     };
     if viewport.is_empty() {
         app.history_unavailable();
@@ -3137,12 +3182,12 @@ fn render_slash_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(area.right().saturating_sub(width));
     let overlay = Rect::new(x, area.bottom().saturating_sub(height), width, height);
     frame.render_widget(Clear, overlay);
-    frame.buffer_mut().set_style(overlay, page_style());
+    frame.buffer_mut().set_style(overlay, page_style(app.theme));
     let lines = rows.into_iter().map(|row| {
         let text = format!("{} {}", row.token, row.purpose);
         let padding = usize::from(width).saturating_sub(Line::raw(&text).width());
         let style = if row.selected {
-            Style::new().add_modifier(Modifier::REVERSED)
+            Style::new().fg(app.theme.text).bg(app.theme.selected_bg)
         } else {
             Style::default()
         };
@@ -3161,6 +3206,7 @@ fn prompt_content_capacity(height: u16) -> usize {
 }
 
 fn render_prompt(
+    theme: &Theme,
     frame: &mut Frame,
     prompt: &PromptLayout,
     content: Rect,
@@ -3187,7 +3233,7 @@ fn render_prompt(
     let text: Text<'_> = prompt
         .rows()
         .iter()
-        .map(|row| prompt_line(row, recognised_token.as_ref()))
+        .map(|row| prompt_line(theme, row, recognised_token.as_ref()))
         .collect();
     frame.render_widget(
         Paragraph::new(text),
@@ -3237,7 +3283,11 @@ fn render_prompt(
     }
 }
 
-fn prompt_line<'a>(row: &'a PromptRow, recognised_token: Option<&Range<usize>>) -> Line<'a> {
+fn prompt_line<'a>(
+    theme: &Theme,
+    row: &'a PromptRow,
+    recognised_token: Option<&Range<usize>>,
+) -> Line<'a> {
     let source = row.source();
     let Some(token) =
         recognised_token.filter(|token| token.start < source.end && source.start < token.end)
@@ -3251,47 +3301,43 @@ fn prompt_line<'a>(row: &'a PromptRow, recognised_token: Option<&Range<usize>>) 
         Span::raw(&text[..start]),
         Span::styled(
             &text[start..end],
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw(&text[end..]),
     ])
 }
 
-const THINKING_RULE_COLOURS: [Color; 6] = [
-    Color::Rgb(102, 102, 102),
-    Color::Rgb(63, 94, 158),
-    Color::Rgb(91, 77, 169),
-    Color::Rgb(139, 63, 192),
-    Color::Rgb(190, 45, 209),
-    Color::Rgb(255, 0, 255),
-];
-
-fn thinking_rule_style(selection: ModelSelection) -> Style {
+fn thinking_rule_style(theme: &Theme, selection: ModelSelection) -> Style {
     Style::new().fg(thinking_rule_colour(
+        theme,
         selection.model().thinking_levels,
         selection.thinking(),
     ))
 }
 
-fn thinking_rule_colour(levels: &[&str], selected: &str) -> Color {
+fn thinking_rule_colour(theme: &Theme, levels: &[&str], selected: &str) -> Color {
+    let colours = [
+        theme.thinking_off,
+        theme.thinking_minimal,
+        theme.thinking_low,
+        theme.thinking_medium,
+        theme.thinking_high,
+        theme.thinking_xhigh,
+        theme.thinking_max,
+    ];
     let index = levels
         .iter()
         .position(|level| *level == selected)
         .expect("selection thinking must be supported by its model");
     let denominator = levels.len().saturating_sub(1);
     if denominator == 0 {
-        return THINKING_RULE_COLOURS[0];
+        return colours[0];
     }
-    let position = index * (THINKING_RULE_COLOURS.len() - 1);
+    let position = index * (colours.len() - 1);
     let lower = position / denominator;
     let remainder = position % denominator;
-    let upper = (lower + usize::from(remainder > 0)).min(THINKING_RULE_COLOURS.len() - 1);
-    interpolate_colour(
-        THINKING_RULE_COLOURS[lower],
-        THINKING_RULE_COLOURS[upper],
-        remainder,
-        denominator,
-    )
+    let upper = (lower + usize::from(remainder > 0)).min(colours.len() - 1);
+    interpolate_colour(colours[lower], colours[upper], remainder, denominator)
 }
 
 fn interpolate_colour(start: Color, end: Color, remainder: usize, denominator: usize) -> Color {
@@ -3341,7 +3387,8 @@ mod tests {
         MouseEventKind,
     };
     use ratatui::layout::Position;
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Color;
+    use ratatui::style::Modifier;
 
     use super::{
         App, DocumentPosition, HistoryPosition, Selection, TitlePublisher, compaction_throbber,
@@ -3370,6 +3417,7 @@ mod tests {
     use crate::skills::{ProjectScope, SkillCatalog, SkillDiagnostic, write_skill};
     use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
+    use crate::theme::{DARK, DISTINCT_TEST_THEME};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
@@ -3386,6 +3434,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/canonical/repository"),
+            &DARK,
             || {
                 saved.set(true);
                 Ok(())
@@ -3424,6 +3473,7 @@ mod tests {
                 &mut terminal,
                 &mut input,
                 Path::new("/canonical/project"),
+                &DARK,
                 || panic!("modified or release key must not select Trust"),
             )
             .unwrap();
@@ -3445,6 +3495,7 @@ mod tests {
                 &mut terminal,
                 &mut input,
                 Path::new("/canonical/project"),
+                &DARK,
                 || panic!("modified or release Enter must not confirm Trust"),
             )
             .unwrap();
@@ -3460,6 +3511,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/project/line\n\u{202e}tail"),
+            &DARK,
             || panic!("default Skip must not save"),
         )
         .unwrap();
@@ -3480,9 +3532,13 @@ mod tests {
         let path = format!("/project/{}/VISIBLE-SUFFIX", "a".repeat(240));
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
-        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
-            panic!("default Skip must not save")
-        })
+        super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new(&path),
+            &DARK,
+            || panic!("default Skip must not save"),
+        )
         .unwrap();
         let initial = terminal
             .backend()
@@ -3499,9 +3555,13 @@ mod tests {
             Some(Event::Key(key(KeyCode::PageDown))),
             Some(Event::Key(key(KeyCode::Enter))),
         ]);
-        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
-            panic!("default Skip must not save")
-        })
+        super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new(&path),
+            &DARK,
+            || panic!("default Skip must not save"),
+        )
         .unwrap();
         let scrolled = terminal
             .backend()
@@ -3526,6 +3586,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/canonical/repository"),
+            &DARK,
             || {
                 saved.set(saved.get() + 1);
                 Ok(())
@@ -3546,6 +3607,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/canonical/repository"),
+            &DARK,
             || {
                 saved.set(saved.get() + 1);
                 Err("could not save project skill trust (PermissionDenied)".to_owned())
@@ -3579,6 +3641,7 @@ mod tests {
                 &mut terminal,
                 &mut input,
                 Path::new("/canonical/repository"),
+                &DARK,
                 || panic!("cancel must not save trust"),
             )
             .unwrap();
@@ -4804,33 +4867,62 @@ mod tests {
     }
 
     #[test]
-    fn prompt_rules_follow_active_and_preview_thinking_colours() {
-        let levels = ["low", "medium", "high", "xhigh", "max"];
+    fn thinking_rule_spreads_model_levels_across_theme_stops() {
+        let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+        let stops = [
+            DARK.thinking_off,
+            DARK.thinking_minimal,
+            DARK.thinking_low,
+            DARK.thinking_medium,
+            DARK.thinking_high,
+            DARK.thinking_xhigh,
+            DARK.thinking_max,
+        ];
+        for count in [1, 3, 5, 7] {
+            let model_levels = &levels[..count];
+            assert_eq!(
+                super::thinking_rule_colour(&DARK, model_levels, model_levels[0]),
+                stops[0],
+                "{count} levels"
+            );
+            if count > 1 {
+                assert_eq!(
+                    super::thinking_rule_colour(&DARK, model_levels, model_levels[count - 1]),
+                    stops[6],
+                    "{count} levels"
+                );
+            }
+        }
+        for (level, stop) in levels.into_iter().zip(stops) {
+            assert_eq!(
+                super::thinking_rule_colour(&DARK, &levels, level),
+                stop,
+                "{level}"
+            );
+        }
         assert_eq!(
-            super::thinking_rule_colour(&levels, "low"),
-            super::THINKING_RULE_COLOURS[0],
+            super::thinking_rule_colour(&DARK, &levels[..3], "minimal"),
+            stops[3]
         );
         assert_eq!(
-            super::thinking_rule_colour(&levels, "max"),
-            super::THINKING_RULE_COLOURS[5],
+            super::thinking_rule_colour(&DARK, &levels[..5], "minimal"),
+            Color::Rgb(94, 133, 153)
         );
         assert_eq!(
-            super::thinking_rule_colour(&["low", "medium", "max"], "medium"),
-            super::interpolate_colour(
-                super::THINKING_RULE_COLOURS[2],
-                super::THINKING_RULE_COLOURS[3],
-                1,
-                2,
-            )
+            super::thinking_rule_colour(&DARK, &levels[..5], "medium"),
+            Color::Rgb(187, 101, 211)
         );
+    }
 
+    #[test]
+    fn prompt_rules_follow_active_and_preview_thinking_colours() {
         let mut app = App::default();
         let now = Instant::now();
         assert!(app.cycle_thinking_preview(now).visible_changed);
         let buffer = rendered_buffer(&mut app, 80, 8);
         assert_eq!(
             buffer[(0, 7)].fg,
-            super::thinking_rule_colour(super::DEFAULT_MODEL.thinking_levels, "high")
+            super::thinking_rule_colour(&DARK, super::DEFAULT_MODEL.thinking_levels, "high")
         );
     }
 
@@ -5235,7 +5327,14 @@ mod tests {
 
     #[test]
     fn slash_completion_lists_catalogue_in_order_and_clamps_keyboard_selection() {
+        fn assert_slash_selection(cell: &ratatui::buffer::Cell) {
+            assert_eq!(cell.fg, DISTINCT_TEST_THEME.text);
+            assert_eq!(cell.bg, DISTINCT_TEST_THEME.selected_bg);
+            assert!(!cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+        }
+
         let mut app = app_with_prompt("/");
+        app.theme = &DISTINCT_TEST_THEME;
         let initial = rendered_buffer(&mut app, 40, 10);
         let overlay = app.slash_overlay.expect("slash overlay");
         let (compact_column, compact_row) = cell_start(&initial, "/compact");
@@ -5251,32 +5350,16 @@ mod tests {
                 && name_row < thinking_row
                 && thinking_row < tree_row
         );
-        assert!(
-            initial[(compact_column, compact_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&initial[(compact_column, compact_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let model = rendered_buffer(&mut app, 40, 10);
-        assert!(
-            model[(model_column, model_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&model[(model_column, model_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let name = rendered_buffer(&mut app, 40, 10);
-        assert!(
-            name[(name_column, name_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&name[(name_column, name_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let thinking = rendered_buffer(&mut app, 40, 10);
-        assert!(
-            thinking[(thinking_column, thinking_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&thinking[(thinking_column, thinking_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(
@@ -5284,11 +5367,7 @@ mod tests {
                 .visible_changed
         );
         let tree = rendered_buffer(&mut app, 40, 10);
-        assert!(
-            tree[(tree_column, tree_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&tree[(tree_column, tree_row)]);
         assert_eq!(app.prompt.text(), "/");
     }
 
@@ -5368,20 +5447,20 @@ mod tests {
         let (argument_column, argument_row) = cell_start(&buffer, "arg");
 
         for column in token_column..token_column + 3 {
-            assert_eq!(buffer[(column, token_row)].fg, Color::Cyan);
+            assert_eq!(buffer[(column, token_row)].fg, DARK.accent);
             assert!(
                 buffer[(column, token_row)]
                     .modifier
                     .contains(ratatui::style::Modifier::BOLD)
             );
-            assert_eq!(buffer[(column, token_row + 1)].fg, Color::Cyan);
+            assert_eq!(buffer[(column, token_row + 1)].fg, DARK.accent);
             assert!(
                 buffer[(column, token_row + 1)]
                     .modifier
                     .contains(ratatui::style::Modifier::BOLD)
             );
         }
-        assert_ne!(buffer[(argument_column + 1, argument_row)].fg, Color::Cyan);
+        assert_ne!(buffer[(argument_column + 1, argument_row)].fg, DARK.accent);
         assert!(
             !buffer[(argument_column + 1, argument_row)]
                 .modifier
@@ -5390,7 +5469,7 @@ mod tests {
 
         assert!(wrapped.handle_key(key(KeyCode::Left)).visible_changed);
         let interior = rendered_buffer(&mut wrapped, 5, 21);
-        assert_eq!(interior[(token_column, token_row)].fg, Color::Cyan);
+        assert_eq!(interior[(token_column, token_row)].fg, DARK.accent);
         assert!(
             interior[(token_column, token_row)]
                 .modifier
@@ -5401,7 +5480,7 @@ mod tests {
             let mut app = app_with_prompt(draft);
             let buffer = rendered_buffer(&mut app, 40, 12);
             let (column, row) = cell_start(&buffer, token);
-            assert_ne!(buffer[(column, row)].fg, Color::Cyan, "{draft}");
+            assert_ne!(buffer[(column, row)].fg, DARK.accent, "{draft}");
             assert!(
                 !buffer[(column, row)]
                     .modifier
@@ -5436,11 +5515,13 @@ mod tests {
         assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
         let buffer = rendered_buffer(&mut tiny, 5, 5);
         let (column, row) = cell_start(&buffer, "/thin");
-        assert!(
-            buffer[(column, row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        for selected_column in 0..5 {
+            let cell = &buffer[(selected_column, row)];
+            assert_eq!(cell.fg, DARK.text);
+            assert_eq!(cell.bg, DARK.selected_bg);
+            assert!(!cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+        }
+        assert_eq!(column, 0);
 
         rendered_buffer(&mut tiny, 5, 4);
         assert!(tiny.slash_overlay.is_none());
@@ -6895,7 +6976,7 @@ mod tests {
         assert_eq!(history_bottom(&app), rule - 3);
         let buffer = rendered_buffer(&mut app, 80, 40);
         let (column, row) = cell_start(&buffer, "[pending]");
-        assert_eq!(buffer[(column, row)].fg, Color::Rgb(128, 128, 128));
+        assert_eq!(buffer[(column, row)].fg, app.theme.muted);
 
         assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
         let (rows, rule) = rows_and_prompt_rule(&mut app);
@@ -8268,6 +8349,46 @@ mod tests {
     }
 
     #[test]
+    fn theme_setting_controls_user_card_background() {
+        use crate::theme::{Appearance, LIGHT};
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        fs::create_dir(home.path().join(".kiki")).unwrap();
+        for (setting, appearance, expected) in [
+            ("light", Appearance::Dark, LIGHT.user_message_bg),
+            ("automatic", Appearance::Light, LIGHT.user_message_bg),
+            ("automatic", Appearance::Dark, DARK.user_message_bg),
+        ] {
+            fs::write(
+                home.path().join(".kiki/config.toml"),
+                format!("theme = {setting:?}\n"),
+            )
+            .unwrap();
+            let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+                Some(home.path()),
+                workspace.path(),
+            ))
+            .with_appearance(appearance);
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "themed user card".to_owned(),
+                        selection: None,
+                    },
+                },
+                progress_gap: false,
+            });
+            let buffer = rendered_buffer(&mut app, 80, 20);
+            assert_eq!(
+                buffer[cell_start(&buffer, "themed user card")].bg,
+                expected,
+                "{setting} {appearance:?}"
+            );
+        }
+    }
+
+    #[test]
     fn configuration_configured_mode_renders_a_ready_snapshot_and_remains_editable() {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
@@ -8343,8 +8464,10 @@ mod tests {
 
     #[test]
     fn configuration_entry_requires_only_a_startup_snapshot() {
-        let _: fn(crate::config::StartupSnapshot) -> Result<(), super::TuiError> =
-            super::run_configuration;
+        let _: fn(
+            crate::config::StartupSnapshot,
+            crate::theme::Appearance,
+        ) -> Result<(), super::TuiError> = super::run_configuration;
     }
 
     #[test]
@@ -12113,7 +12236,11 @@ mod tests {
         let buffer = rendered_buffer(&mut app, 33, 2);
         assert_eq!(
             buffer[(0, 1)].fg,
-            super::thinking_rule_colour(GPT6_1_SOL.thinking_levels, GPT6_1_SOL.default_thinking)
+            super::thinking_rule_colour(
+                &DARK,
+                GPT6_1_SOL.thinking_levels,
+                GPT6_1_SOL.default_thinking
+            )
         );
 
         for width in 0..=4 {
@@ -12138,7 +12265,11 @@ mod tests {
         let buffer = rendered_buffer(&mut app, 33, 3);
         assert_eq!(
             buffer[(0, 2)].fg,
-            super::thinking_rule_colour(GPT6_1_SOL.thinking_levels, GPT6_1_SOL.default_thinking)
+            super::thinking_rule_colour(
+                &DARK,
+                GPT6_1_SOL.thinking_levels,
+                GPT6_1_SOL.default_thinking
+            )
         );
 
         for width in 0..=4 {
@@ -12410,7 +12541,7 @@ mod tests {
                     && full[(*column + 4, 3)].symbol() == "%"
             })
             .expect("context percentage");
-        assert_eq!(full[(column, 3)].fg, Color::Yellow);
+        assert_eq!(full[(column, 3)].fg, app.theme.warning);
         let full = rendered(&mut app, 80, 4);
         assert!(
             full.lines()

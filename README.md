@@ -150,6 +150,7 @@ User defaults live at `~/.kiki/config.toml`:
 model = "anthropic/claude-opus-5-5"
 favourites = ["anthropic/claude-opus-5-5", "openai/gpt-6-astra", "openai/gpt-6-sol"]
 cross_provider_reasoning = "inline"
+theme = "automatic"
 
 [anthropic]
 cache_ttl = "5m"
@@ -181,6 +182,8 @@ model = "anthropic/claude-opus-5-5"
 "openai/gpt-5.6-terra" = "high"
 "openai/gpt-5.6-luna" = "medium"
 ```
+
+`theme` is `"dark"`, `"light"` or `"automatic"` (default); project settings override user settings. Automatic mode chooses light or dark once at startup by asking the terminal for its background colour, falling back to `COLORFGBG`, then dark. Restart Kiki to apply a theme change.
 
 `cross_provider_reasoning` is `"inline"` (default) or `"drop"`: when switching providers between runs, Kiki reconstructs foreign history from its stored semantic entries, including reasoning summaries as assistant text with `inline`, or omitting those summaries with `drop`. Same-provider history keeps its provider replay. `[anthropic] cache_ttl` is `"5m"` (default) or `"1h"`; Ordinary Anthropic requests place two cache breakpoints, on the system block and the latest message; summaries have none. Both settings use user/project precedence, are read at startup, and have no environment or session override.
 

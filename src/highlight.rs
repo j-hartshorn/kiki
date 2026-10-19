@@ -1,6 +1,8 @@
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
+
+use crate::theme::Theme;
 
 const HIGHLIGHT_NAMES: [&str; 5] = ["comment", "keyword", "function", "string", "number"];
 
@@ -27,12 +29,12 @@ impl PythonHighlighter {
         }
     }
 
-    pub(crate) fn highlight<'a>(&mut self, source: &'a str) -> Text<'a> {
+    pub(crate) fn highlight<'a>(&mut self, source: &'a str, theme: &Theme) -> Text<'a> {
         let Some((highlighter, configuration)) = &mut self.state else {
             return plain_text(source);
         };
 
-        highlighted(highlighter, configuration, source).unwrap_or_else(|| plain_text(source))
+        highlighted(highlighter, configuration, source, theme).unwrap_or_else(|| plain_text(source))
     }
 
     fn fallback() -> Self {
@@ -49,6 +51,7 @@ fn highlighted<'a>(
     highlighter: &mut Highlighter,
     configuration: &HighlightConfiguration,
     source: &'a str,
+    theme: &Theme,
 ) -> Option<Text<'a>> {
     let events = highlighter
         .highlight(configuration, source.as_bytes(), None, |_| None)
@@ -78,7 +81,7 @@ fn highlighted<'a>(
                 source_end = end;
             }
             HighlightEvent::HighlightStart(highlight) => {
-                styles.push(style_for(highlight)?);
+                styles.push(style_for(highlight, theme)?);
             }
             HighlightEvent::HighlightEnd => {
                 styles.pop()?;
@@ -95,13 +98,13 @@ fn highlighted<'a>(
     ))
 }
 
-fn style_for(highlight: Highlight) -> Option<Style> {
+fn style_for(highlight: Highlight, theme: &Theme) -> Option<Style> {
     let colour = match highlight.0 {
-        0 => Color::DarkGray,
-        1 => Color::Magenta,
-        2 => Color::Cyan,
-        3 => Color::Green,
-        4 => Color::Yellow,
+        0 => theme.syntax_comment,
+        1 => theme.syntax_keyword,
+        2 => theme.syntax_function,
+        3 => theme.syntax_string,
+        4 => theme.syntax_number,
         _ => return None,
     };
     Some(Style::new().fg(colour))
@@ -135,10 +138,11 @@ fn plain_text(source: &str) -> Text<'_> {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::{Color, Style};
+    use ratatui::style::Style;
     use ratatui::text::Text;
 
     use super::PythonHighlighter;
+    use crate::theme::DARK;
 
     fn reconstruct(text: &Text<'_>) -> String {
         text.lines
@@ -166,28 +170,28 @@ mod tests {
     fn highlights_complete_python_with_expected_styles() {
         let source = "# note\ndef greeting():\n    text = \"hello\"\n    return 42\n";
         let mut highlighter = PythonHighlighter::new();
-        let text = highlighter.highlight(source);
+        let text = highlighter.highlight(source, &DARK);
 
         assert_eq!(reconstruct(&text), source);
         assert_eq!(
             style_for_content(&text, "# note"),
-            Style::new().fg(Color::DarkGray)
+            Style::new().fg(DARK.syntax_comment)
         );
         assert_eq!(
             style_for_content(&text, "def"),
-            Style::new().fg(Color::Magenta)
+            Style::new().fg(DARK.syntax_keyword)
         );
         assert_eq!(
             style_for_content(&text, "greeting"),
-            Style::new().fg(Color::Cyan)
+            Style::new().fg(DARK.syntax_function)
         );
         assert_eq!(
             style_for_content(&text, "\"hello\""),
-            Style::new().fg(Color::Green)
+            Style::new().fg(DARK.syntax_string)
         );
         assert_eq!(
             style_for_content(&text, "42"),
-            Style::new().fg(Color::Yellow)
+            Style::new().fg(DARK.syntax_number)
         );
     }
 
@@ -200,7 +204,7 @@ mod tests {
             if source.is_char_boundary(end) {
                 let prefix = &source[..end];
                 assert_eq!(
-                    reconstruct(&highlighter.highlight(prefix)),
+                    reconstruct(&highlighter.highlight(prefix, &DARK)),
                     prefix,
                     "{prefix:?}"
                 );
@@ -213,7 +217,7 @@ mod tests {
         let mut highlighter = PythonHighlighter::new();
 
         for source in ["", "\n", "before\n\nafter\n", "\n\n"] {
-            let text = highlighter.highlight(source);
+            let text = highlighter.highlight(source, &DARK);
             assert_eq!(reconstruct(&text), source);
             assert_eq!(text.lines.len(), source.split('\n').count());
         }
@@ -223,7 +227,7 @@ mod tests {
     fn forced_fallback_preserves_exact_text_with_default_styles() {
         let source = "# Café 日本 🦀\n\ndef incomplete(名):\n    value = \"hello";
         let mut highlighter = PythonHighlighter::fallback_for_test();
-        let text = highlighter.highlight(source);
+        let text = highlighter.highlight(source, &DARK);
 
         assert_eq!(reconstruct(&text), source);
         for line in &text.lines {
