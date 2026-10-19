@@ -5327,6 +5327,12 @@ mod tests {
 
     #[test]
     fn slash_completion_lists_catalogue_in_order_and_clamps_keyboard_selection() {
+        fn assert_slash_selection(cell: &ratatui::buffer::Cell) {
+            assert_eq!(cell.fg, DISTINCT_TEST_THEME.text);
+            assert_eq!(cell.bg, DISTINCT_TEST_THEME.selected_bg);
+            assert!(!cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+        }
+
         let mut app = app_with_prompt("/");
         app.theme = &DISTINCT_TEST_THEME;
         let initial = rendered_buffer(&mut app, 40, 10);
@@ -5344,61 +5350,16 @@ mod tests {
                 && name_row < thinking_row
                 && thinking_row < tree_row
         );
-        assert_eq!(
-            initial[(compact_column, compact_row)].fg,
-            DISTINCT_TEST_THEME.text
-        );
-        assert_eq!(
-            initial[(compact_column, compact_row)].bg,
-            DISTINCT_TEST_THEME.selected_bg
-        );
-        assert!(
-            !initial[(compact_column, compact_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&initial[(compact_column, compact_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let model = rendered_buffer(&mut app, 40, 10);
-        assert_eq!(
-            model[(model_column, model_row)].fg,
-            DISTINCT_TEST_THEME.text
-        );
-        assert_eq!(
-            model[(model_column, model_row)].bg,
-            DISTINCT_TEST_THEME.selected_bg
-        );
-        assert!(
-            !model[(model_column, model_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&model[(model_column, model_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let name = rendered_buffer(&mut app, 40, 10);
-        assert_eq!(name[(name_column, name_row)].fg, DISTINCT_TEST_THEME.text);
-        assert_eq!(
-            name[(name_column, name_row)].bg,
-            DISTINCT_TEST_THEME.selected_bg
-        );
-        assert!(
-            !name[(name_column, name_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&name[(name_column, name_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let thinking = rendered_buffer(&mut app, 40, 10);
-        assert_eq!(
-            thinking[(thinking_column, thinking_row)].fg,
-            DISTINCT_TEST_THEME.text
-        );
-        assert_eq!(
-            thinking[(thinking_column, thinking_row)].bg,
-            DISTINCT_TEST_THEME.selected_bg
-        );
-        assert!(
-            !thinking[(thinking_column, thinking_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&thinking[(thinking_column, thinking_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(
@@ -5406,16 +5367,7 @@ mod tests {
                 .visible_changed
         );
         let tree = rendered_buffer(&mut app, 40, 10);
-        assert_eq!(tree[(tree_column, tree_row)].fg, DISTINCT_TEST_THEME.text);
-        assert_eq!(
-            tree[(tree_column, tree_row)].bg,
-            DISTINCT_TEST_THEME.selected_bg
-        );
-        assert!(
-            !tree[(tree_column, tree_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        assert_slash_selection(&tree[(tree_column, tree_row)]);
         assert_eq!(app.prompt.text(), "/");
     }
 

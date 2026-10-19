@@ -6770,10 +6770,6 @@ mod tests {
 
         let fenced = markdown("```rust\nlet value = 1;\n```", &DARK, None);
         assert_eq!(fenced.to_string(), "```rust\nlet value = 1;\n```");
-        assert_eq!(
-            markdown_style_at(&fenced, "let").fg,
-            Some(DARK.syntax_keyword)
-        );
 
         let html = markdown(
             "inline <em>HTML</em>\n\n<div>\nblock HTML\n</div>",

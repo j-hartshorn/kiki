@@ -354,7 +354,7 @@ mod tests {
     use super::{Appearance, TerminalQuery, detect_appearance};
 
     enum ScriptedRead {
-        Bytes(VecDeque<u8>),
+        Byte(u8),
         Timeout,
         Error,
     }
@@ -371,7 +371,8 @@ mod tests {
             Self {
                 script: chunks
                     .iter()
-                    .map(|chunk| ScriptedRead::Bytes(chunk.iter().copied().collect()))
+                    .flat_map(|chunk| chunk.iter().copied())
+                    .map(ScriptedRead::Byte)
                     .collect(),
                 writes: Vec::new(),
                 deadlines: Vec::new(),
@@ -383,10 +384,9 @@ mod tests {
             self.script
                 .iter()
                 .filter_map(|step| match step {
-                    ScriptedRead::Bytes(bytes) => Some(bytes.iter().copied()),
+                    ScriptedRead::Byte(byte) => Some(*byte),
                     _ => None,
                 })
-                .flatten()
                 .collect()
         }
     }
@@ -403,19 +403,10 @@ mod tests {
 
         fn read_byte(&mut self, deadline: Instant) -> io::Result<Option<u8>> {
             self.deadlines.push(deadline);
-            loop {
-                match self.script.pop_front() {
-                    Some(ScriptedRead::Bytes(mut bytes)) => {
-                        if let Some(byte) = bytes.pop_front() {
-                            self.script.push_front(ScriptedRead::Bytes(bytes));
-                            return Ok(Some(byte));
-                        }
-                    }
-                    Some(ScriptedRead::Error) => {
-                        return Err(io::Error::other("scripted read error"));
-                    }
-                    Some(ScriptedRead::Timeout) | None => return Ok(None),
-                }
+            match self.script.pop_front() {
+                Some(ScriptedRead::Byte(byte)) => Ok(Some(byte)),
+                Some(ScriptedRead::Error) => Err(io::Error::other("scripted read error")),
+                Some(ScriptedRead::Timeout) | None => Ok(None),
             }
         }
     }
@@ -592,7 +583,7 @@ mod tests {
         terminal.script.push_back(ScriptedRead::Timeout);
         terminal
             .script
-            .push_back(ScriptedRead::Bytes(late_reply.iter().copied().collect()));
+            .extend(late_reply.iter().copied().map(ScriptedRead::Byte));
         assert_eq!(
             detect_appearance(&mut terminal, Some("0;15")),
             Appearance::Light
@@ -629,26 +620,6 @@ mod tests {
     }
 
     #[test]
-    fn osc11_malformed_colours_are_rejected_directly() {
-        for value in [
-            "rgb:/f/f",
-            "rgb:fffff/f/f",
-            "rgb:gg/f/f",
-            "rgb:-1/f/f",
-            "rgb:f/f",
-            "rgb:f/f/f/f",
-            "rgba:f/f/f/f",
-            "#ffffff",
-        ] {
-            assert_eq!(
-                super::parse_osc11(format!("11;{value}").as_bytes()),
-                None,
-                "{value}"
-            );
-        }
-    }
-
-    #[test]
     fn osc11_unparseable_background_falls_back() {
         for value in [
             "rgb:/f/f",
@@ -657,17 +628,20 @@ mod tests {
             "rgb:-1/f/f",
             "rgb:f/f",
             "rgb:f/f/f/f",
+            "rgba:f/f/f/f",
             "rgb:0x0/0/0",
             "#ffffff",
         ] {
-            let reply = format!("\x1b]11;{value}\x07\x1b[?1c");
-            let mut terminal = ScriptedTerminal::new(&[reply.as_bytes()]);
-            assert_eq!(
-                detect_appearance(&mut terminal, Some("0;15")),
-                Appearance::Light,
-                "{value}"
-            );
-            assert!(terminal.unread_bytes().is_empty());
+            for (fallback, expected) in [("15;0", Appearance::Dark), ("0;15", Appearance::Light)] {
+                let reply = format!("\x1b]11;{value}\x07\x1b[?1c");
+                let mut terminal = ScriptedTerminal::new(&[reply.as_bytes()]);
+                assert_eq!(
+                    detect_appearance(&mut terminal, Some(fallback)),
+                    expected,
+                    "{value}, COLORFGBG={fallback}"
+                );
+                assert!(terminal.unread_bytes().is_empty());
+            }
         }
     }
 
