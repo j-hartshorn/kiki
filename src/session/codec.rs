@@ -3040,7 +3040,7 @@ mod tests {
     fn task_usage() -> crate::model::AttemptAccounting {
         crate::model::AttemptAccounting::KnownUsage(crate::model::ModelUsage {
             model: crate::config::DEFAULT_MODEL.id.to_owned(),
-            service_tier: Some("default".to_owned()),
+            service_tier: Some(crate::config::DEFAULT_MODEL.service_tier.to_owned()),
             input_tokens: Some(1),
             cached_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),

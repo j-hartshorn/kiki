@@ -30,9 +30,10 @@ use crate::{
         canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
+    provider::redact,
 };
 
-const OPENAI_PROVIDER: &str = "openai";
+const OPENAI_PROVIDER: &str = Provider::OpenAi.id();
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 const CONTEXT_OVERFLOW_CODES: [&str; 2] =
@@ -1133,14 +1134,6 @@ fn is_context_overflow(status: Option<u16>, code: Option<&str>, message: &str) -
     }
 }
 
-fn redact(value: &str, api_key: &str) -> String {
-    if api_key.is_empty() {
-        value.to_owned()
-    } else {
-        value.replace(api_key, "[REDACTED]")
-    }
-}
-
 fn foreign_input(part: ForeignPart<'_>) -> Vec<Value> {
     match part {
         ForeignPart::Text(text) => vec![json!({"role": "assistant", "content": text})],
@@ -1930,11 +1923,7 @@ pub(crate) mod tests {
     }
 
     fn default_selection() -> ModelSelection {
-        ModelSelection::new(
-            crate::config::DEFAULT_MODEL,
-            crate::config::DEFAULT_MODEL.default_thinking,
-        )
-        .unwrap()
+        ModelSelection::new(&SOL, SOL.default_thinking).unwrap()
     }
 
     #[test]
@@ -2079,9 +2068,14 @@ pub(crate) mod tests {
             super::OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
         let cancellation = CancellationToken::new();
 
-        for id in ["anthropic/claude-opus-5-5", "anthropic/claude-fable-5-1"] {
+        for id in [
+            "anthropic/claude-opus-5-5",
+            "anthropic/claude-fable-5-1",
+            "google/gemini-4-argon",
+            "google/gemini-3.8-flash",
+        ] {
             let configuration =
-                crate::config::model_by_id(id).expect("Anthropic model is in the catalogue");
+                crate::config::model_by_id(id).expect("foreign model is in the catalogue");
             let selection =
                 ModelSelection::new(configuration, configuration.default_thinking).unwrap();
             let mut progress_events = 0;
@@ -6223,6 +6217,16 @@ pub(crate) mod tests {
             )
         }
 
+        fn google_replay(steps: &[Value]) -> ProviderReplay {
+            ProviderReplay::new(
+                "google",
+                steps
+                    .iter()
+                    .map(|step| OpaqueReplayItem::new(serde_json::to_vec(step).unwrap()))
+                    .collect(),
+            )
+        }
+
         fn cross_provider_history(code_reasoning: &str) -> ModelHistory {
             let mut history = history("first request");
             history.append_final_message(
@@ -6253,6 +6257,48 @@ pub(crate) mod tests {
                     json!({"type": "text", "text": "It printed 1."}),
                 ]),
             );
+            history.append_user_request("google turn");
+            history
+                .append_completed_code(
+                    "print(2)".to_owned(),
+                    ModelCallId::new("call_google_1"),
+                    Some("Running on Google.".to_owned()),
+                    code_reasoning.to_owned(),
+                    google_replay(&[
+                        json!({
+                            "type": "thought",
+                            "summary": [{"type": "text", "text": code_reasoning}],
+                            "signature": "google-thought-signature"
+                        }),
+                        json!({
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "Running on Google."}]
+                        }),
+                        json!({
+                            "type": "function_call",
+                            "id": "call_google_1",
+                            "name": "execute_python",
+                            "arguments": {"code": "print(2)"}
+                        }),
+                    ]),
+                    CodeResult::execution("2\n".to_owned()),
+                )
+                .unwrap();
+            history.append_final_message(
+                "It printed 2.".to_owned(),
+                "Google summary".to_owned(),
+                google_replay(&[
+                    json!({
+                        "type": "thought",
+                        "summary": [{"type": "text", "text": "Google summary"}],
+                        "signature": "google-final-signature"
+                    }),
+                    json!({
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "It printed 2."}]
+                    }),
+                ]),
+            );
             history.append_user_request("continue");
             history
         }
@@ -6264,17 +6310,21 @@ pub(crate) mod tests {
                 (
                     CrossProviderReasoning::Inline,
                     "Checking the file",
-                    [Some("Checking the file"), Some("Summarising")],
+                    [
+                        Some("Checking the file"),
+                        Some("Summarising"),
+                        Some("Google summary"),
+                    ],
                 ),
                 (
                     CrossProviderReasoning::Inline,
                     "",
-                    [None, Some("Summarising")],
+                    [None, Some("Summarising"), Some("Google summary")],
                 ),
                 (
                     CrossProviderReasoning::Drop,
                     "Checking the file",
-                    [None, None],
+                    [None, None, None],
                 ),
             ] {
                 let fixture = Fixture::start_sequence(vec![
@@ -6324,6 +6374,22 @@ pub(crate) mod tests {
                 input.extend(reasoning_texts[1].map(assistant_text));
                 input.extend([
                     assistant_text("It printed 1."),
+                    json!({"role": "user", "content": "google turn"}),
+                ]);
+                input.extend(reasoning_texts[0].map(assistant_text));
+                input.extend([
+                    assistant_text("Running on Google."),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_google_1",
+                        "name": "execute_python",
+                        "arguments": r#"{"code":"print(2)"}"#
+                    }),
+                    json!({"type": "function_call_output", "call_id": "call_google_1", "output": "2\n"}),
+                ]);
+                input.extend(reasoning_texts[2].map(assistant_text));
+                input.extend([
+                    assistant_text("It printed 2."),
                     json!({"role": "user", "content": "continue"}),
                 ]);
                 let requests = fixture.requests.lock().unwrap().clone();
@@ -6340,7 +6406,14 @@ pub(crate) mod tests {
                 );
                 for request in &requests {
                     let body = request.body.to_string();
-                    for opaque in ["anthropic-signature", "anthropic-redacted-data", "thinking"] {
+                    for opaque in [
+                        "anthropic-signature",
+                        "anthropic-redacted-data",
+                        "thinking",
+                        "google-thought-signature",
+                        "google-final-signature",
+                        "model_output",
+                    ] {
                         assert!(!body.contains(opaque), "{opaque} leaked into {body}");
                     }
                 }
@@ -6456,6 +6529,8 @@ pub(crate) mod tests {
         "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_ANTHROPIC: &str =
         "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
+    const LIVE_SETUP_GOOGLE: &str =
+        "live test requires GEMINI_API_KEY and an absolute MONTY_BIN for monty-runtime 1.0.0";
     const LIVE_SETUP_MODEL: &str =
         "live test effective model is not the required model; set KIKI_MODEL to select it";
     const LIVE_SETUP_READ_TOOL: &str =
@@ -6764,6 +6839,7 @@ pub(crate) mod tests {
         let setup_failure = match effective_model.provider() {
             Provider::OpenAi => LIVE_SETUP_OPENAI,
             Provider::Anthropic => LIVE_SETUP_ANTHROPIC,
+            Provider::Google => LIVE_SETUP_GOOGLE,
         };
         let persisted_settings = configuration.snapshot().settings().clone();
         let (worker_path, workspace_root, model, prompt_base, selection, policy) = {

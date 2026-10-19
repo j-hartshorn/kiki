@@ -339,6 +339,7 @@ mod tests {
             home: Some(home.path().as_os_str().to_os_string()),
             workspace_root: Some(project.path().to_path_buf()),
             session_preferences: None,
+            default_model: crate::config::DEFAULT_MODEL,
             model: None,
             thinking: None,
         });

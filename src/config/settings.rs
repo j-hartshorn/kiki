@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 use super::{
-    DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupProblemKind,
+    ModelConfiguration, ModelSelection, StartupProblemKind,
     constants::{
         DEFAULT_SUBAGENT_ALLOW_NESTED, DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_DEPTH,
         DEFAULT_SUBAGENT_MAX_STARTS_PER_RUN, DEFAULT_SUBAGENT_TIMEOUT, SUBAGENT_TIMER_HEADROOM,
@@ -53,6 +53,7 @@ pub(crate) struct Input {
     pub(crate) home: Option<OsString>,
     pub(crate) workspace_root: Option<PathBuf>,
     pub(crate) session_preferences: Option<SessionPreferences>,
+    pub(crate) default_model: &'static ModelConfiguration,
     pub(crate) model: Option<OsString>,
     pub(crate) thinking: Option<OsString>,
 }
@@ -496,7 +497,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
     let (project, project_problems) = load_layer(project_path.as_deref(), FileLayer::Project);
     problems.extend(project_problems);
 
-    let mut model = DEFAULT_MODEL;
+    let mut model = input.default_model;
     let mut model_origin = SettingsOrigin::BuiltIn;
     let mut thinking = BTreeMap::new();
     let mut favourites = None;
@@ -1983,6 +1984,7 @@ mod tests {
             home: Some(home.path().as_os_str().to_os_string()),
             workspace_root: Some(project.path().to_path_buf()),
             session_preferences: None,
+            default_model: &SOL,
             model: None,
             thinking: None,
         });
@@ -2049,6 +2051,7 @@ mod tests {
             home: home.map(|path| path.as_os_str().to_os_string()),
             workspace_root: workspace_root.map(Path::to_path_buf),
             session_preferences: None,
+            default_model: &SOL,
             model: None,
             thinking: None,
         }

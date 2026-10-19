@@ -34,3 +34,6 @@ live-test: worker
 
 live-test-anthropic: worker
     KIKI_MODEL=anthropic/claude-opus-5-5 cargo test anthropic::tests::live_opus -- --exact --ignored --test-threads=1
+
+live-test-google: worker
+    KIKI_MODEL=google/gemini-4-argon cargo test google::tests::live_argon -- --exact --ignored --test-threads=1
