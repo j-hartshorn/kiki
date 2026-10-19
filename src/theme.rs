@@ -29,6 +29,15 @@ pub(crate) struct Theme {
     pub(crate) syntax_function: Color,
     pub(crate) syntax_string: Color,
     pub(crate) syntax_number: Color,
+    pub(crate) md_heading: Color,
+    pub(crate) md_link: Color,
+    pub(crate) md_quote: Color,
+    pub(crate) md_code: Color,
+    pub(crate) border_muted: Color,
+    pub(crate) syntax_variable: Color,
+    pub(crate) syntax_type: Color,
+    pub(crate) syntax_operator: Color,
+    pub(crate) syntax_punctuation: Color,
 }
 
 pub(crate) static DARK: Theme = Theme {
@@ -60,6 +69,15 @@ pub(crate) static DARK: Theme = Theme {
     syntax_function: Color::Rgb(0xcd, 0x9a, 0x22),
     syntax_string: Color::Rgb(0xde, 0x8d, 0x5a),
     syntax_number: Color::Rgb(0x68, 0xb7, 0x8d),
+    md_heading: Color::Rgb(0xcd, 0x9a, 0x22),
+    md_link: Color::Rgb(0x69, 0xad, 0xd0),
+    md_quote: Color::Rgb(0x9d, 0xa5, 0xa9),
+    md_code: Color::Rgb(0xa7, 0x98, 0xd7),
+    border_muted: Color::Rgb(0x76, 0x81, 0x86),
+    syntax_variable: Color::Rgb(0x5d, 0xb3, 0xba),
+    syntax_type: Color::Rgb(0xa7, 0x98, 0xd7),
+    syntax_operator: Color::Rgb(0x9d, 0xa5, 0xa9),
+    syntax_punctuation: Color::Rgb(0x9d, 0xa5, 0xa9),
 };
 
 // Keep these distinct from DARK and from each other to catch token mix-ups.
@@ -112,6 +130,15 @@ mod tests {
             (DARK.syntax_function, "#cd9a22"),
             (DARK.syntax_string, "#de8d5a"),
             (DARK.syntax_number, "#68b78d"),
+            (DARK.md_heading, "#cd9a22"),
+            (DARK.md_link, "#69add0"),
+            (DARK.md_quote, "#9da5a9"),
+            (DARK.md_code, "#a798d7"),
+            (DARK.border_muted, "#768186"),
+            (DARK.syntax_variable, "#5db3ba"),
+            (DARK.syntax_type, "#a798d7"),
+            (DARK.syntax_operator, "#9da5a9"),
+            (DARK.syntax_punctuation, "#9da5a9"),
         ] {
             assert_eq!(actual, hex(expected), "{expected}");
         }

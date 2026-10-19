@@ -21,7 +21,7 @@ Pi 1.2.0 (vendored at `.research/pi/source`, identical to the installed release)
 - Following terminal light/dark switches while Kiki runs (mode 2031 notifications); appearance is detected once at startup.
 - Custom or user-defined themes, Pi's `system` theme generated from terminal colours, and Pi's `"<light>/<dark>"` theme pairs.
 - Any `/settings` item other than Theme; theme environment variables or command-line flags.
-- Distinguishing inline code from unrecognised fenced code (`tui-markdown` styles both with one `code()` style without a highlighter); styling code fences or list bullets separately.
+- Colouring unrecognised, language-less or indented code blocks: with `highlight-code` enabled, `tui-markdown` 0.3.9 applies no style to blocks it cannot highlight (`tui-markdown-0.3.9/src/renderer/code.rs:57-61,117-129`), so they render in the card's `text` colour (agreed after implementation found this; a fork or post-processing was rejected as not worth carrying). Styling code fences or list bullets separately.
 - Colouring elements that currently use the terminal's default colours (the prompt editor text, unstyled picker rows).
 - Painting the page background: Kiki keeps the terminal's own background, as today.
 
@@ -70,7 +70,8 @@ Pi 1.2.0 (vendored at `.research/pi/source`, identical to the installed release)
 | Markdown math (inline italic, display) | `mdCode` |
 | Markdown metadata block | `muted` |
 | Markdown heading meta, raw HTML, footnotes, image alt text | `dim` (keeping the crate's italic where it has one) |
-| Inline code and unrecognised fences | `mdCode`, no background |
+| Inline code | `mdCode`, no background |
+| Unrecognised, language-less or indented code blocks | card `text` (crate applies no style; agreed) |
 | Recognised fenced code | `syntaxComment`, `syntaxKeyword`, `syntaxFunction`, `syntaxVariable`, `syntaxString`, `syntaxNumber`, `syntaxType`, `syntaxOperator`, `syntaxPunctuation` via generated TextMate theme |
 | Arena Python highlighter (comment, keyword, function, string, number) | matching `syntax*` tokens |
 | Tree accent, success, error, warning, border, selected row | `accent`, `success`, `error`, `warning`, `border`, `selectedBg` |

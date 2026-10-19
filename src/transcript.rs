@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -9,7 +9,9 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
-use tui_markdown::{ImageFallback, Options, StyleSheet, from_str_with_options};
+use tui_markdown::{
+    AlertKind, CodeTheme, ImageFallback, Options, StyleSheet, from_str_with_options,
+};
 
 use crate::agent::{
     ExecutionEvidence, ExecutionFailure, GenerationEvidence, OverflowRecovery, TerminalEvidence,
@@ -35,31 +37,152 @@ use crate::selection::{
 use crate::session::{CompactionOutcome, CompactionReason};
 use crate::skills::SkillOrigin;
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
-use crate::theme::Theme;
+use crate::theme::{DARK, Theme};
 
 #[derive(Clone, Copy)]
-struct MarkdownStyleSheet;
+struct MarkdownStyleSheet {
+    theme: &'static Theme,
+}
 
 impl StyleSheet for MarkdownStyleSheet {
     fn heading(&self, _level: u8) -> Style {
-        Style::new().bold()
+        Style::new().fg(self.theme.md_heading).bold()
     }
 
     fn link(&self) -> Style {
-        Style::new().fg(Color::Cyan).underlined()
+        Style::new().fg(self.theme.md_link).underlined()
     }
+
+    fn blockquote(&self) -> Style {
+        Style::new().fg(self.theme.md_quote)
+    }
+
+    fn code(&self) -> Style {
+        Style::new().fg(self.theme.md_code)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::new().fg(self.theme.dim)
+    }
+
+    fn html(&self) -> Style {
+        Style::new().fg(self.theme.dim)
+    }
+
+    fn footnote_ref(&self) -> Style {
+        Style::new().fg(self.theme.dim).italic()
+    }
+
+    fn footnote_def(&self) -> Style {
+        Style::new().fg(self.theme.dim)
+    }
+
+    fn image_alt(&self) -> Style {
+        Style::new().fg(self.theme.dim).italic()
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::new().fg(self.theme.muted)
+    }
+
+    fn math_inline(&self) -> Style {
+        Style::new().fg(self.theme.md_code).italic()
+    }
+
+    fn math_display(&self) -> Style {
+        Style::new().fg(self.theme.md_code)
+    }
+
+    fn alert(&self, kind: AlertKind) -> Style {
+        let color = match kind {
+            AlertKind::Note => self.theme.md_link,
+            AlertKind::Tip => self.theme.success,
+            AlertKind::Important => self.theme.accent,
+            AlertKind::Warning => self.theme.warning,
+            AlertKind::Caution => self.theme.error,
+        };
+        Style::new().fg(color)
+    }
+
+    fn table_header(&self) -> Style {
+        Style::new().fg(self.theme.text).bold()
+    }
+
+    fn table_border(&self) -> Style {
+        Style::new().fg(self.theme.border_muted)
+    }
+}
+
+fn textmate_theme(theme: &Theme) -> String {
+    let mut source = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>settings</key><array>",
+    );
+    for (scope, color) in [
+        ("", theme.md_code),
+        ("comment", theme.syntax_comment),
+        (
+            "keyword, storage, storage.type.function, storage.type.class, source.rust storage.type",
+            theme.syntax_keyword,
+        ),
+        (
+            "entity.name.function, support.function",
+            theme.syntax_function,
+        ),
+        ("variable", theme.syntax_variable),
+        ("string", theme.syntax_string),
+        ("constant.numeric, constant.language", theme.syntax_number),
+        (
+            "entity.name.type, support.type, storage.type",
+            theme.syntax_type,
+        ),
+        ("keyword.operator", theme.syntax_operator),
+        ("punctuation", theme.syntax_punctuation),
+    ] {
+        source.push_str("<dict>");
+        if !scope.is_empty() {
+            source.push_str(&format!("<key>scope</key><string>{scope}</string>"));
+        }
+        let Color::Rgb(red, green, blue) = color else {
+            panic!("TextMate theme tokens must be RGB colours");
+        };
+        source.push_str(&format!(
+            "<key>settings</key><dict><key>foreground</key><string>#{red:02x}{green:02x}{blue:02x}</string></dict></dict>"
+        ));
+    }
+    source.push_str("</array></dict></plist>");
+    source
+}
+
+type MarkdownOptions = Options<MarkdownStyleSheet>;
+
+fn build_markdown_options(theme: &'static Theme) -> MarkdownOptions {
+    let code_theme = CodeTheme::from_textmate(&textmate_theme(theme))
+        .expect("generated TextMate theme must be valid");
+    Options::new(MarkdownStyleSheet { theme })
+        .image_fallback(ImageFallback::AltText)
+        .code_theme(code_theme)
+}
+
+fn markdown_options(theme: &'static Theme) -> &'static MarkdownOptions {
+    static DARK_OPTIONS: LazyLock<MarkdownOptions> =
+        LazyLock::new(|| build_markdown_options(&DARK));
+    assert!(
+        std::ptr::eq(theme, &DARK),
+        "markdown options exist only for the built-in themes"
+    );
+    &DARK_OPTIONS
 }
 
 fn markdown<'a>(
     source: &'a str,
+    theme: &'static Theme,
     #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
 ) -> Text<'a> {
     #[cfg(test)]
     if let Some(construction_counts) = construction_counts {
         construction_counts.markdown += 1;
     }
-    let options = Options::new(MarkdownStyleSheet).image_fallback(ImageFallback::AltText);
-    from_str_with_options(source, &options)
+    from_str_with_options(source, markdown_options(theme))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -720,7 +843,7 @@ fn accounting_line(text: String, style: Style) -> Line<'static> {
 }
 
 fn assistant_text(
-    theme: &Theme,
+    theme: &'static Theme,
     markdown_source: &str,
     accounting: Option<String>,
     #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
@@ -728,6 +851,7 @@ fn assistant_text(
     let mut text = own_styled_text(
         markdown(
             markdown_source,
+            theme,
             #[cfg(test)]
             construction_counts,
         ),
@@ -1473,7 +1597,7 @@ fn draw_rounded_frame(
 impl NormalisedBlock {
     fn paragraph(&self) -> Paragraph<'_> {
         let text = match self {
-            Self::Reasoning { markdown: source } => markdown(source, None),
+            Self::Reasoning { markdown: source } => markdown(source, &crate::theme::DARK, None),
             Self::Assistant {
                 markdown: source,
                 accounting,
@@ -2965,13 +3089,13 @@ impl Transcript {
         visible
     }
 
-    pub(crate) fn layout(&mut self, theme: &Theme, width: u16) -> TranscriptLayout {
+    pub(crate) fn layout(&mut self, theme: &'static Theme, width: u16) -> TranscriptLayout {
         self.layout_with_cache(theme, width, true, None)
     }
 
     pub(crate) fn layout_with_footer(
         &mut self,
-        theme: &Theme,
+        theme: &'static Theme,
         width: u16,
         context: FooterContext,
     ) -> TranscriptLayout {
@@ -2979,13 +3103,13 @@ impl Transcript {
     }
 
     #[cfg(test)]
-    pub(crate) fn layout_fresh(&mut self, theme: &Theme, width: u16) -> TranscriptLayout {
+    pub(crate) fn layout_fresh(&mut self, theme: &'static Theme, width: u16) -> TranscriptLayout {
         self.layout_with_cache(theme, width, false, None)
     }
 
     fn layout_with_cache(
         &mut self,
-        theme: &Theme,
+        theme: &'static Theme,
         width: u16,
         use_cache: bool,
         footer_context: Option<FooterContext>,
@@ -3584,7 +3708,7 @@ fn model_change_block(theme: &Theme, text: &str, width: u16) -> RenderBlock {
 }
 
 fn build_render_block(
-    theme: &Theme,
+    theme: &'static Theme,
     source: &NormalisedBlock,
     show_reasoning: bool,
     expand_arenas: bool,
@@ -3645,6 +3769,7 @@ fn build_render_block(
                 match &card.expanded {
                     CompactionContent::Markdown(source) => markdown(
                         source,
+                        theme,
                         #[cfg(test)]
                         construction_counts,
                     ),
@@ -3687,6 +3812,7 @@ fn build_render_block(
                 own_styled_text(
                     markdown(
                         source,
+                        theme,
                         #[cfg(test)]
                         construction_counts,
                     ),
@@ -6601,25 +6727,33 @@ mod tests {
 
     #[test]
     fn markdown_compatibility() {
-        let heading = markdown("# Heading", None);
+        let heading = markdown("# Heading", &DARK, None);
         assert_eq!(heading.to_string(), "# Heading");
-        assert_eq!(heading.lines[0].style, Style::new().bold());
+        assert_eq!(
+            heading.lines[0].style,
+            Style::new().fg(DARK.md_heading).bold()
+        );
 
-        let table = markdown("| Name | State |\n| --- | --- |\n| Kiki | ready |", None).to_string();
+        let table = markdown(
+            "| Name | State |\n| --- | --- |\n| Kiki | ready |",
+            &DARK,
+            None,
+        )
+        .to_string();
         assert!(table.contains("┌"));
         assert!(table.contains("Name"));
         assert!(table.contains("ready"));
 
-        let tasks = markdown("- [ ] pending\n- [x] complete", None).to_string();
+        let tasks = markdown("- [ ] pending\n- [x] complete", &DARK, None).to_string();
         assert!(tasks.contains("- [ ] pending"));
         assert!(tasks.contains("- [x] complete"));
 
         assert_eq!(
-            markdown("[guide](https://example.com)", None).to_string(),
+            markdown("[guide](https://example.com)", &DARK, None).to_string(),
             "guide (https://example.com)"
         );
-        assert_eq!(markdown("> quoted", None).to_string(), "> quoted");
-        let strikethrough = markdown("~~obsolete~~", None);
+        assert_eq!(markdown("> quoted", &DARK, None).to_string(), "> quoted");
+        let strikethrough = markdown("~~obsolete~~", &DARK, None);
         assert_eq!(strikethrough.to_string(), "obsolete");
         assert!(
             strikethrough.lines[0].spans[0]
@@ -6628,51 +6762,67 @@ mod tests {
                 .contains(Modifier::CROSSED_OUT)
         );
 
-        let fenced = markdown("```rust\nlet value = 1;\n```", None);
+        let fenced = markdown("```rust\nlet value = 1;\n```", &DARK, None);
         assert_eq!(fenced.to_string(), "```rust\nlet value = 1;\n```");
-        assert_eq!(fenced.lines[1].style, Style::new().white().on_black());
+        assert_eq!(
+            markdown_style_at(&fenced, "let").fg,
+            Some(DARK.syntax_keyword)
+        );
 
-        let html = markdown("inline <em>HTML</em>\n\n<div>\nblock HTML\n</div>", None).to_string();
+        let html = markdown(
+            "inline <em>HTML</em>\n\n<div>\nblock HTML\n</div>",
+            &DARK,
+            None,
+        )
+        .to_string();
         for literal in ["<em>", "</em>", "<div>", "block HTML", "</div>"] {
             assert!(html.contains(literal));
         }
 
-        let images = markdown("![diagram](diagram.png)\n\n![](empty.png)", None).to_string();
+        let images = markdown("![diagram](diagram.png)\n\n![](empty.png)", &DARK, None).to_string();
         assert!(images.contains("[img] diagram"));
         assert!(images.contains("[img] empty.png"));
 
-        let styled_link = markdown("[guide](https://example.com)", None);
+        let styled_link = markdown("[guide](https://example.com)", &DARK, None);
         let link = styled_link.lines[0]
             .spans
             .iter()
             .find(|span| span.content == "guide")
             .expect("link label span");
-        assert_eq!(link.style, Style::new().fg(Color::Cyan).underlined());
+        assert_eq!(link.style, Style::new().fg(DARK.md_link).underlined());
         assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
 
         assert_eq!(
-            markdown("unfinished **emphasis", None).to_string(),
+            markdown("unfinished **emphasis", &DARK, None).to_string(),
             "unfinished **emphasis"
         );
         assert!(
-            markdown("```rust\nlet value = 1;", None)
+            markdown("```rust\nlet value = 1;", &DARK, None)
                 .to_string()
                 .contains("let value = 1;")
         );
-        assert!(!markdown("| header |\n| --- |", None).lines.is_empty());
+        assert!(
+            !markdown("| header |\n| --- |", &DARK, None)
+                .lines
+                .is_empty()
+        );
 
         let source = "# Café 日本 🦀\n\n- [x] **résumé**\n\n[link](https://example.com/🦀)\n\n```text\nolé 世界\n```";
-        let complete = markdown(source, None).to_string();
+        let complete = markdown(source, &DARK, None).to_string();
         let mut final_prefix = None;
         for end in 0..=source.len() {
             if source.is_char_boundary(end) {
-                final_prefix = Some(markdown(&source[..end], None).to_string());
+                final_prefix = Some(markdown(&source[..end], &DARK, None).to_string());
             }
         }
         assert_eq!(final_prefix, Some(complete));
 
-        let paragraph = Paragraph::new(markdown("café 日本 🦀 wraps across terminal rows", None))
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(markdown(
+            "café 日本 🦀 wraps across terminal rows",
+            &DARK,
+            None,
+        ))
+        .wrap(Wrap { trim: false });
         let width = 8;
         let measured_rows = paragraph.line_count(width);
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, measured_rows as u16 + 1));
@@ -6685,6 +6835,262 @@ mod tests {
         assert_eq!(rendered_rows, measured_rows);
     }
 
+    fn markdown_style_at(text: &ratatui::text::Text<'_>, needle: &str) -> Style {
+        for line in &text.lines {
+            let content = line.to_string();
+            if let Some(offset) = content.find(needle) {
+                let mut start = 0;
+                for span in &line.spans {
+                    let end = start + span.content.len();
+                    if start <= offset && offset < end {
+                        return text.style.patch(line.style).patch(span.style);
+                    }
+                    start = end;
+                }
+            }
+        }
+        panic!("missing {needle:?} in {text:?}");
+    }
+
+    #[test]
+    fn markdown_element_styles_use_pi_tokens() {
+        for level in 1..=6 {
+            let source = format!("{} Heading", "#".repeat(level));
+            let text = markdown(&source, &DARK, None);
+            let style = markdown_style_at(&text, "Heading");
+            assert_eq!(style.fg, Some(DARK.md_heading));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
+        for (source, needle, color) in [
+            ("> quoted", "quoted", DARK.md_quote),
+            ("> [!NOTE]\n> note body", "note body", DARK.md_link),
+            ("> [!CAUTION]\n> caution body", "caution body", DARK.error),
+        ] {
+            assert_eq!(
+                markdown_style_at(&markdown(source, &DARK, None), needle).fg,
+                Some(color)
+            );
+        }
+        let table = markdown(
+            "| Name | State |\n| --- | --- |\n| Kiki | ready |",
+            &DARK,
+            None,
+        );
+        let header = markdown_style_at(&table, "Name");
+        assert_eq!(header.fg, Some(DARK.text));
+        assert!(header.add_modifier.contains(Modifier::BOLD));
+        for line in &table.lines {
+            for span in &line.spans {
+                if span.content.chars().any(|ch| "┌┐└┘├┤┬┴┼─│".contains(ch)) {
+                    assert_eq!(line.style.patch(span.style).fg, Some(DARK.border_muted));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_inline_code_has_no_background() {
+        let text = markdown("an `inline` value", &DARK, None);
+        let style = markdown_style_at(&text, "inline");
+        assert_eq!(style.fg, Some(DARK.md_code));
+        assert_eq!(style.bg, None);
+    }
+
+    #[test]
+    fn markdown_rust_fence_uses_syntax_tokens_without_background() {
+        let text = markdown("```rust\nlet value = 1;\n```", &DARK, None);
+        assert_eq!(
+            markdown_style_at(&text, "let").fg,
+            Some(DARK.syntax_keyword)
+        );
+        assert_eq!(markdown_style_at(&text, "1").fg, Some(DARK.syntax_number));
+        for line in &text.lines {
+            assert_eq!(line.style.bg, None);
+            for span in &line.spans {
+                assert_eq!(span.style.bg, None);
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_fence_scope_resolution_uses_syntax_tokens() {
+        // DARK shares comment/operator/punctuation and type/fallback colours.
+        // Distinct colours ensure these assertions exercise scope resolution.
+        static SCOPE_THEME: crate::theme::Theme = crate::theme::Theme {
+            md_code: Color::Rgb(1, 2, 3),
+            syntax_comment: Color::Rgb(4, 5, 6),
+            syntax_keyword: Color::Rgb(7, 8, 9),
+            syntax_function: Color::Rgb(10, 11, 12),
+            syntax_variable: Color::Rgb(13, 14, 15),
+            syntax_string: Color::Rgb(16, 17, 18),
+            syntax_number: Color::Rgb(19, 20, 21),
+            syntax_type: Color::Rgb(22, 23, 24),
+            syntax_operator: Color::Rgb(25, 26, 27),
+            syntax_punctuation: Color::Rgb(28, 29, 30),
+            ..DARK
+        };
+        let source = concat!(
+            "```rust\n",
+            "fn add(left: i32, right: String) -> Option<u8> { let x = left + 1; // note\n",
+            " \"text\" }\n",
+            "```\n\n",
+            "```rust\nstruct Point;\n```\n\n",
+            "```python\ndef f(x: int):\n    return \"s\"  # c\n```",
+        );
+        for theme in [&DARK, &SCOPE_THEME] {
+            let options = super::build_markdown_options(theme);
+            let text = tui_markdown::from_str_with_options(source, &options);
+            for (token, color) in [
+                ("note", theme.syntax_comment),
+                (" c", theme.syntax_comment),
+                ("fn", theme.syntax_keyword),
+                ("let", theme.syntax_keyword),
+                ("struct", theme.syntax_keyword),
+                ("return", theme.syntax_keyword),
+                ("add", theme.syntax_function),
+                ("f(", theme.syntax_function),
+                ("left:", theme.syntax_variable),
+                ("right:", theme.syntax_variable),
+                ("x:", theme.syntax_variable),
+                ("text", theme.syntax_string),
+                ("s\"", theme.syntax_string),
+                ("1", theme.syntax_number),
+                ("int)", theme.syntax_type),
+                ("def", theme.syntax_keyword),
+                ("=", theme.syntax_operator),
+                ("+", theme.syntax_operator),
+                ("(", theme.syntax_punctuation),
+                (":", theme.syntax_punctuation),
+                ("->", theme.syntax_punctuation),
+                ("<", theme.syntax_punctuation),
+                (">", theme.syntax_punctuation),
+                ("{", theme.syntax_punctuation),
+                ("}", theme.syntax_punctuation),
+                (";", theme.syntax_punctuation),
+                ("//", theme.syntax_punctuation),
+                ("#", theme.syntax_punctuation),
+                ("\"", theme.syntax_punctuation),
+                // Syntect gives primitives and `let` the same storage.type.rust scope.
+                ("i32", theme.syntax_keyword),
+                ("u8", theme.syntax_keyword),
+                // These names (and the parameter comma) have no mapped type scope.
+                ("String", theme.md_code),
+                ("Option", theme.md_code),
+                ("Point", theme.md_code),
+                (",", theme.md_code),
+                ("x =", theme.md_code),
+                ("left +", theme.md_code),
+            ] {
+                assert_eq!(
+                    markdown_style_at(&text, token).fg,
+                    Some(color),
+                    "wrong foreground for {token:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_unrecognised_code_inherits_card_colors() {
+        for source in [
+            "```nosuchlang\nunknown code\n```",
+            "```\nunknown code\n```",
+            "    unknown code",
+        ] {
+            let text = markdown(source, &DARK, None);
+            let style = markdown_style_at(&text, "unknown code");
+            assert_eq!(style.fg, None);
+            assert_eq!(style.bg, None);
+
+            let card = super::CompactionCard {
+                heading: "Compaction".to_owned(),
+                collapsed: String::new(),
+                expanded: super::CompactionContent::Markdown(source.to_owned()),
+                accounting: None,
+                state: super::ArenaState::Complete,
+            };
+            let block = super::build_render_block(
+                &DARK,
+                &NormalisedBlock::Compaction(card),
+                true,
+                true,
+                40,
+                &mut PythonHighlighter::new(),
+                None,
+            );
+            let RenderBlock::Card(card) = block else {
+                panic!("compaction card");
+            };
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
+            card.render(buffer.area, 0, 0, &mut buffer);
+            let row = row_containing(&buffer, "unknown code") as u16;
+            for column in 0..buffer.area.width {
+                let cell = &buffer[(column, row)];
+                assert_eq!(cell.fg, DARK.text);
+                assert_eq!(cell.bg, DARK.tool_success_bg);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn markdown_highlight_cost() {
+        let mut source = String::from("```rust\n");
+        for number in 0..400 {
+            source.push_str(&format!("let value_{number} = {number};\n"));
+        }
+        source.push_str("```");
+        std::hint::black_box(markdown(&source, &DARK, None));
+        let runs = 5;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(markdown(&source, &DARK, None));
+        }
+        eprintln!(
+            "markdown_highlight_cost: {:.3} ms/render",
+            start.elapsed().as_secs_f64() * 1000.0 / f64::from(runs)
+        );
+    }
+
+    #[test]
+    fn markdown_generated_theme_parses_and_options_are_reused() {
+        assert!(tui_markdown::CodeTheme::from_textmate(&super::textmate_theme(&DARK)).is_ok());
+        assert!(std::ptr::eq(
+            super::markdown_options(&DARK),
+            super::markdown_options(&DARK)
+        ));
+        let text = markdown("| Name |\n| --- |", &DARK, None);
+        assert_eq!(markdown_style_at(&text, "Name").fg, Some(DARK.text));
+    }
+
+    #[test]
+    fn markdown_secondary_styles_keep_modifiers_without_ansi_colors() {
+        use tui_markdown::{AlertKind, StyleSheet};
+
+        let styles = super::MarkdownStyleSheet { theme: &DARK };
+        for (actual, expected) in [
+            (styles.heading_meta(), Style::new().fg(DARK.dim)),
+            (styles.html(), Style::new().fg(DARK.dim)),
+            (styles.footnote_ref(), Style::new().fg(DARK.dim).italic()),
+            (styles.footnote_def(), Style::new().fg(DARK.dim)),
+            (styles.image_alt(), Style::new().fg(DARK.dim).italic()),
+            (styles.metadata_block(), Style::new().fg(DARK.muted)),
+            (styles.math_inline(), Style::new().fg(DARK.md_code).italic()),
+            (styles.math_display(), Style::new().fg(DARK.md_code)),
+            (styles.alert(AlertKind::Tip), Style::new().fg(DARK.success)),
+            (
+                styles.alert(AlertKind::Important),
+                Style::new().fg(DARK.accent),
+            ),
+            (
+                styles.alert(AlertKind::Warning),
+                Style::new().fg(DARK.warning),
+            ),
+        ] {
+            assert_eq!(actual, expected);
+        }
+    }
+
     fn rendered_text(transcript: &Transcript) -> String {
         transcript
             .blocks()
@@ -6692,7 +7098,7 @@ mod tests {
             .map(TranscriptBlock::normalise)
             .map(|block| match &block {
                 NormalisedBlock::Reasoning { markdown: source } => {
-                    markdown(source, None).to_string()
+                    markdown(source, &DARK, None).to_string()
                 }
                 NormalisedBlock::Assistant {
                     markdown: source,

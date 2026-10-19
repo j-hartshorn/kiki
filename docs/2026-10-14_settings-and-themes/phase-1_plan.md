@@ -10,7 +10,7 @@
 - With `theme = "dark"`, every element in the spec's element → token table (except the phase-2 pickers) renders with Pi 1.2.0 `dark.json` colours; with `theme = "light"`, with `light.json` colours.
 - With `theme` unset or `"automatic"`, Kiki starts light on a light terminal and dark on a dark one (OSC 11, then `COLORFGBG`, then dark). Detection runs once per process, before the first TUI screen, and only for commands that open the TUI.
 - Detection never blocks longer than 500 ms and never fails startup. Kiki doesn't query the terminal when stdin or stdout is not a terminal.
-- Recognised fenced code is syntax-highlighted with the theme's `syntax*` tokens. Inline code and unrecognised fences use `mdCode` with no background. No markdown element keeps a `tui-markdown` ANSI default colour.
+- Recognised fenced code is syntax-highlighted with the theme's `syntax*` tokens. Inline code uses `mdCode` with no background; unrecognised, language-less and indented code blocks use the card's `text` colour. No markdown element keeps a `tui-markdown` ANSI default colour.
 - An unsupported `theme` value (`theme = "blue"`, `theme = 1`) is a settings problem shown on the existing configuration screen, with remediation naming `dark`, `light` and `automatic`. A project value overrides the user value.
 - Text selection keeps reverse video; the page background stays the terminal's own.
 
@@ -57,7 +57,7 @@ The selection reverse-video tests stay unchanged.
 **Verification** — `just test`, `just lint` and `cargo fmt --all -- --check` all pass.
 
 ### Task 3: Markdown on `md*` tokens with syntect-highlighted fences
-**Changes** — Add the remaining `Theme` fields (`md*`, `borderMuted`, the other `syntax*` tokens). Enable `tui-markdown`'s `highlight-code` feature. `MarkdownStyleSheet` holds `&'static Theme` and maps every style in the spec's markdown rows (headings, links, quotes, table header and border, alerts, math, metadata, dim elements). Inline code and unrecognised fences use `mdCode` with no background. A TextMate theme is generated from the `syntax*` tokens. Suggested scope groups:
+**Changes** — Add the remaining `Theme` fields (`md*`, `borderMuted`, the other `syntax*` tokens). Enable `tui-markdown`'s `highlight-code` feature. `MarkdownStyleSheet` holds `&'static Theme` and maps every style in the spec's markdown rows (headings, links, quotes, table header and border, alerts, math, metadata, dim elements). Inline code uses `mdCode` with no background (unrecognised code blocks get no style from the crate and show in card `text`). A TextMate theme is generated from the `syntax*` tokens. Suggested scope groups:
 - comment;
 - keyword and storage;
 - entity.name.function and support.function;
@@ -74,7 +74,7 @@ Options are built once per theme and borrowed per render (spec Seams §1, §4). 
 - each table row has its style (heading `mdHeading` bold, link `mdLink` underlined, blockquote `mdQuote`, table border `borderMuted`, NOTE alert `mdLink`, CAUTION alert `error`);
 - inline code `mdCode` with `bg` unset;
 - `rust` fence: `let` is `syntaxKeyword` and `1` is `syntaxNumber`;
-- unknown-language fence: `mdCode` with no background;
+- unknown-language fence: renders its body text with no foreground or background set by markdown (card `text` shows through);
 - the generated TextMate theme parses.
 
 Also an `#[ignore]` timing test, `markdown_highlight_cost`, rendering a 400-line Rust fence and printing ms per render.
