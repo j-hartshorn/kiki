@@ -754,7 +754,7 @@ impl AcceptedThinking {
         Self(Arc::new(RwLock::new(AcceptedThinkingState {
             persisted,
             values,
-            providers: vec![Provider::OpenAi, Provider::Anthropic],
+            providers: vec![Provider::OpenAi, Provider::Anthropic, Provider::Google],
         })))
     }
 
@@ -4048,6 +4048,17 @@ mod tests {
             assert_eq!(error.kind, ToolErrorKind::Value);
             assert!(error.to_string().contains("ANTHROPIC_API_KEY"), "{error}");
         }
+        let google_error = explicit
+            .resolve_selection(Some(crate::config::models::GEMINI_4_ARGON.id))
+            .unwrap_err();
+        assert_eq!(google_error.kind, ToolErrorKind::Value);
+        assert!(
+            google_error.to_string().contains("GEMINI_API_KEY"),
+            "{google_error}"
+        );
+        let default_providers =
+            super::AcceptedThinking::new(invoking, without_favourites.settings().clone(), None);
+        assert!(default_providers.has_provider(Provider::Google));
         assert_eq!(
             explicit
                 .resolve_selection(Some(crate::config::models::SOL.id))
@@ -4527,7 +4538,7 @@ mod tests {
     fn known_usage() -> crate::model::AttemptAccounting {
         crate::model::AttemptAccounting::KnownUsage(crate::model::ModelUsage {
             model: DEFAULT_MODEL.id.to_owned(),
-            service_tier: Some("default".to_owned()),
+            service_tier: Some(DEFAULT_MODEL.service_tier.to_owned()),
             input_tokens: Some(1),
             cached_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),

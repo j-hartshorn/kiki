@@ -13740,7 +13740,7 @@ mod tests {
                     text: "recovered".to_owned(),
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new(
-                        "openai",
+                        DEFAULT_MODEL.provider().id(),
                         vec![crate::model::OpaqueReplayItem::new(b"done".to_vec())],
                     ),
                     attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
