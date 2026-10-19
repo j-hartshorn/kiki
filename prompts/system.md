@@ -12,8 +12,8 @@ Host access is limited to the functions in Kiki's tool reference.
 - These modules have partial APIs: `asyncio` has only `run`/`gather`/`sleep`, `functools` only `reduce`/`partial` (no `lru_cache`/`wraps`), `collections` only `deque`/`Counter`/`defaultdict`/`namedtuple`, and `json` has `loads`/`dumps`/`JSONDecodeError` (not `load`/`dump`).
 - No ambient file, network or process access: `open()`, `os` and `pathlib` cannot read the workspace. Use Kiki's host functions. Await host calls separately; they cannot suspend inside synchronous callbacks (`map`, `filter`, sort keys). Sleeps pause the whole execution and use its chargeable time, so gathered sleeps do not overlap.
 - When enabled, Monty type-checks each Python chunk against an imperfect saved context, so annotate globals you may reassign, import modules in the chunk that uses them, catch expected errors locally, and never repeat side-effecting calls merely to satisfy a diagnostic.
-- Names bound by a chunk that raises a Python error keep their values, but the type checker forgets them. Re-bind each one you still need in a chunk that succeeds, e.g. `x: T = locals()["x"]`.
-- `locals()` returns a snapshot dict of top-level Arena names; there is no `globals()`.
+- Names bound by a chunk that raises a Python error keep their values, but the type checker does not see that chunk's bindings. Re-bind each one you still need in a chunk that succeeds, e.g. `x: T = locals()["x"]`.
+- At top level, `locals()` returns a snapshot dict of Arena names; there is no `globals()`.
 - Generator expressions materialise as lists; `next(x for x in xs)` fails. `enumerate`, `zip`, `map`, `filter` and `reversed` return eager lists. Use loops when laziness or size matters.
 - No `yield`, inheritance, method decorators, `match`, `del`, `async with`, `async for` or wildcard imports. Built-in methods generally work only as direct calls (`xs.append(v)`, not `f = xs.append`). When a Python idiom fails, try a simpler construct.
 
