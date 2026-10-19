@@ -213,6 +213,7 @@ pub struct StartupSnapshot {
     prompt_source: PromptProvenance,
     openai_api_key_presence: ApiKeyPresence,
     anthropic_api_key_presence: ApiKeyPresence,
+    google_api_key_presence: ApiKeyPresence,
     problems: Vec<StartupProblem>,
     /// Non-blocking issues, such as an unusable auth file while the selected
     /// provider's key comes from the environment.
@@ -252,6 +253,7 @@ impl StartupSnapshot {
         match provider {
             Provider::OpenAi => self.openai_api_key_presence,
             Provider::Anthropic => self.anthropic_api_key_presence,
+            Provider::Google => self.google_api_key_presence,
         }
     }
 
@@ -394,6 +396,7 @@ impl ApiKey {
 struct ApiKeys {
     openai: Option<ApiKey>,
     anthropic: Option<ApiKey>,
+    google: Option<ApiKey>,
 }
 
 impl ApiKeys {
@@ -401,6 +404,7 @@ impl ApiKeys {
         match provider {
             Provider::OpenAi => self.openai.as_ref(),
             Provider::Anthropic => self.anthropic.as_ref(),
+            Provider::Google => self.google.as_ref(),
         }
     }
 
@@ -412,7 +416,7 @@ impl ApiKeys {
     }
 
     fn secrets(&self) -> Vec<&str> {
-        [&self.openai, &self.anthropic]
+        [&self.openai, &self.anthropic, &self.google]
             .into_iter()
             .flatten()
             .map(ApiKey::expose)
@@ -430,6 +434,7 @@ struct StartupInput {
     skills_catalog_guidance: Result<String, PromptError>,
     openai_api_key: Option<OsString>,
     anthropic_api_key: Option<OsString>,
+    gemini_api_key: Option<OsString>,
     /// Keys from `~/.kiki/auth.toml`, used when the environment has none.
     stored_api_keys: Result<auth::StoredKeys, auth::AuthError>,
 }
@@ -520,6 +525,7 @@ pub(crate) fn load_with_session_preferences(
         skills_catalog_guidance: prompt::resolve_skills_catalog_guidance(),
         openai_api_key: env::var_os(Provider::OpenAi.api_key_variable()),
         anthropic_api_key: env::var_os(Provider::Anthropic.api_key_variable()),
+        gemini_api_key: env::var_os(Provider::Google.api_key_variable()),
         stored_api_keys,
     };
     resolve_startup_with_session_preferences(input, session_preferences)
@@ -544,6 +550,7 @@ fn resolve_startup_with_session_preferences(
         skills_catalog_guidance,
         openai_api_key,
         anthropic_api_key,
+        gemini_api_key,
         stored_api_keys,
     } = input;
     let resuming = session_preferences.is_some();
@@ -556,10 +563,23 @@ fn resolve_startup_with_session_preferences(
         anthropic_api_key,
         stored.and_then(|keys| keys.get(Provider::Anthropic)),
     );
+    let gemini_api_key = resolve_api_key(
+        gemini_api_key,
+        stored.and_then(|keys| keys.get(Provider::Google)),
+    );
+    let providers = [
+        (Provider::OpenAi, openai_api_key.is_ok()),
+        (Provider::Anthropic, anthropic_api_key.is_ok()),
+        (Provider::Google, gemini_api_key.is_ok()),
+    ]
+    .into_iter()
+    .filter_map(|(provider, present)| present.then_some(provider))
+    .collect::<Vec<_>>();
     let settings = settings::resolve(settings::Input {
         home,
         workspace_root: workspace_root.as_ref().ok().cloned(),
         session_preferences,
+        default_model: models::default_model_for_providers(&providers),
         model,
         thinking,
     });
@@ -567,6 +587,7 @@ fn resolve_startup_with_session_preferences(
     let selected_api_key = match model.provider() {
         Provider::OpenAi => &openai_api_key,
         Provider::Anthropic => &anthropic_api_key,
+        Provider::Google => &gemini_api_key,
     };
     let auth_file_issue = stored_api_keys.as_ref().err().map(auth_file_problem);
     let api_key_problem = selected_api_key
@@ -588,6 +609,7 @@ fn resolve_startup_with_session_preferences(
     let api_keys = ApiKeys {
         openai: openai_api_key.ok(),
         anthropic: anthropic_api_key.ok(),
+        google: gemini_api_key.ok(),
     };
     let secrets = api_keys.secrets();
     let thinking = settings.thinking();
@@ -632,6 +654,7 @@ fn resolve_startup_with_session_preferences(
             prompt_source: prompt_source_display,
             openai_api_key_presence: api_keys.presence(Provider::OpenAi),
             anthropic_api_key_presence: api_keys.presence(Provider::Anthropic),
+            google_api_key_presence: api_keys.presence(Provider::Google),
             problems,
             warnings,
         },
@@ -718,7 +741,7 @@ fn api_key_problem(kind: StartupProblemKind, provider: Provider, resuming: bool)
         (
             "is missing or empty",
             "a non-empty",
-            format!(" or run `kiki login {}`", auth::provider_id(provider)),
+            format!(" or run `kiki login {}`", provider.id()),
         )
     };
     let saved_model = if resuming {
@@ -895,6 +918,7 @@ pub(crate) fn ready_snapshot_with_settings_for_test(
         skills_catalog_guidance: Ok(prompt::skills_catalog_guidance().to_owned()),
         openai_api_key: Some(OsString::from("test-api-key")),
         anthropic_api_key: None,
+        gemini_api_key: None,
         stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
     })
     .snapshot
@@ -939,8 +963,11 @@ fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        DEFAULT_MODEL, ModelSelection, SessionPreferences,
-        models::{ASTRA, LUNA, OPUS_5_5, Provider, SOL, TERRA},
+        ModelSelection, SessionPreferences,
+        models::{
+            ASTRA, GEMINI_3_8_FLASH, GEMINI_4_ARGON, GPT6_1_SOL, LUNA, OPUS_5_5, Provider, SOL,
+            TERRA,
+        },
     };
     use crate::prompt::{PromptError, PromptSource, ResolvedPrompt};
     use std::collections::BTreeMap;
@@ -978,6 +1005,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(api_key.into()),
             anthropic_api_key: None,
+            gemini_api_key: None,
             stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         }
     }
@@ -986,6 +1014,13 @@ mod tests {
         let mut input = ready_input("unused");
         input.openai_api_key = None;
         input.anthropic_api_key = Some(OsString::from(api_key));
+        input
+    }
+
+    fn google_only_input(api_key: &str) -> StartupInput {
+        let mut input = ready_input("unused");
+        input.openai_api_key = None;
+        input.gemini_api_key = Some(OsString::from(api_key));
         input
     }
 
@@ -1021,7 +1056,7 @@ mod tests {
 
         assert_eq!(snapshot.worker_path().unwrap().as_str(), WORKER_PATH);
         assert_eq!(snapshot.workspace_root().unwrap().as_str(), WORKSPACE_ROOT);
-        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
         assert_eq!(
             snapshot.prompt_source(),
             &PromptProvenance::Bundled { name: "system" }
@@ -1087,12 +1122,183 @@ mod tests {
     }
 
     #[test]
+    fn only_a_google_key_selects_argon_and_is_ready() {
+        let configuration = resolve_startup(google_only_input("AIza-google-private"));
+        let snapshot = configuration.snapshot();
+        let rendered = crate::tui::format_startup_configuration(snapshot);
+
+        assert!(snapshot.problems().is_empty(), "{:?}", snapshot.problems());
+        assert!(std::ptr::eq(snapshot.model(), &GEMINI_4_ARGON));
+        assert_eq!(snapshot.thinking(), "medium");
+        assert_eq!(
+            snapshot.api_key_presence(Provider::OpenAi),
+            ApiKeyPresence::Missing
+        );
+        assert_eq!(
+            snapshot.api_key_presence(Provider::Anthropic),
+            ApiKeyPresence::Missing
+        );
+        assert_eq!(
+            snapshot.api_key_presence(Provider::Google),
+            ApiKeyPresence::Present
+        );
+        assert!(rendered.contains("OpenAI API key: missing"), "{rendered}");
+        assert!(
+            rendered.contains("Anthropic API key: missing"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Google API key: present"), "{rendered}");
+        let ready = configuration.ready().expect("Google-only startup is ready");
+        assert!(std::ptr::eq(ready.model(), &GEMINI_4_ARGON));
+        assert!(ready.api_key(Provider::OpenAi).is_none());
+        assert!(ready.api_key(Provider::Anthropic).is_none());
+        assert_eq!(
+            ready.api_key(Provider::Google).map(super::ApiKey::expose),
+            Some("AIza-google-private")
+        );
+    }
+
+    #[test]
+    fn default_model_selection_follows_authenticated_provider_priority() {
+        let openai_only = resolve_startup(ready_input("sk-openai"));
+        assert!(openai_only.snapshot().problems().is_empty());
+        assert!(std::ptr::eq(openai_only.snapshot().model(), &GPT6_1_SOL));
+
+        let anthropic_only = resolve_startup(anthropic_only_input("sk-ant"));
+        assert!(anthropic_only.snapshot().problems().is_empty());
+        assert!(std::ptr::eq(anthropic_only.snapshot().model(), &OPUS_5_5));
+
+        let home = tempdir().unwrap();
+        crate::config::auth::store(home.path(), Provider::Google, "AIza-stored").unwrap();
+        let stored = crate::config::auth::load(home.path()).unwrap();
+        let mut stored_google = ready_input("");
+        stored_google.openai_api_key = None;
+        stored_google.stored_api_keys = Ok(stored);
+        let stored_google = resolve_startup(stored_google);
+        assert!(stored_google.snapshot().problems().is_empty());
+        assert!(std::ptr::eq(
+            stored_google.snapshot().model(),
+            &GEMINI_4_ARGON
+        ));
+        assert_eq!(
+            stored_google
+                .ready()
+                .unwrap()
+                .api_key(Provider::Google)
+                .map(super::ApiKey::expose),
+            Some("AIza-stored")
+        );
+
+        let mut google_and_openai = ready_input("sk-openai");
+        google_and_openai.gemini_api_key = Some(OsString::from("AIza-google"));
+        let google_and_openai = resolve_startup(google_and_openai);
+        assert!(google_and_openai.snapshot().problems().is_empty());
+        assert!(std::ptr::eq(
+            google_and_openai.snapshot().model(),
+            &GEMINI_4_ARGON
+        ));
+
+        let mut openai_and_anthropic = ready_input("sk-openai");
+        openai_and_anthropic.anthropic_api_key = Some(OsString::from("sk-ant"));
+        let openai_and_anthropic = resolve_startup(openai_and_anthropic);
+        assert!(openai_and_anthropic.snapshot().problems().is_empty());
+        assert!(std::ptr::eq(
+            openai_and_anthropic.snapshot().model(),
+            &GPT6_1_SOL
+        ));
+
+        let mut all_three = ready_input("sk-openai");
+        all_three.anthropic_api_key = Some(OsString::from("sk-ant"));
+        all_three.gemini_api_key = Some(OsString::from("AIza-google"));
+        let all_three = resolve_startup(all_three);
+        assert!(all_three.snapshot().problems().is_empty());
+        assert!(std::ptr::eq(all_three.snapshot().model(), &GEMINI_4_ARGON));
+
+        let mut no_keys = ready_input("");
+        no_keys.openai_api_key = None;
+        let no_keys = resolve_startup(no_keys);
+        assert!(std::ptr::eq(no_keys.snapshot().model(), &GEMINI_4_ARGON));
+        assert!(no_keys.ready().is_none());
+        let [problem] = no_keys.snapshot().problems() else {
+            panic!(
+                "expected missing key problem: {:?}",
+                no_keys.snapshot().problems()
+            );
+        };
+        assert_eq!(problem.kind(), StartupProblemKind::ApiKeyMissing);
+        assert_eq!(problem.diagnostic(), "GEMINI_API_KEY is missing or empty.");
+        assert_eq!(
+            problem.remediation(),
+            "Set GEMINI_API_KEY to a non-empty Google API key or run `kiki login google`, then restart Kiki."
+        );
+    }
+
+    #[test]
+    fn explicit_model_overrides_provider_derived_default_and_requires_its_key() {
+        let mut env_override = google_only_input("AIza-google");
+        env_override.model = Some(OsString::from(SOL.id));
+        let env_override = resolve_startup(env_override);
+        assert!(std::ptr::eq(env_override.snapshot().model(), &SOL));
+        assert!(env_override.ready().is_none());
+        assert_eq!(
+            env_override.snapshot().problems()[0].diagnostic(),
+            "OPENAI_API_KEY is missing or empty."
+        );
+
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_settings(home.path(), "model = \"openai/gpt-5.6-sol\"\n");
+        let mut config_override = google_only_input("AIza-google");
+        config_override.home = Some(home.path().as_os_str().to_os_string());
+        config_override.workspace_root = Ok(workspace.path().to_path_buf());
+        let config_override = resolve_startup(config_override);
+        assert!(std::ptr::eq(config_override.snapshot().model(), &SOL));
+        assert!(config_override.ready().is_none());
+        assert_eq!(
+            config_override.snapshot().problems()[0].diagnostic(),
+            "OPENAI_API_KEY is missing or empty."
+        );
+
+        let mut invalid_env = ready_input("sk-openai");
+        invalid_env.model = Some(OsString::from("openai/unknown"));
+        let invalid_env = resolve_startup(invalid_env);
+        assert!(std::ptr::eq(invalid_env.snapshot().model(), &GPT6_1_SOL));
+    }
+
+    #[test]
+    fn google_models_reject_xhigh_and_max_environment_thinking_as_unsupported() {
+        for model in [&GEMINI_4_ARGON, &GEMINI_3_8_FLASH] {
+            for unsupported in ["xhigh", "max"] {
+                let mut input = google_only_input("AIza-google");
+                input.model = Some(OsString::from(model.id));
+                input.thinking = Some(OsString::from(unsupported));
+                let configuration = resolve_startup(input);
+                let [problem] = configuration.snapshot().problems() else {
+                    panic!(
+                        "expected ThinkingUnsupported for {} / {unsupported}",
+                        model.id
+                    );
+                };
+                assert_eq!(problem.kind(), StartupProblemKind::ThinkingUnsupported);
+                assert_eq!(
+                    problem.diagnostic(),
+                    format!(
+                        "KIKI_THINKING is not supported for effective model `{}`; valid levels are low, medium, high.",
+                        model.id
+                    )
+                );
+                assert!(configuration.ready().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn only_an_openai_key_with_the_default_model_is_ready() {
         let configuration = resolve_startup(ready_input("sk-openai-private"));
         let snapshot = configuration.snapshot();
 
         assert!(snapshot.problems().is_empty());
-        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
         assert_eq!(
             snapshot.api_key_presence(Provider::OpenAi),
             ApiKeyPresence::Present
@@ -1113,11 +1319,15 @@ mod tests {
     fn a_missing_selected_provider_key_is_a_problem_naming_its_variable() {
         let mut anthropic_selected = ready_input("sk-openai-private");
         anthropic_selected.model = Some(OsString::from(OPUS_5_5.id));
-        let openai_selected = anthropic_only_input("sk-ant-private");
+        let mut openai_selected = anthropic_only_input("sk-ant-private");
+        openai_selected.model = Some(OsString::from(SOL.id));
+        let mut google_selected = ready_input("sk-openai-private");
+        google_selected.model = Some(OsString::from(GEMINI_4_ARGON.id));
 
         for (input, variable, provider) in [
             (anthropic_selected, "ANTHROPIC_API_KEY", "Anthropic"),
             (openai_selected, "OPENAI_API_KEY", "OpenAI"),
+            (google_selected, "GEMINI_API_KEY", "Google"),
         ] {
             let configuration = resolve_startup(input);
             let problems = configuration.snapshot().problems();
@@ -1215,8 +1425,8 @@ mod tests {
                 .remediation()
                 .contains("chmod 600 ~/.kiki/auth.toml")
         );
-        assert!(problems[1].remediation().contains("Set OPENAI_API_KEY"));
-        assert!(problems[1].remediation().contains("kiki login openai"));
+        assert!(problems[1].remediation().contains("Set GEMINI_API_KEY"));
+        assert!(problems[1].remediation().contains("kiki login google"));
 
         let mut input = ready_input("sk-environment");
         input.stored_api_keys = Err(crate::config::auth::AuthError::Malformed);
@@ -1267,17 +1477,21 @@ mod tests {
     fn every_present_key_is_redacted_from_diagnostics_paths_and_provenance() {
         let openai_key = "sk-openai-BOTH-SECRET";
         let anthropic_key = "sk-ant-BOTH-SECRET";
+        let gemini_key = "AIza-google-BOTH-SECRET";
         let mut input = ready_input(openai_key);
         input.anthropic_api_key = Some(OsString::from(anthropic_key));
+        input.gemini_api_key = Some(OsString::from(gemini_key));
         input.worker_path = Some(OsString::from(format!("/opt/{anthropic_key}/monty")));
         input.prompt = PromptResolution::Resolved {
             base: "system instructions".to_owned(),
             source: PromptSource::Override {
-                path: PathBuf::from(format!("/prompts/{openai_key}/{anthropic_key}.md")),
+                path: PathBuf::from(format!(
+                    "/prompts/{openai_key}/{anthropic_key}/{gemini_key}.md"
+                )),
             },
         };
         input.workspace_root = Err(io::Error::other(format!(
-            "resolver repeated {openai_key} and {anthropic_key}"
+            "resolver repeated {openai_key}, {anthropic_key}, and {gemini_key}"
         )));
 
         let configuration = resolve_startup(input)
@@ -1298,7 +1512,10 @@ mod tests {
         let PromptProvenance::Override { path } = snapshot.prompt_source() else {
             panic!("override provenance should be retained")
         };
-        assert_eq!(path.as_str(), "/prompts/[redacted]/[redacted].md");
+        assert_eq!(
+            path.as_str(),
+            "/prompts/[redacted]/[redacted]/[redacted].md"
+        );
         assert_eq!(
             snapshot
                 .problems()
@@ -1307,11 +1524,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "Monty worker construction failed: worker repeated [redacted]",
-                "Could not determine the current workspace root: resolver repeated [redacted] and [redacted]",
+                "Could not determine the current workspace root: resolver repeated [redacted], [redacted], and [redacted]",
             ]
         );
         assert!(!inspectable.contains(openai_key), "{inspectable}");
         assert!(!inspectable.contains(anthropic_key), "{inspectable}");
+        assert!(!inspectable.contains(gemini_key), "{inspectable}");
         assert!(!inspectable.contains("BOTH-SECRET"), "{inspectable}");
     }
 
@@ -1392,8 +1610,8 @@ mod tests {
         let configuration = resolve_startup(ready_input("key"));
         let snapshot = configuration.snapshot();
 
-        assert_eq!(snapshot.model().id, "openai/gpt-5.6-sol");
-        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
+        assert_eq!(snapshot.model().id, "openai/gpt-6.1-sol");
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
         assert_eq!(
             snapshot.submission_availability(),
             SubmissionAvailability::Available
@@ -1403,7 +1621,7 @@ mod tests {
                 .ready()
                 .expect("configuration should be ready")
                 .model(),
-            DEFAULT_MODEL
+            &GPT6_1_SOL
         ));
     }
 
@@ -1577,9 +1795,9 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
             );
-            assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
+            assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
             assert_eq!(
                 snapshot.submission_availability(),
                 SubmissionAvailability::Unavailable
@@ -1613,9 +1831,9 @@ mod tests {
         );
         assert_eq!(
             snapshot.problems()[0].remediation(),
-            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
+            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
         );
-        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
         assert_eq!(
             snapshot.submission_availability(),
             SubmissionAvailability::Unavailable
@@ -1660,6 +1878,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(OsString::from(api_key)),
             anthropic_api_key: None,
+            gemini_api_key: None,
             stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         };
 
@@ -1911,12 +2130,20 @@ mod tests {
 
         let invalid = || Some(OsString::from_vec(vec![b's', b'k', b'-', 0xff]));
         let mut openai = ready_input("placeholder");
+        openai.model = Some(OsString::from(SOL.id));
         openai.openai_api_key = invalid();
         let mut anthropic = ready_input("placeholder");
         anthropic.model = Some(OsString::from(OPUS_5_5.id));
         anthropic.anthropic_api_key = invalid();
+        let mut google = ready_input("placeholder");
+        google.model = Some(OsString::from(GEMINI_4_ARGON.id));
+        google.gemini_api_key = invalid();
 
-        for (input, provider) in [(openai, Provider::OpenAi), (anthropic, Provider::Anthropic)] {
+        for (input, provider) in [
+            (openai, Provider::OpenAi),
+            (anthropic, Provider::Anthropic),
+            (google, Provider::Google),
+        ] {
             let configuration = resolve_startup(input);
             let problems = configuration.snapshot().problems();
 
@@ -1958,6 +2185,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: None,
             anthropic_api_key: None,
+            gemini_api_key: None,
             stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         };
 
@@ -2077,6 +2305,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(OsString::from(api_key)),
             anthropic_api_key: None,
+            gemini_api_key: None,
             stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         })
         .with_worker_construction_failure(format!("worker failure \x1b {api_key}"))
@@ -2086,10 +2315,11 @@ mod tests {
 
         assert!(rendered.contains("Worker: /worker/[redacted]/monty    \\x1B"));
         assert!(rendered.contains("Workspace: /workspace/[redacted]/project\\x0D"));
-        assert!(rendered.contains("Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)"));
+        assert!(rendered.contains("Model: openai/gpt-6.1-sol (context: 1.05m, max output: 128k)"));
         assert!(rendered.contains("Prompt: override /prompts/[redacted]/agent    \\x1B.md"));
         assert!(rendered.contains("OpenAI API key: present"));
         assert!(rendered.contains("Anthropic API key: missing"));
+        assert!(rendered.contains("Google API key: missing"));
         assert!(rendered.contains("Submission: unavailable"));
         assert!(rendered.contains(
             "Problem: Monty worker construction failed: worker failure \\x1B [redacted]"

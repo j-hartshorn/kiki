@@ -6,9 +6,12 @@
 //!
 //! [anthropic]
 //! api_key = "sk-ant-..."
+//!
+//! [google]
+//! api_key = "AIza..."
 //! ```
 //!
-//! Environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) take
+//! Environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) take
 //! precedence over stored keys. The file holds secrets, so it lives apart from
 //! `config.toml` (which is safe to share) and must be accessible by its owner
 //! only: Kiki writes it with mode `0600` and refuses to read a file that other
@@ -33,18 +36,11 @@ pub(crate) fn auth_path(home: &Path) -> PathBuf {
     home.join(".kiki").join("auth.toml")
 }
 
-/// The table name (and `kiki login` argument) for a provider.
-pub(crate) fn provider_id(provider: Provider) -> &'static str {
-    match provider {
-        Provider::OpenAi => "openai",
-        Provider::Anthropic => "anthropic",
-    }
-}
-
 pub(crate) fn parse_provider(id: &str) -> Option<Provider> {
     match id {
         "openai" => Some(Provider::OpenAi),
         "anthropic" => Some(Provider::Anthropic),
+        "google" => Some(Provider::Google),
         _ => None,
     }
 }
@@ -53,6 +49,7 @@ pub(crate) fn parse_provider(id: &str) -> Option<Provider> {
 pub(crate) struct StoredKeys {
     openai: Option<String>,
     anthropic: Option<String>,
+    google: Option<String>,
 }
 
 impl StoredKeys {
@@ -60,6 +57,7 @@ impl StoredKeys {
         match provider {
             Provider::OpenAi => self.openai.as_deref(),
             Provider::Anthropic => self.anthropic.as_deref(),
+            Provider::Google => self.google.as_deref(),
         }
     }
 
@@ -67,6 +65,7 @@ impl StoredKeys {
         match provider {
             Provider::OpenAi => &mut self.openai,
             Provider::Anthropic => &mut self.anthropic,
+            Provider::Google => &mut self.google,
         }
     }
 }
@@ -169,7 +168,7 @@ pub(crate) fn store(home: &Path, provider: Provider, api_key: &str) -> Result<()
     update(home, |document| {
         let mut table = Table::new();
         table.insert(API_KEY_FIELD, value(api_key.trim()));
-        document.insert(provider_id(provider), Item::Table(table));
+        document.insert(provider.id(), Item::Table(table));
         true
     })
     .map(|_| ())
@@ -184,9 +183,7 @@ pub(crate) fn remove(home: &Path, provider: Provider) -> Result<bool, AuthError>
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(AuthError::Unreadable(error)),
     }
-    update(home, |document| {
-        document.remove(provider_id(provider)).is_some()
-    })
+    update(home, |document| document.remove(provider.id()).is_some())
 }
 
 /// Removes group and other write access from an existing `~/.kiki` owned by
@@ -381,7 +378,7 @@ fn parse(content: &str) -> Result<(StoredKeys, DocumentMut), AuthError> {
     let mut keys = StoredKeys::default();
     for (name, item) in document.iter() {
         let provider = parse_provider(name).ok_or(AuthError::Invalid(
-            "it contains an unknown table; only [openai] and [anthropic] are allowed",
+            "it contains an unknown table; only [openai], [anthropic], and [google] are allowed",
         ))?;
         let table = item
             .as_table_like()
@@ -426,7 +423,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{AuthError, StoredKeys, auth_path, load, remove, store};
+    use super::{AuthError, StoredKeys, auth_path, load, parse_provider, remove, store};
     use crate::config::models::Provider;
 
     fn write_auth(home: &std::path::Path, content: &str) {
@@ -447,19 +444,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_ids_and_parsing_cover_openai_anthropic_and_google() {
+        assert_eq!(parse_provider("openai"), Some(Provider::OpenAi));
+        assert_eq!(parse_provider("anthropic"), Some(Provider::Anthropic));
+        assert_eq!(parse_provider("google"), Some(Provider::Google));
+        assert_eq!(parse_provider("gemini"), None);
+        for provider in [Provider::OpenAi, Provider::Anthropic, Provider::Google] {
+            assert_eq!(parse_provider(provider.id()), Some(provider));
+        }
+    }
+
+    #[test]
     fn store_round_trips_and_preserves_other_providers() {
         let home = tempdir().unwrap();
         store(home.path(), Provider::OpenAi, "sk-open").unwrap();
         store(home.path(), Provider::Anthropic, "sk-ant").unwrap();
+        store(home.path(), Provider::Google, "AIza-google").unwrap();
         store(home.path(), Provider::OpenAi, "sk-open-2").unwrap();
         let keys = load(home.path()).unwrap();
         assert_eq!(keys.get(Provider::OpenAi), Some("sk-open-2"));
         assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
+        assert_eq!(keys.get(Provider::Google), Some("AIza-google"));
 
         assert!(remove(home.path(), Provider::OpenAi).unwrap());
         assert!(!remove(home.path(), Provider::OpenAi).unwrap());
         let keys = load(home.path()).unwrap();
         assert_eq!(keys.get(Provider::OpenAi), None);
+        assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
+        assert_eq!(keys.get(Provider::Google), Some("AIza-google"));
+
+        assert!(remove(home.path(), Provider::Google).unwrap());
+        assert!(!remove(home.path(), Provider::Google).unwrap());
+        let keys = load(home.path()).unwrap();
+        assert_eq!(keys.get(Provider::Google), None);
         assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
     }
 
@@ -475,7 +492,7 @@ mod tests {
     #[test]
     fn concurrent_stores_keep_every_key() {
         let home = tempdir().unwrap();
-        let providers = [Provider::OpenAi, Provider::Anthropic];
+        let providers = [Provider::OpenAi, Provider::Anthropic, Provider::Google];
         for round in 0..20 {
             std::thread::scope(|scope| {
                 for provider in providers {
@@ -702,6 +719,17 @@ mod tests {
             assert!(store(home.path(), Provider::OpenAi, "sk-new").is_err());
             assert_eq!(fs::read_to_string(auth_path(home.path())).unwrap(), content);
         }
+    }
+
+    #[test]
+    fn unknown_table_error_lists_openai_anthropic_and_google() {
+        let home = tempdir().unwrap();
+        write_auth(home.path(), "[unknown]\napi_key = \"x\"\n");
+        let error = load(home.path()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "~/.kiki/auth.toml is invalid: it contains an unknown table; only [openai], [anthropic], and [google] are allowed"
+        );
     }
 
     #[test]
