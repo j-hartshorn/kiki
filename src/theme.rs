@@ -175,6 +175,164 @@ pub(crate) fn appearance_from_colorfgbg(value: &str) -> Option<Appearance> {
     }
 }
 
+pub(crate) trait TerminalQuery {
+    fn write_query(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn read_byte(&mut self, deadline: std::time::Instant) -> std::io::Result<Option<u8>>;
+}
+
+pub(crate) struct StdioTerminal;
+
+impl StdioTerminal {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        ratatui::crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for StdioTerminal {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    }
+}
+
+impl TerminalQuery for StdioTerminal {
+    fn write_query(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(bytes)?;
+        stdout.flush()
+    }
+
+    fn read_byte(&mut self, deadline: std::time::Instant) -> std::io::Result<Option<u8>> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let timeout = Timespec::try_from(remaining).map_err(std::io::Error::other)?;
+        let stdin = rustix::stdio::stdin();
+        let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
+        if poll(&mut fds, Some(&timeout))? == 0 || std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if !fds[0].revents().contains(PollFlags::IN) {
+            return Err(std::io::Error::other("terminal input unavailable"));
+        }
+        let mut byte = [0];
+        match rustix::io::read(stdin, &mut byte)? {
+            0 => Ok(None),
+            _ => Ok(Some(byte[0])),
+        }
+    }
+}
+
+pub(crate) fn detect_appearance(
+    terminal: &mut impl TerminalQuery,
+    colorfgbg: Option<&str>,
+) -> Appearance {
+    use std::time::{Duration, Instant};
+
+    enum ReplyState {
+        Ignore,
+        Escape,
+        Osc,
+        OscEnd,
+        Csi,
+        Da1,
+    }
+
+    let fallback = colorfgbg
+        .and_then(appearance_from_colorfgbg)
+        .unwrap_or(Appearance::Dark);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    if terminal.write_query(b"\x1b]11;?\x07\x1b[c").is_err() {
+        return fallback;
+    }
+    let mut state = ReplyState::Ignore;
+    let mut osc = Vec::new();
+    let mut background = None;
+    while Instant::now() < deadline {
+        let byte = match terminal.read_byte(deadline) {
+            Ok(Some(byte)) => byte,
+            Ok(None) | Err(_) => return fallback,
+        };
+        if byte == b'\x1b' {
+            state = match state {
+                ReplyState::Osc => ReplyState::OscEnd,
+                _ => ReplyState::Escape,
+            };
+            continue;
+        }
+        state = match state {
+            ReplyState::OscEnd if byte == b'\\' => {
+                background = parse_osc11(&osc).or(background);
+                ReplyState::Ignore
+            }
+            ReplyState::Escape | ReplyState::OscEnd => match byte {
+                b']' => {
+                    osc.clear();
+                    ReplyState::Osc
+                }
+                b'[' => ReplyState::Csi,
+                _ => ReplyState::Ignore,
+            },
+            ReplyState::Osc if byte == b'\x07' => {
+                background = parse_osc11(&osc).or(background);
+                ReplyState::Ignore
+            }
+            ReplyState::Osc if osc.len() < b"11;rgb:ffff/ffff/ffff".len() => {
+                osc.push(byte);
+                ReplyState::Osc
+            }
+            ReplyState::Csi if byte == b'?' => ReplyState::Da1,
+            ReplyState::Da1 if byte == b'c' => return background.unwrap_or(fallback),
+            ReplyState::Da1 if byte.is_ascii_digit() || byte == b';' => ReplyState::Da1,
+            _ => ReplyState::Ignore,
+        };
+    }
+    fallback
+}
+
+fn parse_osc11(bytes: &[u8]) -> Option<Appearance> {
+    let value = std::str::from_utf8(bytes).ok()?.strip_prefix("11;rgb:")?;
+    let mut channels = value.split('/');
+    let red = parse_osc_channel(channels.next()?)?;
+    let green = parse_osc_channel(channels.next()?)?;
+    let blue = parse_osc_channel(channels.next()?)?;
+    if channels.next().is_some() {
+        return None;
+    }
+    let [red, green, blue] = [red, green, blue].map(|channel| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    let l =
+        (0.4122214694707629 * red + 0.5363325372617349 * green + 0.0514459932675022 * blue).cbrt();
+    let m =
+        (0.2119034958178251 * red + 0.6806995506452344 * green + 0.1073969535369405 * blue).cbrt();
+    let s =
+        (0.0883024591900564 * red + 0.2817188391361215 * green + 0.6299787016738222 * blue).cbrt();
+    let lightness = 0.210454268309314 * l + 0.793617774702305 * m - 0.0040720430116193 * s;
+    Some(if lightness >= 0.5 {
+        Appearance::Light
+    } else {
+        Appearance::Dark
+    })
+}
+
+fn parse_osc_channel(value: &str) -> Option<f64> {
+    if !(1..=4).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let max = (1_u32 << (4 * value.len())) - 1;
+    Some(f64::from(u16::from_str_radix(value, 16).ok()?) / f64::from(max))
+}
+
 // Keep these distinct from DARK and from each other to catch token mix-ups.
 #[cfg(test)]
 pub(crate) static DISTINCT_TEST_THEME: Theme = Theme {
@@ -188,6 +346,330 @@ pub(crate) static DISTINCT_TEST_THEME: Theme = Theme {
 mod tests {
     use super::DARK;
     use ratatui::style::Color;
+
+    use std::collections::VecDeque;
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use super::{Appearance, TerminalQuery, detect_appearance};
+
+    enum ScriptedRead {
+        Bytes(VecDeque<u8>),
+        Timeout,
+        Error,
+    }
+
+    struct ScriptedTerminal {
+        script: VecDeque<ScriptedRead>,
+        writes: Vec<Vec<u8>>,
+        deadlines: Vec<Instant>,
+        write_error: bool,
+    }
+
+    impl ScriptedTerminal {
+        fn new(chunks: &[&[u8]]) -> Self {
+            Self {
+                script: chunks
+                    .iter()
+                    .map(|chunk| ScriptedRead::Bytes(chunk.iter().copied().collect()))
+                    .collect(),
+                writes: Vec::new(),
+                deadlines: Vec::new(),
+                write_error: false,
+            }
+        }
+
+        fn unread_bytes(&self) -> Vec<u8> {
+            self.script
+                .iter()
+                .filter_map(|step| match step {
+                    ScriptedRead::Bytes(bytes) => Some(bytes.iter().copied()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        }
+    }
+
+    impl TerminalQuery for ScriptedTerminal {
+        fn write_query(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.writes.push(bytes.to_vec());
+            if self.write_error {
+                Err(io::Error::other("scripted write error"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn read_byte(&mut self, deadline: Instant) -> io::Result<Option<u8>> {
+            self.deadlines.push(deadline);
+            loop {
+                match self.script.pop_front() {
+                    Some(ScriptedRead::Bytes(mut bytes)) => {
+                        if let Some(byte) = bytes.pop_front() {
+                            self.script.push_front(ScriptedRead::Bytes(bytes));
+                            return Ok(Some(byte));
+                        }
+                    }
+                    Some(ScriptedRead::Error) => {
+                        return Err(io::Error::other("scripted read error"));
+                    }
+                    Some(ScriptedRead::Timeout) | None => return Ok(None),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn osc11_classifies_black_and_white_with_each_channel_width_and_terminator() {
+        for (channel, expected) in [
+            ("0000", Appearance::Dark),
+            ("00", Appearance::Dark),
+            ("0", Appearance::Dark),
+            ("ffff", Appearance::Light),
+            ("ff", Appearance::Light),
+            ("f", Appearance::Light),
+            ("fff", Appearance::Light),
+        ] {
+            for terminator in ["\x07", "\x1b\\"] {
+                let reply =
+                    format!("\x1b]11;rgb:{channel}/{channel}/{channel}{terminator}\x1b[?1;2c");
+                let mut terminal = ScriptedTerminal::new(&[reply.as_bytes()]);
+                let fallback = if expected == Appearance::Dark {
+                    "0;15"
+                } else {
+                    "15;0"
+                };
+                assert_eq!(
+                    detect_appearance(&mut terminal, Some(fallback)),
+                    expected,
+                    "{reply:?}"
+                );
+                assert!(terminal.unread_bytes().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn osc11_uses_oklab_lightness_either_side_of_half() {
+        let threshold = (1.055 * 0.125_f64.powf(1.0 / 2.4) - 0.055) * 65535.0;
+        let below = threshold.floor() as u16;
+        let above = below + 1;
+        for (grey, expected) in [(below, Appearance::Dark), (above, Appearance::Light)] {
+            let reply = format!("\x1b]11;rgb:{grey:04x}/{grey:04x}/{grey:04x}\x07\x1b[?1c");
+            let mut terminal = ScriptedTerminal::new(&[reply.as_bytes()]);
+            let fallback = if expected == Appearance::Dark {
+                "0;15"
+            } else {
+                "15;0"
+            };
+            assert_eq!(
+                detect_appearance(&mut terminal, Some(fallback)),
+                expected,
+                "{grey:04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc11_scales_each_channel_by_its_own_width() {
+        for (channels, expected) in [
+            ("f/ff/fff", Appearance::Light),
+            ("3/33/333", Appearance::Dark),
+            ("0000/f/ff", Appearance::Light),
+        ] {
+            let reply = format!("\x1b]11;rgb:{channels}\x07\x1b[?1c");
+            let mut terminal = ScriptedTerminal::new(&[reply.as_bytes()]);
+            assert_eq!(
+                detect_appearance(&mut terminal, None),
+                expected,
+                "{channels}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc11_handles_three_fragmented_reply_batches_with_one_500ms_deadline() {
+        let mut terminal =
+            ScriptedTerminal::new(&[b"\x1b]11;rg", b"b:ff/ff/ff\x07\x1b[?", b"1;2c"]);
+        let before = Instant::now();
+        assert_eq!(detect_appearance(&mut terminal, None), Appearance::Light);
+        let after = Instant::now();
+        assert!(terminal.unread_bytes().is_empty());
+        let deadline = terminal.deadlines[0];
+        assert!(deadline >= before + Duration::from_millis(500));
+        assert!(deadline <= after + Duration::from_millis(500));
+        assert!(terminal.deadlines.iter().all(|&value| value == deadline));
+    }
+
+    #[test]
+    fn osc11_da1_only_uses_colorfgbg_then_dark() {
+        for (colorfgbg, expected) in [(Some("0;15"), Appearance::Light), (None, Appearance::Dark)] {
+            let mut terminal = ScriptedTerminal::new(&[b"\x1b[?1;2c"]);
+            assert_eq!(detect_appearance(&mut terminal, colorfgbg), expected);
+            assert!(terminal.unread_bytes().is_empty());
+        }
+    }
+
+    #[test]
+    fn osc11_silence_times_out_immediately_in_the_fake() {
+        for (colorfgbg, expected) in [
+            (Some("0;15"), Appearance::Light),
+            (None, Appearance::Dark),
+            (Some("invalid"), Appearance::Dark),
+        ] {
+            let mut terminal = ScriptedTerminal::new(&[]);
+            assert_eq!(detect_appearance(&mut terminal, colorfgbg), expected);
+            assert_eq!(terminal.deadlines.len(), 1);
+        }
+    }
+
+    #[test]
+    fn osc11_ignores_garbage_before_da1() {
+        let mut terminal = ScriptedTerminal::new(&[b"garbage\xff\x1b[31m\x1b[?1;2c"]);
+        assert_eq!(
+            detect_appearance(&mut terminal, Some("0;15")),
+            Appearance::Light
+        );
+        assert!(terminal.unread_bytes().is_empty());
+    }
+
+    #[test]
+    fn osc11_ignores_other_sequences_before_a_valid_reply() {
+        let mut terminal = ScriptedTerminal::new(&[
+            b"garbage\x1b]10;rgb:0/0/0\x07\x1b[31m\x1b]11;rgb:f/f/f\x1b\\\x1b[?1c",
+        ]);
+        assert_eq!(detect_appearance(&mut terminal, None), Appearance::Light);
+    }
+
+    #[test]
+    fn osc11_does_not_read_bytes_queued_after_da1() {
+        let mut terminal = ScriptedTerminal::new(&[
+            b"\x1b]11;rgb:f/f/f\x07\x1b[?1;2cnext input\x1b]11;rgb:0/0/0\x07",
+        ]);
+        assert_eq!(detect_appearance(&mut terminal, None), Appearance::Light);
+        assert_eq!(terminal.unread_bytes(), b"next input\x1b]11;rgb:0/0/0\x07");
+    }
+
+    #[test]
+    fn osc11_write_error_falls_back_without_reading() {
+        let reply = b"\x1b]11;rgb:0/0/0\x07\x1b[?1c";
+        let mut terminal = ScriptedTerminal::new(&[reply]);
+        terminal.write_error = true;
+        assert_eq!(
+            detect_appearance(&mut terminal, Some("0;15")),
+            Appearance::Light
+        );
+        assert_eq!(terminal.writes, vec![b"\x1b]11;?\x07\x1b[c".to_vec()]);
+        assert!(terminal.deadlines.is_empty());
+        assert_eq!(terminal.unread_bytes(), reply);
+    }
+
+    #[test]
+    fn osc11_writes_the_osc11_and_da1_queries_together() {
+        let mut terminal = ScriptedTerminal::new(&[]);
+        detect_appearance(&mut terminal, None);
+        assert_eq!(terminal.writes, vec![b"\x1b]11;?\x07\x1b[c".to_vec()]);
+    }
+
+    #[test]
+    fn osc11_read_error_falls_back_and_stops_reading() {
+        let reply = b"\x1b]11;rgb:0/0/0\x07\x1b[?1c";
+        let mut terminal = ScriptedTerminal::new(&[reply]);
+        terminal.script.push_front(ScriptedRead::Error);
+        assert_eq!(
+            detect_appearance(&mut terminal, Some("0;15")),
+            Appearance::Light
+        );
+        assert_eq!(terminal.deadlines.len(), 1);
+        assert_eq!(terminal.unread_bytes(), reply);
+    }
+
+    #[test]
+    fn osc11_timeout_stops_before_a_late_reply_even_after_a_valid_background() {
+        let late_reply = b"\x1b[?1c";
+        let mut terminal = ScriptedTerminal::new(&[b"\x1b]11;rgb:0/0/0\x07"]);
+        terminal.script.push_back(ScriptedRead::Timeout);
+        terminal
+            .script
+            .push_back(ScriptedRead::Bytes(late_reply.iter().copied().collect()));
+        assert_eq!(
+            detect_appearance(&mut terminal, Some("0;15")),
+            Appearance::Light
+        );
+        assert_eq!(terminal.deadlines.len(), b"\x1b]11;rgb:0/0/0\x07".len() + 1);
+        assert_eq!(terminal.unread_bytes(), late_reply);
+    }
+
+    #[test]
+    fn osc11_parser_boundaries() {
+        let mut terminal = ScriptedTerminal::new(&[b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?62;22cx"]);
+        assert_eq!(detect_appearance(&mut terminal, None), Appearance::Light);
+        assert_eq!(terminal.unread_bytes(), b"x");
+
+        let mut terminal =
+            ScriptedTerminal::new(&[b"\x1b[12;40R\x1b[1c\x1b]11;rgb:0/0/0\x07\x1b[?1;2cy"]);
+        assert_eq!(
+            detect_appearance(&mut terminal, Some("0;15")),
+            Appearance::Dark
+        );
+        assert_eq!(terminal.unread_bytes(), b"y");
+
+        let mut terminal = ScriptedTerminal::new(&[b"\x1b]11;rgb:ffff\x1b[?1cz"]);
+        assert_eq!(detect_appearance(&mut terminal, None), Appearance::Dark);
+        assert_eq!(terminal.unread_bytes(), b"z");
+
+        let mut terminal = ScriptedTerminal::new(&[
+            b"\x1b]11;rgb:fffff/fffff/fffff/fffff\x07\x1b]11;rgb:0/0/0\x07\x1b[?1c",
+        ]);
+        assert_eq!(
+            detect_appearance(&mut terminal, Some("0;15")),
+            Appearance::Dark
+        );
+    }
+
+    #[test]
+    fn osc11_malformed_colours_are_rejected_directly() {
+        for value in [
+            "rgb:/f/f",
+            "rgb:fffff/f/f",
+            "rgb:gg/f/f",
+            "rgb:-1/f/f",
+            "rgb:f/f",
+            "rgb:f/f/f/f",
+            "rgba:f/f/f/f",
+            "#ffffff",
+        ] {
+            assert_eq!(
+                super::parse_osc11(format!("11;{value}").as_bytes()),
+                None,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc11_unparseable_background_falls_back() {
+        for value in [
+            "rgb:/f/f",
+            "rgb:fffff/f/f",
+            "rgb:gg/f/f",
+            "rgb:-1/f/f",
+            "rgb:f/f",
+            "rgb:f/f/f/f",
+            "rgb:0x0/0/0",
+            "#ffffff",
+        ] {
+            let reply = format!("\x1b]11;{value}\x07\x1b[?1c");
+            let mut terminal = ScriptedTerminal::new(&[reply.as_bytes()]);
+            assert_eq!(
+                detect_appearance(&mut terminal, Some("0;15")),
+                Appearance::Light,
+                "{value}"
+            );
+            assert!(terminal.unread_bytes().is_empty());
+        }
+    }
 
     fn hex(value: &str) -> Color {
         let value = u32::from_str_radix(value.trim_start_matches('#'), 16).unwrap();

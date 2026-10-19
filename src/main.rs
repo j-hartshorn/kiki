@@ -317,8 +317,16 @@ fn startup_skill_catalog(
 }
 
 fn startup_appearance() -> theme::Appearance {
-    std::env::var("COLORFGBG")
-        .ok()
+    use std::io::IsTerminal;
+
+    let colorfgbg = std::env::var("COLORFGBG").ok();
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && let Ok(mut terminal) = theme::StdioTerminal::new()
+    {
+        return theme::detect_appearance(&mut terminal, colorfgbg.as_deref());
+    }
+    colorfgbg
         .as_deref()
         .and_then(theme::appearance_from_colorfgbg)
         .unwrap_or(theme::Appearance::Dark)

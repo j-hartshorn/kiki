@@ -15,7 +15,7 @@ ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 rattles = "=0.3.1"
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["event", "fs", "stdio"] }
 monty-pool = "=1.0.0"
 monty-types = "=1.0.0"
 # The embedded worker (`kiki subprocess`); keep in lockstep with monty-pool.
