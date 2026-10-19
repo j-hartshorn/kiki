@@ -37,7 +37,7 @@ use crate::selection::{
 use crate::session::{CompactionOutcome, CompactionReason};
 use crate::skills::SkillOrigin;
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
-use crate::theme::{DARK, Theme};
+use crate::theme::{DARK, LIGHT, Theme};
 
 #[derive(Clone, Copy)]
 struct MarkdownStyleSheet {
@@ -166,11 +166,17 @@ fn build_markdown_options(theme: &'static Theme) -> MarkdownOptions {
 fn markdown_options(theme: &'static Theme) -> &'static MarkdownOptions {
     static DARK_OPTIONS: LazyLock<MarkdownOptions> =
         LazyLock::new(|| build_markdown_options(&DARK));
-    assert!(
-        std::ptr::eq(theme, &DARK),
-        "markdown options exist only for the built-in themes"
-    );
-    &DARK_OPTIONS
+    static LIGHT_OPTIONS: LazyLock<MarkdownOptions> =
+        LazyLock::new(|| build_markdown_options(&LIGHT));
+    if std::ptr::eq(theme, &DARK) {
+        &DARK_OPTIONS
+    } else {
+        assert!(
+            std::ptr::eq(theme, &LIGHT),
+            "markdown options exist only for the built-in themes"
+        );
+        &LIGHT_OPTIONS
+    }
 }
 
 fn markdown<'a>(
@@ -7054,13 +7060,15 @@ mod tests {
 
     #[test]
     fn markdown_generated_theme_parses_and_options_are_reused() {
-        assert!(tui_markdown::CodeTheme::from_textmate(&super::textmate_theme(&DARK)).is_ok());
-        assert!(std::ptr::eq(
-            super::markdown_options(&DARK),
-            super::markdown_options(&DARK)
-        ));
-        let text = markdown("| Name |\n| --- |", &DARK, None);
-        assert_eq!(markdown_style_at(&text, "Name").fg, Some(DARK.text));
+        for theme in [&DARK, &crate::theme::LIGHT] {
+            assert!(tui_markdown::CodeTheme::from_textmate(&super::textmate_theme(theme)).is_ok());
+            assert!(std::ptr::eq(
+                super::markdown_options(theme),
+                super::markdown_options(theme)
+            ));
+            let text = markdown("| Name |\n| --- |", theme, None);
+            assert_eq!(markdown_style_at(&text, "Name").fg, Some(theme.text));
+        }
     }
 
     #[test]

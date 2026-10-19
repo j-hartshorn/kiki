@@ -80,6 +80,101 @@ pub(crate) static DARK: Theme = Theme {
     syntax_punctuation: Color::Rgb(0x9d, 0xa5, 0xa9),
 };
 
+pub(crate) static LIGHT: Theme = Theme {
+    text: Color::Rgb(0x3b, 0x3f, 0x41),
+    muted: Color::Rgb(0x67, 0x71, 0x76),
+    dim: Color::Rgb(0x87, 0x90, 0x95),
+    user_message_bg: Color::Rgb(0xdf, 0xe7, 0xec),
+    tool_pending_bg: Color::Rgb(0xe4, 0xe5, 0xe6),
+    tool_success_bg: Color::Rgb(0xde, 0xe9, 0xe1),
+    tool_error_bg: Color::Rgb(0xee, 0xe2, 0xe1),
+    thinking_text: Color::Rgb(0x7c, 0x86, 0x8c),
+    card_bg: Color::Rgb(0xf7, 0xf6, 0xf6),
+    error: Color::Rgb(0xc8, 0x25, 0x3d),
+    warning: Color::Rgb(0x8f, 0x68, 0x02),
+    accent: Color::Rgb(0x74, 0x59, 0xb4),
+    success: Color::Rgb(0x33, 0x7e, 0x58),
+    border: Color::Rgb(0x3d, 0x8e, 0xb3),
+    border_accent: Color::Rgb(0x8a, 0x72, 0xcb),
+    selected_bg: Color::Rgb(0xdf, 0xe7, 0xec),
+    thinking_off: Color::Rgb(0xc2, 0xc8, 0xca),
+    thinking_minimal: Color::Rgb(0xb5, 0xc4, 0xcb),
+    thinking_low: Color::Rgb(0x9f, 0xc2, 0xd5),
+    thinking_medium: Color::Rgb(0xa2, 0xb7, 0xe0),
+    thinking_high: Color::Rgb(0xb5, 0xa5, 0xe8),
+    thinking_xhigh: Color::Rgb(0xe5, 0x85, 0xcd),
+    thinking_max: Color::Rgb(0xfe, 0x74, 0x79),
+    syntax_comment: Color::Rgb(0x67, 0x71, 0x76),
+    syntax_keyword: Color::Rgb(0x2f, 0x78, 0x99),
+    syntax_function: Color::Rgb(0x8f, 0x68, 0x02),
+    syntax_string: Color::Rgb(0xa4, 0x54, 0x17),
+    syntax_number: Color::Rgb(0x33, 0x7e, 0x58),
+    md_heading: Color::Rgb(0x8f, 0x68, 0x02),
+    md_link: Color::Rgb(0x2f, 0x78, 0x99),
+    md_quote: Color::Rgb(0x67, 0x71, 0x76),
+    md_code: Color::Rgb(0x74, 0x59, 0xb4),
+    border_muted: Color::Rgb(0x9a, 0xa2, 0xa7),
+    syntax_variable: Color::Rgb(0x28, 0x7a, 0x81),
+    syntax_type: Color::Rgb(0x74, 0x59, 0xb4),
+    syntax_operator: Color::Rgb(0x67, 0x71, 0x76),
+    syntax_punctuation: Color::Rgb(0x67, 0x71, 0x76),
+};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ThemeSetting {
+    Dark,
+    Light,
+    #[default]
+    Automatic,
+}
+
+impl ThemeSetting {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            "automatic" => Some(Self::Automatic),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Automatic => "automatic",
+        }
+    }
+
+    pub(crate) fn resolve(self, appearance: Appearance) -> &'static Theme {
+        match (self, appearance) {
+            (Self::Dark, _) | (Self::Automatic, Appearance::Dark) => &DARK,
+            (Self::Light, _) | (Self::Automatic, Appearance::Light) => &LIGHT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Appearance {
+    Dark,
+    Light,
+}
+
+pub(crate) fn appearance_from_colorfgbg(value: &str) -> Option<Appearance> {
+    let background = value.rsplit(';').next()?.trim();
+    if background.is_empty()
+        || background.len() > 2
+        || !background.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    match background.parse::<u8>().ok()? {
+        0..=6 | 8 => Some(Appearance::Dark),
+        7 | 9..=15 => Some(Appearance::Light),
+        _ => None,
+    }
+}
+
 // Keep these distinct from DARK and from each other to catch token mix-ups.
 #[cfg(test)]
 pub(crate) static DISTINCT_TEST_THEME: Theme = Theme {
@@ -97,6 +192,117 @@ mod tests {
     fn hex(value: &str) -> Color {
         let value = u32::from_str_radix(value.trim_start_matches('#'), 16).unwrap();
         Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+    }
+
+    #[test]
+    fn light_tokens_match_pi_resolved_hex() {
+        for (actual, expected) in [
+            (super::LIGHT.text, "#3b3f41"),
+            (super::LIGHT.muted, "#677176"),
+            (super::LIGHT.dim, "#879095"),
+            (super::LIGHT.user_message_bg, "#dfe7ec"),
+            (super::LIGHT.tool_pending_bg, "#e4e5e6"),
+            (super::LIGHT.tool_success_bg, "#dee9e1"),
+            (super::LIGHT.tool_error_bg, "#eee2e1"),
+            (super::LIGHT.thinking_text, "#7c868c"),
+            (super::LIGHT.card_bg, "#f7f6f6"),
+            (super::LIGHT.error, "#c8253d"),
+            (super::LIGHT.warning, "#8f6802"),
+            (super::LIGHT.accent, "#7459b4"),
+            (super::LIGHT.success, "#337e58"),
+            (super::LIGHT.border, "#3d8eb3"),
+            (super::LIGHT.border_accent, "#8a72cb"),
+            (super::LIGHT.selected_bg, "#dfe7ec"),
+            (super::LIGHT.thinking_off, "#c2c8ca"),
+            (super::LIGHT.thinking_minimal, "#b5c4cb"),
+            (super::LIGHT.thinking_low, "#9fc2d5"),
+            (super::LIGHT.thinking_medium, "#a2b7e0"),
+            (super::LIGHT.thinking_high, "#b5a5e8"),
+            (super::LIGHT.thinking_xhigh, "#e585cd"),
+            (super::LIGHT.thinking_max, "#fe7479"),
+            (super::LIGHT.syntax_comment, "#677176"),
+            (super::LIGHT.syntax_keyword, "#2f7899"),
+            (super::LIGHT.syntax_function, "#8f6802"),
+            (super::LIGHT.syntax_string, "#a45417"),
+            (super::LIGHT.syntax_number, "#337e58"),
+            (super::LIGHT.md_heading, "#8f6802"),
+            (super::LIGHT.md_link, "#2f7899"),
+            (super::LIGHT.md_quote, "#677176"),
+            (super::LIGHT.md_code, "#7459b4"),
+            (super::LIGHT.border_muted, "#9aa2a7"),
+            (super::LIGHT.syntax_variable, "#287a81"),
+            (super::LIGHT.syntax_type, "#7459b4"),
+            (super::LIGHT.syntax_operator, "#677176"),
+            (super::LIGHT.syntax_punctuation, "#677176"),
+        ] {
+            assert_eq!(actual, hex(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn theme_setting_round_trips_exact_lowercase_values() {
+        for setting in [
+            super::ThemeSetting::Dark,
+            super::ThemeSetting::Light,
+            super::ThemeSetting::Automatic,
+        ] {
+            assert_eq!(super::ThemeSetting::parse(setting.as_str()), Some(setting));
+        }
+        for invalid in ["Dark", "", "blue"] {
+            assert_eq!(super::ThemeSetting::parse(invalid), None);
+        }
+    }
+
+    #[test]
+    fn theme_setting_resolves_fixed_and_automatic_appearances() {
+        use super::{Appearance, LIGHT, ThemeSetting};
+        for (setting, appearance, expected) in [
+            (ThemeSetting::Dark, Appearance::Dark, &DARK),
+            (ThemeSetting::Dark, Appearance::Light, &DARK),
+            (ThemeSetting::Light, Appearance::Dark, &LIGHT),
+            (ThemeSetting::Light, Appearance::Light, &LIGHT),
+            (ThemeSetting::Automatic, Appearance::Dark, &DARK),
+            (ThemeSetting::Automatic, Appearance::Light, &LIGHT),
+        ] {
+            assert!(
+                std::ptr::eq(setting.resolve(appearance), expected),
+                "{setting:?} {appearance:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn colorfgbg_uses_the_last_ansi_background_index() {
+        use super::Appearance::{Dark, Light};
+        for (value, expected) in [
+            ("15;0", Some(Dark)),
+            ("0;15", Some(Light)),
+            ("0;7", Some(Light)),
+            ("0;8", Some(Dark)),
+            ("default;default", None),
+            ("0;16", None),
+            ("", None),
+            ("0;default;15", Some(Light)),
+            ("0;blue", None),
+            ("0; 15 ", Some(Light)),
+            ("0;+15", None),
+            ("0;000", None),
+            ("0;-1", None),
+            ("0;", None),
+        ] {
+            assert_eq!(super::appearance_from_colorfgbg(value), expected, "{value}");
+        }
+        for index in 0..=15 {
+            let expected = if index <= 6 || index == 8 {
+                Dark
+            } else {
+                Light
+            };
+            assert_eq!(
+                super::appearance_from_colorfgbg(&format!("0;{index}")),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

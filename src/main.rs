@@ -252,9 +252,10 @@ fn continue_latest_session(home: PathBuf) -> Result<(), Box<dyn Error>> {
 
 fn run_configuration(
     startup: config::StartupSnapshot,
+    appearance: theme::Appearance,
     trace_owner: TraceOwner,
 ) -> Result<(), Box<dyn Error>> {
-    let tui_result = tui::run_configuration(startup);
+    let tui_result = tui::run_configuration(startup, appearance);
     let trace_result = trace_owner.shutdown();
     tui_result?;
     trace_result?;
@@ -279,9 +280,10 @@ fn discard_open_session(session: Session, trace_owner: TraceOwner) {
 fn run_open_configuration(
     session: Session,
     startup: config::StartupSnapshot,
+    appearance: theme::Appearance,
     trace_owner: TraceOwner,
 ) -> Result<(), Box<dyn Error>> {
-    let tui_result = tui::run_configuration(startup);
+    let tui_result = tui::run_configuration(startup, appearance);
     let close_result = close_open_session(session, trace_owner);
     tui_result?;
     close_result
@@ -314,14 +316,23 @@ fn startup_skill_catalog(
     ))
 }
 
+fn startup_appearance() -> theme::Appearance {
+    std::env::var("COLORFGBG")
+        .ok()
+        .as_deref()
+        .and_then(theme::appearance_from_colorfgbg)
+        .unwrap_or(theme::Appearance::Dark)
+}
+
 fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
+    let appearance = startup_appearance();
     let disable_type_check =
         requested_type_check_disabled(std::env::var_os("KIKI_TYPE_CHECK").as_deref())?;
     let trace_owner = TraceOwner::from_path(std::env::var_os("KIKI_TRACE_FILE"))?;
     let trace = trace_owner.handle();
     let configuration = config::load();
     let Some(ready) = configuration.ready() else {
-        return run_configuration(configuration.snapshot().clone(), trace_owner);
+        return run_configuration(configuration.snapshot().clone(), appearance, trace_owner);
     };
     let startup = configuration.snapshot().clone();
     let worker_path = ready.worker_path().to_path_buf();
@@ -333,7 +344,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         ready.skills_catalog_guidance(),
         || Ok(false),
         |scope| {
-            tui::run_project_skill_trust(scope, || {
+            tui::run_project_skill_trust(scope, startup.settings().theme(), appearance, || {
                 skill_trust::save_project_skill_scope_trust(&home, scope)
                     .map_err(|error| error.to_string())
             })
@@ -361,7 +372,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         Ok(tool_host) => tool_host,
         Err(error) => {
             let configuration = configuration.with_workspace_construction_failure(error);
-            return run_configuration(configuration.snapshot().clone(), trace_owner);
+            return run_configuration(configuration.snapshot().clone(), appearance, trace_owner);
         }
     };
     let mut arena = match runtime.block_on(Arena::new(
@@ -371,7 +382,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);
-            return run_configuration(configuration.snapshot().clone(), trace_owner);
+            return run_configuration(configuration.snapshot().clone(), appearance, trace_owner);
         }
     };
     let session = Session::create_with_type_check_disabled(
@@ -407,7 +418,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         mpsc::channel::<ProgressEnvelope<RuntimeEvent>>(PROGRESS_CHANNEL_CAPACITY);
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run(
-        tui::TuiStartup::new(startup, skills_catalog),
+        tui::TuiStartup::new(startup, skills_catalog, appearance),
         providers,
         command_sender.clone(),
         event_receiver,
@@ -423,6 +434,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error>> {
+    let appearance = startup_appearance();
     let disable_type_check =
         requested_type_check_disabled(std::env::var_os("KIKI_TYPE_CHECK").as_deref())?;
     let current_root = current_workspace_root()?;
@@ -460,7 +472,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let configuration = config::load_with_session_preferences(session_preferences);
     let startup = configuration.snapshot().clone();
     let Some(ready) = configuration.ready() else {
-        return run_open_configuration(session, startup, trace_owner);
+        return run_open_configuration(session, startup, appearance, trace_owner);
     };
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
@@ -472,7 +484,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
             ready.skills_catalog_guidance(),
             || Ok(session.has_active_project_skill_in_scope(&skill_scope.canonical_scope)?),
             |scope| {
-                tui::run_project_skill_trust(scope, || {
+                tui::run_project_skill_trust(scope, startup.settings().theme(), appearance, || {
                     skill_trust::save_project_skill_scope_trust(&home, scope)
                         .map_err(|error| error.to_string())
                 })
@@ -511,7 +523,12 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         Ok(tool_host) => tool_host,
         Err(error) => {
             let configuration = configuration.with_workspace_construction_failure(error);
-            return run_open_configuration(session, configuration.snapshot().clone(), trace_owner);
+            return run_open_configuration(
+                session,
+                configuration.snapshot().clone(),
+                appearance,
+                trace_owner,
+            );
         }
     };
     let arena = match runtime.block_on(Arena::new(
@@ -521,7 +538,12 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);
-            return run_open_configuration(session, configuration.snapshot().clone(), trace_owner);
+            return run_open_configuration(
+                session,
+                configuration.snapshot().clone(),
+                appearance,
+                trace_owner,
+            );
         }
     };
     let subagents: SessionSubagents = SubagentCoordinator::new(
@@ -562,7 +584,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         mpsc::channel::<ProgressEnvelope<RuntimeEvent>>(PROGRESS_CHANNEL_CAPACITY);
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run_restored(
-        tui::TuiStartup::new(startup, skills_catalog),
+        tui::TuiStartup::new(startup, skills_catalog, appearance),
         initial,
         providers,
         command_sender.clone(),

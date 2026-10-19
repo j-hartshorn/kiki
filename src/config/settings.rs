@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use crate::theme::ThemeSetting;
+
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
@@ -203,6 +205,7 @@ pub(crate) struct SettingsContext {
     compaction: CompactionSettings,
     anthropic_cache_ttl: CacheTtl,
     cross_provider_reasoning: CrossProviderReasoning,
+    theme: ThemeSetting,
 }
 
 impl fmt::Debug for SettingsContext {
@@ -230,6 +233,7 @@ impl fmt::Debug for SettingsContext {
             .field("compaction", &self.compaction)
             .field("anthropic_cache_ttl", &self.anthropic_cache_ttl)
             .field("cross_provider_reasoning", &self.cross_provider_reasoning)
+            .field("theme", &self.theme)
             .finish()
     }
 }
@@ -263,6 +267,10 @@ impl SettingsContext {
 
     pub(crate) fn anthropic_cache_ttl(&self) -> CacheTtl {
         self.anthropic_cache_ttl
+    }
+
+    pub(crate) fn theme(&self) -> ThemeSetting {
+        self.theme
     }
 
     pub(crate) fn cross_provider_reasoning(&self) -> CrossProviderReasoning {
@@ -522,6 +530,10 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         .into_iter()
         .find_map(|layer| layer.as_ref()?.cross_provider_reasoning)
         .unwrap_or_default();
+    let theme = [&project, &user]
+        .into_iter()
+        .find_map(|layer| layer.as_ref()?.theme)
+        .unwrap_or_default();
     if let Some(session_preferences) = input.session_preferences {
         model = session_preferences.selection().model();
         model_origin = SettingsOrigin::Session;
@@ -620,6 +632,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             compaction,
             anthropic_cache_ttl,
             cross_provider_reasoning,
+            theme,
         },
         problems,
     }
@@ -758,6 +771,18 @@ fn validate_document(
             "anthropic" => {
                 validate_anthropic_table(item, &mut settings.anthropic_cache_ttl, &mut problems);
             }
+            "theme" => match item.as_str().and_then(ThemeSetting::parse) {
+                Some(theme) => settings.theme = Some(theme),
+                None => problems.push(
+                    format!(
+                        "field `theme` must be \"{}\", \"{}\" or \"{}\"",
+                        ThemeSetting::Dark.as_str(),
+                        ThemeSetting::Light.as_str(),
+                        ThemeSetting::Automatic.as_str(),
+                    ),
+                    "Set it to \"dark\", \"light\" or \"automatic\", then restart Kiki.",
+                ),
+            },
             "cross_provider_reasoning" => match item.as_str() {
                 Some("inline") => {
                     settings.cross_provider_reasoning = Some(CrossProviderReasoning::Inline);
@@ -769,7 +794,7 @@ fn validate_document(
                 ),
             },
             _ => problems.push(
-                "contains an unknown field; only `model`, `favourites`, `cross_provider_reasoning`, `[thinking]`, `[subagents]`, `[compaction]`, and `[anthropic]` are allowed",
+                "contains an unknown field; only `model`, `favourites`, `cross_provider_reasoning`, `theme`, `[thinking]`, `[subagents]`, `[compaction]`, and `[anthropic]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -1090,6 +1115,7 @@ struct FileSettings {
     compaction: FileCompactionSettings,
     anthropic_cache_ttl: Option<CacheTtl>,
     cross_provider_reasoning: Option<CrossProviderReasoning>,
+    theme: Option<ThemeSetting>,
 }
 
 #[derive(Default)]
@@ -1638,6 +1664,91 @@ mod tests {
                 .collect::<Vec<_>>(),
             [crate::config::StartupProblemKind::ProjectSettingsInvalid]
         );
+    }
+
+    #[test]
+    fn theme_defaults_to_automatic_and_project_overrides_user() {
+        use crate::theme::ThemeSetting;
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        let defaults = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(defaults.context().theme(), ThemeSetting::Automatic);
+        assert!(defaults.problems().is_empty());
+
+        write_settings(home.path(), "theme = \"light\"\n");
+        let user = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(user.context().theme(), ThemeSetting::Light);
+        assert!(user.problems().is_empty());
+
+        write_settings(project.path(), "theme = \"dark\"\n");
+        let overridden = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(overridden.context().theme(), ThemeSetting::Dark);
+        assert!(overridden.problems().is_empty());
+
+        write_settings(project.path(), "theme = \"automatic\"\n");
+        let explicit_automatic = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            explicit_automatic.context().theme(),
+            ThemeSetting::Automatic
+        );
+        assert!(explicit_automatic.problems().is_empty());
+    }
+
+    #[test]
+    fn invalid_project_theme_reports_one_problem_and_preserves_user_theme() {
+        use crate::theme::ThemeSetting;
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(home.path(), "theme = \"light\"\n");
+        write_settings(
+            project.path(),
+            "model = \"openai/gpt-5.6-terra\"\ntheme = \"blue\"\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(resolution.context().theme(), ThemeSetting::Light);
+        assert_eq!(resolution.model().id, SOL.id);
+        let [problem] = resolution.problems() else {
+            panic!("expected one project problem");
+        };
+        assert_eq!(
+            problem.kind(),
+            crate::config::StartupProblemKind::ProjectSettingsInvalid
+        );
+        for choice in ["dark", "light", "automatic"] {
+            assert!(
+                problem.diagnostic().contains(choice),
+                "{}",
+                problem.diagnostic()
+            );
+        }
+    }
+
+    #[test]
+    fn theme_values_are_validated_with_supported_choices() {
+        let home = tempdir().expect("home directory");
+        for value in ["\"light\"", "\"dark\"", "\"automatic\""] {
+            write_settings(home.path(), &format!("theme = {value}\n"));
+            let resolution = resolve(input(Some(home.path()), None));
+            assert!(resolution.problems().is_empty(), "{value}");
+        }
+        for value in ["\"blue\"", "1"] {
+            write_settings(home.path(), &format!("theme = {value}\n"));
+            let resolution = resolve(input(Some(home.path()), None));
+            let [problem] = resolution.problems() else {
+                panic!("expected one problem for {value}");
+            };
+            assert_eq!(
+                problem.kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid
+            );
+            for choice in ["dark", "light", "automatic"] {
+                assert!(
+                    problem.diagnostic().contains(choice),
+                    "{}",
+                    problem.diagnostic()
+                );
+            }
+        }
     }
 
     #[test]

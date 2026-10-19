@@ -41,7 +41,7 @@ use crate::runtime::{
 use crate::selection::{DocumentPosition, Selection};
 use crate::skills::{SkillCatalog, SkillDiagnostic, SkillLookupError};
 use crate::telemetry::{Trace, TraceEvent};
-use crate::theme::{self, Theme};
+use crate::theme::{self, Appearance, Theme, ThemeSetting};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
@@ -198,6 +198,7 @@ struct ThinkingPreview {
 
 struct App {
     theme: &'static Theme,
+    appearance: Appearance,
     mode: AppMode,
     prompt: PromptEditor,
     prompt_width: u16,
@@ -255,6 +256,7 @@ impl Default for App {
             .expect("default model thinking must be supported");
         Self {
             theme: &theme::DARK,
+            appearance: Appearance::Dark,
             mode: AppMode::Configured,
             prompt: PromptEditor::default(),
             prompt_width: 80,
@@ -359,6 +361,16 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
 }
 
 impl App {
+    fn with_appearance(mut self, appearance: Appearance) -> Self {
+        self.appearance = appearance;
+        self.theme = self
+            .settings
+            .as_ref()
+            .map_or(ThemeSetting::Automatic, SettingsContext::theme)
+            .resolve(self.appearance);
+        self
+    }
+
     fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
         self.transcript
             .append_metadata(skill_diagnostic_report(&catalog));
@@ -385,6 +397,7 @@ impl App {
             .and_then(Path::parent)
             .map(Path::to_path_buf);
         Self {
+            theme: settings.theme().resolve(Appearance::Dark),
             transcript: Transcript::configured(startup),
             settings: Some(settings),
             workspace_root,
@@ -2168,13 +2181,19 @@ fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
 
 pub(crate) struct TuiStartup {
     snapshot: StartupSnapshot,
+    appearance: Appearance,
     skills_catalog: Arc<SkillCatalog>,
 }
 
 impl TuiStartup {
-    pub(crate) fn new(snapshot: StartupSnapshot, skills_catalog: Arc<SkillCatalog>) -> Self {
+    pub(crate) fn new(
+        snapshot: StartupSnapshot,
+        skills_catalog: Arc<SkillCatalog>,
+        appearance: Appearance,
+    ) -> Self {
         Self {
             snapshot,
+            appearance,
             skills_catalog,
         }
     }
@@ -2208,8 +2227,9 @@ pub(crate) fn run_restored(
     mut progress: RuntimeProgressReceiver,
     trace: Trace,
 ) -> Result<(), TuiError> {
-    let mut app =
-        App::restored(startup.snapshot, &initial).with_skill_catalog(startup.skills_catalog);
+    let mut app = App::restored(startup.snapshot, &initial)
+        .with_appearance(startup.appearance)
+        .with_skill_catalog(startup.skills_catalog);
     app.providers = providers;
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
@@ -2244,8 +2264,11 @@ pub(crate) fn run_restored(
     )
 }
 
-pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError> {
-    let mut app = App::configuration(startup);
+pub(crate) fn run_configuration(
+    startup: StartupSnapshot,
+    appearance: Appearance,
+) -> Result<(), TuiError> {
+    let mut app = App::configuration(startup).with_appearance(appearance);
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
     let mut titles = TerminalTitlePublisher;
@@ -2263,6 +2286,8 @@ pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError
 
 pub(crate) fn run_project_skill_trust(
     scope: &Path,
+    setting: ThemeSetting,
+    appearance: Appearance,
     mut save: impl FnMut() -> Result<(), String>,
 ) -> Result<bool, TuiError> {
     let mut input = CrosstermEvents;
@@ -2271,7 +2296,13 @@ pub(crate) fn run_project_skill_trust(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
         |terminal| {
-            trusted = run_project_skill_trust_loop(terminal, &mut input, scope, &mut save)?;
+            trusted = run_project_skill_trust_loop(
+                terminal,
+                &mut input,
+                scope,
+                setting.resolve(appearance),
+                &mut save,
+            )?;
             Ok(())
         },
     )?;
@@ -2282,6 +2313,7 @@ fn run_project_skill_trust_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     input: &mut impl EventSource,
     scope: &Path,
+    theme: &Theme,
     mut save: impl FnMut() -> Result<(), String>,
 ) -> Result<bool, TuiError> {
     let mut trust_selected = false;
@@ -2294,7 +2326,7 @@ fn run_project_skill_trust_loop<B: Backend>(
             terminal
                 .draw(|frame| {
                     visible_path_rows = render_project_skill_trust(
-                        &theme::DARK,
+                        theme,
                         frame,
                         scope,
                         trust_selected,
@@ -3402,6 +3434,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/canonical/repository"),
+            &DARK,
             || {
                 saved.set(true);
                 Ok(())
@@ -3440,6 +3473,7 @@ mod tests {
                 &mut terminal,
                 &mut input,
                 Path::new("/canonical/project"),
+                &DARK,
                 || panic!("modified or release key must not select Trust"),
             )
             .unwrap();
@@ -3461,6 +3495,7 @@ mod tests {
                 &mut terminal,
                 &mut input,
                 Path::new("/canonical/project"),
+                &DARK,
                 || panic!("modified or release Enter must not confirm Trust"),
             )
             .unwrap();
@@ -3476,6 +3511,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/project/line\n\u{202e}tail"),
+            &DARK,
             || panic!("default Skip must not save"),
         )
         .unwrap();
@@ -3496,9 +3532,13 @@ mod tests {
         let path = format!("/project/{}/VISIBLE-SUFFIX", "a".repeat(240));
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
-        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
-            panic!("default Skip must not save")
-        })
+        super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new(&path),
+            &DARK,
+            || panic!("default Skip must not save"),
+        )
         .unwrap();
         let initial = terminal
             .backend()
@@ -3515,9 +3555,13 @@ mod tests {
             Some(Event::Key(key(KeyCode::PageDown))),
             Some(Event::Key(key(KeyCode::Enter))),
         ]);
-        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
-            panic!("default Skip must not save")
-        })
+        super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new(&path),
+            &DARK,
+            || panic!("default Skip must not save"),
+        )
         .unwrap();
         let scrolled = terminal
             .backend()
@@ -3542,6 +3586,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/canonical/repository"),
+            &DARK,
             || {
                 saved.set(saved.get() + 1);
                 Ok(())
@@ -3562,6 +3607,7 @@ mod tests {
             &mut terminal,
             &mut input,
             Path::new("/canonical/repository"),
+            &DARK,
             || {
                 saved.set(saved.get() + 1);
                 Err("could not save project skill trust (PermissionDenied)".to_owned())
@@ -3595,6 +3641,7 @@ mod tests {
                 &mut terminal,
                 &mut input,
                 Path::new("/canonical/repository"),
+                &DARK,
                 || panic!("cancel must not save trust"),
             )
             .unwrap();
@@ -8307,6 +8354,46 @@ mod tests {
     }
 
     #[test]
+    fn theme_setting_controls_user_card_background() {
+        use crate::theme::{Appearance, LIGHT};
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        fs::create_dir(home.path().join(".kiki")).unwrap();
+        for (setting, appearance, expected) in [
+            ("light", Appearance::Dark, LIGHT.user_message_bg),
+            ("automatic", Appearance::Light, LIGHT.user_message_bg),
+            ("automatic", Appearance::Dark, DARK.user_message_bg),
+        ] {
+            fs::write(
+                home.path().join(".kiki/config.toml"),
+                format!("theme = {setting:?}\n"),
+            )
+            .unwrap();
+            let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+                Some(home.path()),
+                workspace.path(),
+            ))
+            .with_appearance(appearance);
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "themed user card".to_owned(),
+                        selection: None,
+                    },
+                },
+                progress_gap: false,
+            });
+            let buffer = rendered_buffer(&mut app, 80, 20);
+            assert_eq!(
+                buffer[cell_start(&buffer, "themed user card")].bg,
+                expected,
+                "{setting} {appearance:?}"
+            );
+        }
+    }
+
+    #[test]
     fn configuration_configured_mode_renders_a_ready_snapshot_and_remains_editable() {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
@@ -8381,8 +8468,10 @@ mod tests {
 
     #[test]
     fn configuration_entry_requires_only_a_startup_snapshot() {
-        let _: fn(crate::config::StartupSnapshot) -> Result<(), super::TuiError> =
-            super::run_configuration;
+        let _: fn(
+            crate::config::StartupSnapshot,
+            crate::theme::Appearance,
+        ) -> Result<(), super::TuiError> = super::run_configuration;
     }
 
     #[test]
