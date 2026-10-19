@@ -504,7 +504,7 @@ impl GoogleModel {
                 }
                 WireEvent::InteractionCompleted { interaction } => {
                     validate_echoed_model(interaction.model.as_deref(), model)?;
-                    message.status = Some(interaction.status);
+                    message.status = interaction.status;
                     message
                         .usage
                         .update_interaction(interaction.service_tier, interaction.usage);
@@ -1195,7 +1195,7 @@ enum WireEvent {
 #[derive(Deserialize)]
 struct WireInteraction {
     model: Option<String>,
-    status: String,
+    status: Option<String>,
     service_tier: Option<String>,
     usage: Option<WireUsage>,
 }
@@ -1875,6 +1875,53 @@ mod tests {
                 ("Summarising".to_owned(), "Done.".to_owned(), String::new())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn flash_stream_accepts_creation_without_status() {
+        let created = sse([json!({
+            "event_type": "interaction.created",
+            "interaction": {"object": "interaction", "model": "gemini-3.8-flash"}
+        })]);
+        let selection = ModelSelection::new(&GEMINI_3_8_FLASH, "medium").unwrap();
+        for (body, expected) in [
+            (tool_stream(), tool_steps()),
+            (message_stream(), message_steps()),
+        ] {
+            assert!(body.starts_with(&sse([interaction_created()])));
+            let body = body
+                .replacen(&sse([interaction_created()]), &created, 1)
+                .replace("gemini-4-argon", "gemini-3.8-flash");
+            let fixture = Fixture::start(FixtureReply::OwnedSse(body)).await;
+
+            let (result, _) = step_with(&fixture, KEY, selection, &history("inspect")).await;
+            let step = result.unwrap();
+
+            assert_eq!(replay_values(&step.replay), expected);
+            assert_eq!(fixture.request_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_rejects_completion_without_status() {
+        let events = vec![interaction_created()]
+            .into_iter()
+            .chain(model_output(0, "Done."))
+            .chain([json!({
+                "event_type": "interaction.completed",
+                "interaction": {"model": "gemini-4-argon", "usage": final_usage()}
+            })]);
+        let fixture = Fixture::start(FixtureReply::OwnedSse(sse(events))).await;
+
+        let (result, _) = step(&fixture, &history("inspect")).await;
+        let failure = result.unwrap_err();
+
+        assert_eq!(
+            failure.error(),
+            &ModelError::InvalidResponse("interaction completed without a terminal status")
+        );
+        assert_eq!(failure.attempts(), &[expected_accounting()]);
+        assert_eq!(fixture.request_count(), 1);
     }
 
     #[tokio::test]
@@ -3721,6 +3768,14 @@ mod tests {
     #[ignore = "requires explicit GEMINI_API_KEY, KIKI_MODEL=google/gemini-4-argon and MONTY_BIN"]
     async fn live_argon() {
         if let Err(message) = crate::openai::tests::run_live_smoke_test(&GEMINI_4_ARGON).await {
+            panic!("{message}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit GEMINI_API_KEY, KIKI_MODEL=google/gemini-3.8-flash and MONTY_BIN"]
+    async fn live_flash() {
+        if let Err(message) = crate::openai::tests::run_live_smoke_test(&GEMINI_3_8_FLASH).await {
             panic!("{message}");
         }
     }
