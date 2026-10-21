@@ -2255,6 +2255,7 @@ impl SettledBlock {
 }
 
 struct SettledRaster {
+    theme: &'static Theme,
     buffer: Buffer,
     regions: Vec<SelectableRegion>,
 }
@@ -3152,10 +3153,9 @@ impl Transcript {
         );
         for settled in &mut self.settled_blocks {
             if use_cache
-                && let Some(raster) = settled
-                    .raster
-                    .as_ref()
-                    .filter(|raster| raster.buffer.area.width == width)
+                && let Some(raster) = settled.raster.as_ref().filter(|raster| {
+                    raster.buffer.area.width == width && std::ptr::eq(raster.theme, theme)
+                })
             {
                 blocks.push(LayoutBlock::Cached(Arc::clone(raster)));
                 continue;
@@ -3175,6 +3175,7 @@ impl Transcript {
             );
             let block = if use_cache {
                 match rasterise(
+                    theme,
                     render_block,
                     width,
                     #[cfg(test)]
@@ -3898,6 +3899,7 @@ fn build_render_block(
 }
 
 fn rasterise(
+    theme: &'static Theme,
     block: RenderBlock,
     width: u16,
     #[cfg(test)] construction_counts: &mut ConstructionCounts,
@@ -3914,7 +3916,11 @@ fn rasterise(
         construction_counts.selection_region_builds += 1;
     }
     let regions = block.selectable_regions(area, 0, 0, CardId::new(0), &buffer);
-    Ok(Arc::new(SettledRaster { buffer, regions }))
+    Ok(Arc::new(SettledRaster {
+        theme,
+        buffer,
+        regions,
+    }))
 }
 
 fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
@@ -4806,7 +4812,7 @@ pub(crate) fn normalise_terminal_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::theme::DARK;
+    use crate::theme::{DARK, LIGHT};
 
     use std::path::PathBuf;
     use std::time::Duration;
@@ -7756,6 +7762,34 @@ mod tests {
                     .is_some_and(|raster| raster.buffer.area.width == width)
             }));
         }
+
+        let before_light = transcript.construction_counts();
+        let light_layout = transcript.layout(&LIGHT, 48);
+        let light = transcript.construction_counts();
+        assert_eq!(
+            light.rasterisations,
+            before_light.rasterisations + block_count
+        );
+        assert_eq!(light.markdown, before_light.markdown + 2);
+        assert_eq!(light.highlighting, before_light.highlighting + 1);
+        assert_eq!(
+            light.render_block_builds,
+            before_light.render_block_builds + block_count
+        );
+        assert_eq!(
+            light.selection_region_builds,
+            before_light.selection_region_builds + block_count
+        );
+        let height = u16::try_from(light_layout.total_height()).expect("test transcript height");
+        let light_buffer = layout_buffer(&light_layout, Rect::new(0, 0, 48, height), 0, None);
+        assert_row_background(
+            &light_buffer,
+            row_containing(&light_buffer, "cached request"),
+            LIGHT.user_message_bg,
+        );
+
+        transcript.layout(&LIGHT, 48);
+        assert_eq!(transcript.construction_counts(), light);
     }
 
     #[test]
