@@ -10271,7 +10271,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::FinalMessage {
                     step_id: ModelStepId(1),
-                    text: "done".to_owned(),
+                    text: "done ".repeat(60),
                     reasoning_summary: String::new(),
                     terminal: TerminalDetails::empty(),
                 },
@@ -10432,6 +10432,12 @@ mod tests {
             HistoryPosition::Anchored(app.newest_history_top().saturating_sub(2))
         );
         rendered_buffer(&mut app, 40, 7);
+        assert!(app.tick(now + Duration::from_millis(150)).visible_changed);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(3))
+        );
+        rendered_buffer(&mut app, 40, 7);
 
         app.handle_mouse(
             mouse_event(
@@ -10439,10 +10445,10 @@ mod tests {
                 column,
                 viewport.area.top(),
             ),
-            now + Duration::from_millis(100),
+            now + Duration::from_millis(150),
         );
         assert!(app.drag.is_none());
-        assert!(!app.tick(now + Duration::from_millis(150)).visible_changed);
+        assert!(!app.tick(now + Duration::from_millis(200)).visible_changed);
         let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
         let mut clipboard = FakeClipboard::available();
         super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();

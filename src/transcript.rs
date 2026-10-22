@@ -1027,7 +1027,6 @@ fn selectable_text_regions(
     text: &Text<'_>,
     placement: TextPlacement,
     card: CardId,
-    skip_leading_lines: usize,
     buffer: &Buffer,
 ) -> Vec<SelectableRegion> {
     if placement.width == 0 {
@@ -1036,19 +1035,17 @@ fn selectable_text_regions(
 
     let mut regions = Vec::new();
     let mut line_top = placement.text_top;
-    for (index, line) in text.lines.iter().enumerate() {
+    for line in &text.lines {
         let line_text = Text::from(line.clone());
         let line_height = Paragraph::new(line.clone())
             .wrap(Wrap { trim: false })
             .line_count(placement.width);
-        if index >= skip_leading_lines
-            && let Some(clip) = vertical_clip(
-                line_top,
-                line_height,
-                placement.top,
-                placement.viewport.height,
-            )
-        {
+        if let Some(clip) = vertical_clip(
+            line_top,
+            line_height,
+            placement.top,
+            placement.viewport.height,
+        ) {
             let breaks = RowBreaks::for_rows(
                 &line_text,
                 placement.width,
@@ -1140,7 +1137,6 @@ impl ArenaText {
                 x,
             },
             card,
-            0,
             buffer,
         )
     }
@@ -1705,7 +1701,6 @@ impl RenderBlock {
             right_padding,
             top_padding: vertical_padding,
             bottom_padding: vertical_padding,
-            skip_leading_selection_lines: 0,
             height: content_height.saturating_add(usize::from(vertical_padding).saturating_mul(2)),
         })
     }
@@ -1715,13 +1710,6 @@ impl RenderBlock {
             Self::Card(card) => card.height,
             Self::Arena(arena) => arena.height,
         }
-    }
-
-    fn skip_leading_selection_lines(mut self, count: usize) -> Self {
-        if let Self::Card(card) = &mut self {
-            card.skip_leading_selection_lines = count;
-        }
-        self
     }
 
     fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
@@ -1753,7 +1741,6 @@ struct CardRenderBlock {
     right_padding: u16,
     top_padding: u16,
     bottom_padding: u16,
-    skip_leading_selection_lines: usize,
     height: usize,
 }
 
@@ -1779,7 +1766,6 @@ impl CardRenderBlock {
                 x: self.left_padding,
             },
             card,
-            self.skip_leading_selection_lines,
             buffer,
         )
     }
@@ -2334,6 +2320,8 @@ impl LayoutBlock {
     }
 }
 
+const BLOCK_GAP: usize = 1;
+
 pub(crate) struct TranscriptLayout {
     page_style: Style,
     blocks: Vec<LayoutBlock>,
@@ -2396,8 +2384,7 @@ impl TranscriptLayout {
         let selection =
             selection.and_then(|selection| selection.project(Viewport::new(viewport, top)));
         let mut regions = Vec::new();
-        let mut block_top = 0_usize;
-        for (index, block) in self.blocks.iter().enumerate() {
+        for (index, block_top, block) in self.placed_blocks() {
             if block_top >= top.saturating_add(usize::from(viewport.height)) {
                 break;
             }
@@ -2411,7 +2398,6 @@ impl TranscriptLayout {
                     buffer,
                 ));
             }
-            block_top = block_top.saturating_add(block.height());
         }
         if let Some(selection) = selection {
             highlight(buffer, selection, &regions);
@@ -2426,8 +2412,7 @@ impl TranscriptLayout {
         }
 
         let mut extraction = Extraction::new();
-        let mut block_top = 0_usize;
-        for (index, block) in self.blocks.iter().enumerate() {
+        for (index, block_top, block) in self.placed_blocks() {
             let block_bottom = block_top.saturating_add(block.height());
             let mut chunk_top = block_top;
             while chunk_top < block_bottom {
@@ -2453,10 +2438,33 @@ impl TranscriptLayout {
                 }
                 chunk_top = chunk_bottom;
             }
-            block_top = block_bottom;
         }
         extraction.finish()
     }
+
+    fn placed_blocks(&self) -> impl Iterator<Item = (usize, usize, &LayoutBlock)> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .scan(0_usize, |next_top, (index, block)| {
+                let block_top = *next_top;
+                *next_top = block_top
+                    .saturating_add(block.height())
+                    .saturating_add(BLOCK_GAP);
+                Some((index, block_top, block))
+            })
+    }
+}
+
+fn stacked_height(heights: impl IntoIterator<Item = usize>) -> usize {
+    heights
+        .into_iter()
+        .fold(None, |total: Option<usize>, height| {
+            Some(total.map_or(height, |total| {
+                total.saturating_add(BLOCK_GAP).saturating_add(height)
+            }))
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3206,9 +3214,7 @@ impl Transcript {
                 None,
             )));
         }
-        let total_height = blocks.iter().fold(0_usize, |height, block| {
-            height.saturating_add(block.height())
-        });
+        let total_height = stacked_height(blocks.iter().map(LayoutBlock::height));
         TranscriptLayout {
             page_style: page_style(theme),
             blocks,
@@ -3861,7 +3867,7 @@ fn build_render_block(
             page_style(theme),
             width,
             0,
-            1,
+            0,
         ),
         NormalisedBlock::Status { text } => RenderBlock::card(
             own_styled_text(Text::raw(text.as_str()), page_style(theme)),
@@ -3884,17 +3890,13 @@ fn build_render_block(
             Text {
                 alignment: None,
                 style: page_style(theme),
-                lines: vec![
-                    Line::raw(""),
-                    accounting_line(text.clone(), muted_page_style(theme)),
-                ],
+                lines: vec![accounting_line(text.clone(), muted_page_style(theme))],
             },
             page_style(theme),
             width,
             0,
             0,
-        )
-        .skip_leading_selection_lines(1),
+        ),
     }
 }
 
@@ -4828,8 +4830,8 @@ mod tests {
         LayoutBlock, LivePhase, ModelFooter, NormalisedBlock, RenderBlock, SubagentCardPhase,
         SubagentFinishedCard, SubagentSpawnedCard, Transcript, TranscriptBlock, TranscriptLayout,
         assistant_text, format_footer_usd, format_token_count, markdown, muted_page_style,
-        normalise_terminal_text, own_styled_text, page_style, step_accounting, subagent_preview,
-        tool_call_label,
+        normalise_terminal_text, own_styled_text, page_style, stacked_height, step_accounting,
+        subagent_preview, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -5852,6 +5854,55 @@ mod tests {
         assert_eq!(
             copied_text(&mut transcript, 80),
             "request 1\n\nanswer\n\nModel selected: openai/gpt-5.6-terra · high\n\nrequest 2\n\nanswer"
+        );
+    }
+
+    #[test]
+    fn one_page_row_separates_consecutive_blocks() {
+        let mut records = run_records(&[None, None]);
+        let Record::FinalMessage {
+            reasoning_summary, ..
+        } = &mut records[1].record
+        else {
+            unreachable!("run_records pairs requests with final messages");
+        };
+        *reasoning_summary = "thought".to_owned();
+        let mut transcript = Transcript::default();
+        append_records(&mut transcript, records);
+
+        let buffer = rendered_buffer(&mut transcript, 20);
+        let rows = (0..usize::from(buffer.area.height))
+            .map(|row| {
+                (
+                    row_text(&buffer, row).trim().to_owned(),
+                    buffer[(0, row as u16)].bg,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let user = DARK.user_message_bg;
+        let card = DARK.card_bg;
+        let page = Color::Reset;
+        let row = |text: &str, bg: Color| (text.to_owned(), bg);
+        assert_eq!(
+            rows,
+            [
+                row("", user),
+                row("request 1", user),
+                row("", user),
+                row("", page),
+                row("", card),
+                row("thought", card),
+                row("", card),
+                row("", page),
+                row("answer", page),
+                row("", page),
+                row("", user),
+                row("request 2", user),
+                row("", user),
+                row("", page),
+                row("answer", page),
+            ]
         );
     }
 
@@ -8127,15 +8178,15 @@ line 66"
 
         assert_eq!(
             layout.extract_selection(Selection::new(
-                DocumentPosition::new(1, 2),
-                DocumentPosition::new(1, 4),
+                DocumentPosition::new(0, 2),
+                DocumentPosition::new(0, 4),
             )),
             "你🦀"
         );
         assert_eq!(
             layout.extract_selection(Selection::new(
-                DocumentPosition::new(1, 5),
-                DocumentPosition::new(1, 6),
+                DocumentPosition::new(0, 5),
+                DocumentPosition::new(0, 6),
             )),
             "e\u{301}"
         );
@@ -11232,13 +11283,13 @@ truncated"
             .collect::<Vec<_>>();
         let layout = TranscriptLayout {
             page_style: page_style(&DARK),
-            total_height: blocks.iter().map(RenderBlock::height).sum(),
+            total_height: stacked_height(blocks.iter().map(RenderBlock::height)),
             width: 20,
             blocks: blocks.into_iter().map(LayoutBlock::Fresh).collect(),
             footer: None,
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
-        layout.render(buffer.area, 1, &mut buffer);
+        layout.render(buffer.area, 2, &mut buffer);
         let rendered = buffer
             .content
             .iter()
@@ -13491,7 +13542,7 @@ truncated"
         assert_eq!((reasoning.top_padding, reasoning.bottom_padding), (1, 1));
         let assistant = card_with_text(&layout.blocks, "assistant response");
         assert_eq!((assistant.left_padding, assistant.right_padding), (0, 0));
-        assert_eq!((assistant.top_padding, assistant.bottom_padding), (1, 1));
+        assert_eq!((assistant.top_padding, assistant.bottom_padding), (0, 0));
 
         let buffer = rendered_buffer(&mut transcript, 64);
         let user_row = row_containing(&buffer, "user request");
