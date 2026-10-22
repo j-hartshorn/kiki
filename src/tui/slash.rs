@@ -5,7 +5,9 @@ pub(super) enum Action {
     Compact,
     Model,
     Name,
+    Settings,
     Skill,
+    Theme,
     Tree,
     Thinking,
 }
@@ -15,33 +17,51 @@ struct Command {
     token: &'static str,
     purpose: &'static str,
     action: Action,
+    takes_argument: bool,
 }
 
-const CATALOGUE: [Command; 5] = [
+const CATALOGUE: [Command; 7] = [
     Command {
         token: "/compact",
         purpose: "Compact context",
         action: Action::Compact,
+        takes_argument: true,
     },
     Command {
         token: "/model",
         purpose: "Choose model",
         action: Action::Model,
+        takes_argument: true,
     },
     Command {
         token: "/name",
         purpose: "Name session",
         action: Action::Name,
+        takes_argument: true,
+    },
+    Command {
+        token: "/settings",
+        purpose: "Open settings",
+        action: Action::Settings,
+        takes_argument: false,
+    },
+    Command {
+        token: "/theme",
+        purpose: "Choose theme",
+        action: Action::Theme,
+        takes_argument: false,
     },
     Command {
         token: "/thinking",
         purpose: "Choose thinking level",
         action: Action::Thinking,
+        takes_argument: true,
     },
     Command {
         token: "/tree",
         purpose: "Navigate session history",
         action: Action::Tree,
+        takes_argument: true,
     },
 ];
 
@@ -69,6 +89,7 @@ pub(super) fn parse(draft: &str) -> Option<Parsed<'_>> {
         draft
             .strip_prefix(command.token)
             .and_then(slash_argument)
+            .filter(|argument| command.takes_argument || argument.is_empty())
             .map(|argument| Parsed {
                 action: command.action,
                 argument,
@@ -279,6 +300,8 @@ mod tests {
                 ("/compact", "Compact context"),
                 ("/model", "Choose model"),
                 ("/name", "Name session"),
+                ("/settings", "Open settings"),
+                ("/theme", "Choose theme"),
                 ("/thinking", "Choose thinking level"),
                 ("/tree", "Navigate session history"),
             ]
@@ -298,6 +321,10 @@ mod tests {
             ("/model", Action::Model, "", 0..6),
             ("/model  terra\t", Action::Model, "terra", 0..6),
             ("/name  A session  ", Action::Name, "A session", 0..5),
+            ("/settings", Action::Settings, "", 0..9),
+            ("/settings \t ", Action::Settings, "", 0..9),
+            ("/theme", Action::Theme, "", 0..6),
+            ("/theme \t ", Action::Theme, "", 0..6),
             ("/thinking\t high", Action::Thinking, "high", 0..9),
             ("/tree", Action::Tree, "", 0..5),
             ("/tree  auth\t", Action::Tree, "auth", 0..5),
@@ -315,6 +342,12 @@ mod tests {
             "/models",
             "/compact-more",
             "/namex",
+            "/settings theme",
+            "/settings-more",
+            "/settings\n",
+            "/theme dark",
+            "/theme-more",
+            "/theme\n",
             "/thinking-more",
             "/tree-more",
             "/tree\nauth",
@@ -332,12 +365,27 @@ mod tests {
             (
                 "/",
                 true,
-                vec!["/compact", "/model", "/name", "/thinking", "/tree"],
+                vec![
+                    "/compact",
+                    "/model",
+                    "/name",
+                    "/settings",
+                    "/theme",
+                    "/thinking",
+                    "/tree",
+                ],
             ),
             ("/co", true, vec!["/compact"]),
             ("/mo", true, vec!["/model"]),
             ("/model", true, vec![]),
             ("/model ", true, vec![]),
+            ("/se", true, vec!["/settings"]),
+            ("/settings", true, vec![]),
+            ("/settings ", true, vec![]),
+            ("/th", true, vec!["/theme", "/thinking"]),
+            ("/the", true, vec!["/theme"]),
+            ("/theme", true, vec![]),
+            ("/theme ", true, vec![]),
             ("/tr", true, vec!["/tree"]),
             ("/tree auth", true, vec![]),
             ("/M", true, vec![]),

@@ -207,6 +207,7 @@ pub(crate) struct SettingsContext {
     anthropic_cache_ttl: CacheTtl,
     cross_provider_reasoning: CrossProviderReasoning,
     theme: ThemeSetting,
+    theme_set_by_project: bool,
 }
 
 impl fmt::Debug for SettingsContext {
@@ -235,6 +236,7 @@ impl fmt::Debug for SettingsContext {
             .field("anthropic_cache_ttl", &self.anthropic_cache_ttl)
             .field("cross_provider_reasoning", &self.cross_provider_reasoning)
             .field("theme", &self.theme)
+            .field("theme_set_by_project", &self.theme_set_by_project)
             .finish()
     }
 }
@@ -287,6 +289,20 @@ impl SettingsContext {
             Ok(())
         })?;
         Ok(self.model_save_outcome())
+    }
+
+    pub(crate) fn save_theme(&self, theme: ThemeSetting) -> Result<SaveOutcome, SaveError> {
+        update_user_document(self.user_path(), |document| {
+            replace_string(&mut document["theme"], theme.as_str());
+            Ok(())
+        })?;
+        Ok(if self.theme_set_by_project {
+            SaveOutcome::SavedButMasked {
+                by: SettingsOrigin::Project,
+            }
+        } else {
+            SaveOutcome::Saved
+        })
     }
 
     pub(crate) fn save_thinking(
@@ -535,6 +551,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         .into_iter()
         .find_map(|layer| layer.as_ref()?.theme)
         .unwrap_or_default();
+    let theme_set_by_project = project.as_ref().and_then(|layer| layer.theme).is_some();
     if let Some(session_preferences) = input.session_preferences {
         model = session_preferences.selection().model();
         model_origin = SettingsOrigin::Session;
@@ -634,6 +651,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             anthropic_cache_ttl,
             cross_provider_reasoning,
             theme,
+            theme_set_by_project,
         },
         problems,
     }
@@ -2799,6 +2817,84 @@ mod tests {
             fs::read_to_string(home.path().join(".kiki/config.toml")).expect("saved user settings");
         assert!(user.contains("model = \"openai/gpt-5.6-sol\""));
         assert!(user.contains("\"openai/gpt-5.6-terra\" = \"low\""));
+    }
+
+    #[test]
+    fn saving_theme_writes_root_key_preserves_comments_and_reports_project_masking() {
+        use crate::theme::ThemeSetting;
+
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(
+            home.path(),
+            "# keep this comment\nmodel = \"openai/gpt-5.6-sol\" # keep this too\ntheme = \"dark\" # keep theme comment\ncross_provider_reasoning = \"inline\" # preserved\n\n[thinking]\n\"openai/gpt-5.6-luna\" = \"low\" # untouched\n\n[subagents] # keep this table\nallow_nested = false # untouched\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        let context = resolution.context();
+
+        for (setting, expected) in [
+            (
+                ThemeSetting::Light,
+                "theme = \"light\" # keep theme comment",
+            ),
+            (
+                ThemeSetting::Automatic,
+                "theme = \"automatic\" # keep theme comment",
+            ),
+            (ThemeSetting::Dark, "theme = \"dark\" # keep theme comment"),
+        ] {
+            assert_eq!(
+                context.save_theme(setting).unwrap(),
+                super::SaveOutcome::Saved
+            );
+            let content =
+                fs::read_to_string(context.user_path().expect("user path")).expect("saved");
+            assert!(content.contains("# keep this comment"));
+            assert!(content.contains("model = \"openai/gpt-5.6-sol\" # keep this too"));
+            assert!(content.contains(expected), "{content}");
+            assert!(content.contains("cross_provider_reasoning = \"inline\" # preserved"));
+            assert!(content.contains("\"openai/gpt-5.6-luna\" = \"low\" # untouched"));
+            assert!(content.contains("[subagents] # keep this table"));
+            assert!(content.contains("allow_nested = false # untouched"));
+
+            let reloaded = resolve(input(Some(home.path()), Some(project.path())));
+            assert_eq!(reloaded.context().theme(), setting);
+            assert!(reloaded.problems().is_empty());
+        }
+
+        write_settings(
+            home.path(),
+            "[thinking]\n\"openai/gpt-5.6-sol\" = \"low\"\n",
+        );
+        let root_resolution = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            root_resolution
+                .context()
+                .save_theme(ThemeSetting::Light)
+                .unwrap(),
+            super::SaveOutcome::Saved
+        );
+        let reloaded = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(reloaded.context().theme(), ThemeSetting::Light);
+        assert_eq!(reloaded.context().thinking_for(&SOL), Some("low"));
+        assert!(reloaded.problems().is_empty());
+
+        write_settings(project.path(), "theme = \"dark\"\n");
+        let masked_resolution = resolve(input(Some(home.path()), Some(project.path())));
+        let outcome = masked_resolution
+            .context()
+            .save_theme(ThemeSetting::Light)
+            .expect("masked theme save");
+        assert_eq!(
+            outcome,
+            super::SaveOutcome::SavedButMasked {
+                by: super::SettingsOrigin::Project
+            }
+        );
+        assert_eq!(
+            outcome.to_string(),
+            "User default saved; currently overridden by project settings."
+        );
     }
 }
 

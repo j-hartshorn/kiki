@@ -187,6 +187,8 @@ struct Flash {
 enum PickerValue {
     Model(&'static ModelConfiguration),
     Thinking(&'static str),
+    Theme(ThemeSetting),
+    OpenThemePicker,
 }
 
 #[derive(Clone, Copy)]
@@ -198,6 +200,7 @@ struct ThinkingPreview {
 
 struct App {
     theme: &'static Theme,
+    theme_setting: ThemeSetting,
     appearance: Appearance,
     mode: AppMode,
     prompt: PromptEditor,
@@ -236,6 +239,7 @@ struct App {
     session_thinking: BTreeMap<&'static str, &'static str>,
     providers: Vec<Provider>,
     picker: Option<Picker<PickerValue>>,
+    return_to_settings: bool,
     tree_navigator: Option<TreeNavigator>,
     manual_navigation_pending: bool,
     next_tree_revision: u64,
@@ -256,6 +260,7 @@ impl Default for App {
             .expect("default model thinking must be supported");
         Self {
             theme: &theme::DARK,
+            theme_setting: ThemeSetting::Automatic,
             appearance: Appearance::Dark,
             mode: AppMode::Configured,
             prompt: PromptEditor::default(),
@@ -294,6 +299,7 @@ impl Default for App {
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
             providers: vec![Provider::OpenAi, Provider::Anthropic, Provider::Google],
             picker: None,
+            return_to_settings: false,
             tree_navigator: None,
             manual_navigation_pending: false,
             next_tree_revision: 0,
@@ -363,11 +369,7 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
 impl App {
     fn with_appearance(mut self, appearance: Appearance) -> Self {
         self.appearance = appearance;
-        self.theme = self
-            .settings
-            .as_ref()
-            .map_or(ThemeSetting::Automatic, SettingsContext::theme)
-            .resolve(self.appearance);
+        self.theme = self.theme_setting.resolve(self.appearance);
         self
     }
 
@@ -396,8 +398,10 @@ impl App {
             .and_then(Path::parent)
             .and_then(Path::parent)
             .map(Path::to_path_buf);
+        let theme_setting = settings.theme();
         Self {
-            theme: settings.theme().resolve(Appearance::Dark),
+            theme: theme_setting.resolve(Appearance::Dark),
+            theme_setting,
             transcript: Transcript::configured(startup),
             settings: Some(settings),
             workspace_root,
@@ -955,8 +959,24 @@ impl App {
                 }
             }
             slash::Action::Name => self.name_session(command.argument),
+            slash::Action::Settings => {
+                self.open_settings_picker();
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
+            }
             slash::Action::Skill => {
                 unreachable!("direct skill dispatch precedes editor consumption")
+            }
+            slash::Action::Theme => {
+                self.open_theme_picker(false);
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
             }
             slash::Action::Tree => self.open_session_tree(command.argument),
             slash::Action::Thinking => {
@@ -1046,13 +1066,25 @@ impl App {
             .handle_key(key);
         match action {
             PickerAction::None => Update::default(),
-            PickerAction::Changed => Update {
-                commands: Vec::new(),
-                visible_changed: true,
-                quit: false,
-            },
+            PickerAction::Changed => {
+                if let Some(PickerValue::Theme(setting)) =
+                    self.picker.as_ref().and_then(Picker::focused_value)
+                {
+                    self.theme = setting.resolve(self.appearance);
+                }
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
+            }
             PickerAction::Close => {
-                self.picker = None;
+                self.theme = self.theme_setting.resolve(self.appearance);
+                if std::mem::take(&mut self.return_to_settings) {
+                    self.open_settings_picker();
+                } else {
+                    self.picker = None;
+                }
                 Update {
                     commands: Vec::new(),
                     visible_changed: true,
@@ -1087,6 +1119,7 @@ impl App {
                         let model = self.settings_selection.model();
                         self.save_user_default(|settings| settings.save_thinking(model, thinking));
                     }
+                    PickerValue::Theme(_) | PickerValue::OpenThemePicker => {}
                 }
                 update.visible_changed = true;
                 update
@@ -1098,6 +1131,15 @@ impl App {
         match value {
             PickerValue::Model(model) => self.select_model(model),
             PickerValue::Thinking(thinking) => self.select_thinking(thinking),
+            PickerValue::Theme(setting) => self.select_theme(setting),
+            PickerValue::OpenThemePicker => {
+                self.open_theme_picker(true);
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
+            }
         }
     }
 
@@ -1162,6 +1204,69 @@ impl App {
             items,
             PickerValue::Thinking(self.settings_selection.thinking()),
         ));
+    }
+
+    fn open_settings_picker(&mut self) {
+        let label = match self.theme_setting {
+            ThemeSetting::Dark => "Theme  dark",
+            ThemeSetting::Light => "Theme  light",
+            ThemeSetting::Automatic => "Theme  automatic",
+        };
+        self.picker = Some(Picker::new(
+            "Settings",
+            "No matching settings",
+            [PickerItem {
+                group: "Settings",
+                label,
+                value: PickerValue::OpenThemePicker,
+            }],
+            PickerValue::OpenThemePicker,
+        ));
+    }
+
+    fn open_theme_picker(&mut self, return_to_settings: bool) {
+        self.return_to_settings = return_to_settings;
+        let automatic_label = match self.appearance {
+            Appearance::Dark => "automatic (currently dark)",
+            Appearance::Light => "automatic (currently light)",
+        };
+        let items = [
+            PickerItem {
+                group: "Theme",
+                label: automatic_label,
+                value: PickerValue::Theme(ThemeSetting::Automatic),
+            },
+            PickerItem {
+                group: "Theme",
+                label: "dark",
+                value: PickerValue::Theme(ThemeSetting::Dark),
+            },
+            PickerItem {
+                group: "Theme",
+                label: "light",
+                value: PickerValue::Theme(ThemeSetting::Light),
+            },
+        ];
+        self.picker = Some(Picker::new(
+            "Theme",
+            "No matching themes",
+            items,
+            PickerValue::Theme(self.theme_setting),
+        ));
+    }
+
+    fn select_theme(&mut self, setting: ThemeSetting) -> Update {
+        self.theme_setting = setting;
+        self.theme = setting.resolve(self.appearance);
+        self.save_user_default(|settings| settings.save_theme(setting));
+        if std::mem::take(&mut self.return_to_settings) {
+            self.open_settings_picker();
+        }
+        Update {
+            commands: Vec::new(),
+            visible_changed: true,
+            quit: false,
+        }
     }
 
     fn select_model(&mut self, model: &'static ModelConfiguration) -> Update {
@@ -5335,11 +5440,13 @@ mod tests {
 
         let mut app = app_with_prompt("/");
         app.theme = &DISTINCT_TEST_THEME;
-        let initial = rendered_buffer(&mut app, 40, 10);
+        let initial = rendered_buffer(&mut app, 40, 12);
         let overlay = app.slash_overlay.expect("slash overlay");
         let (compact_column, compact_row) = cell_start(&initial, "/compact");
         let (model_column, model_row) = cell_start(&initial, "/model");
         let (name_column, name_row) = cell_start(&initial, "/name");
+        let (settings_column, settings_row) = cell_start(&initial, "/settings");
+        let (theme_column, theme_row) = cell_start(&initial, "/theme");
         let (thinking_column, thinking_row) = cell_start(&initial, "/thinking");
         let (tree_column, tree_row) = cell_start(&initial, "/tree");
 
@@ -5347,18 +5454,26 @@ mod tests {
         assert!(
             compact_row < model_row
                 && model_row < name_row
-                && name_row < thinking_row
+                && name_row < settings_row
+                && settings_row < theme_row
+                && theme_row < thinking_row
                 && thinking_row < tree_row
         );
         assert_slash_selection(&initial[(compact_column, compact_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
-        let model = rendered_buffer(&mut app, 40, 10);
+        let model = rendered_buffer(&mut app, 40, 12);
         assert_slash_selection(&model[(model_column, model_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
-        let name = rendered_buffer(&mut app, 40, 10);
+        let name = rendered_buffer(&mut app, 40, 12);
         assert_slash_selection(&name[(name_column, name_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
-        let thinking = rendered_buffer(&mut app, 40, 10);
+        let settings = rendered_buffer(&mut app, 40, 12);
+        assert_slash_selection(&settings[(settings_column, settings_row)]);
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let theme = rendered_buffer(&mut app, 40, 12);
+        assert_slash_selection(&theme[(theme_column, theme_row)]);
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let thinking = rendered_buffer(&mut app, 40, 12);
         assert_slash_selection(&thinking[(thinking_column, thinking_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
@@ -5366,7 +5481,7 @@ mod tests {
             !app.handle_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        let tree = rendered_buffer(&mut app, 40, 10);
+        let tree = rendered_buffer(&mut app, 40, 12);
         assert_slash_selection(&tree[(tree_column, tree_row)]);
         assert_eq!(app.prompt.text(), "/");
     }
@@ -5514,7 +5629,7 @@ mod tests {
         assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
         let buffer = rendered_buffer(&mut tiny, 5, 5);
-        let (column, row) = cell_start(&buffer, "/thin");
+        let (column, row) = cell_start(&buffer, "/sett");
         for selected_column in 0..5 {
             let cell = &buffer[(selected_column, row)];
             assert_eq!(cell.fg, DARK.text);
@@ -8386,6 +8501,289 @@ mod tests {
                 "{setting} {appearance:?}"
             );
         }
+    }
+
+    #[test]
+    fn theme_picker_lists_items_previews_live_and_restores_on_escape() {
+        use crate::theme::{Appearance, LIGHT};
+
+        let now = Instant::now();
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        fs::create_dir(home.path().join(".kiki")).unwrap();
+        fs::write(home.path().join(".kiki/config.toml"), "theme = \"dark\"\n").unwrap();
+        let mut light_appearance =
+            App::configured(crate::config::ready_snapshot_with_settings_for_test(
+                Some(home.path()),
+                workspace.path(),
+            ))
+            .with_appearance(Appearance::Light);
+        let _ = enter_at(&mut light_appearance, "/theme", now);
+        let light_buffer = rendered_buffer(&mut light_appearance, 80, 20);
+        let (auto_col, auto_row) = cell_start(&light_buffer, "automatic (currently light)");
+        let (_, dark_row) = cell_start(&light_buffer, "│dark");
+        let (_, light_row) = cell_start(&light_buffer, "│light");
+        assert!(auto_row < dark_row && dark_row < light_row);
+        assert_eq!(light_buffer[(auto_col, dark_row)].bg, DARK.selected_bg);
+        assert_ne!(light_buffer[(auto_col, auto_row)].bg, DARK.selected_bg);
+
+        let clean_home = tempdir().unwrap();
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(clean_home.path()),
+            workspace.path(),
+        ))
+        .with_appearance(Appearance::Dark);
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "settled user card".to_owned(),
+                    selection: None,
+                },
+            },
+            progress_gap: false,
+        });
+        let initial = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            initial[cell_start(&initial, "settled user card")].bg,
+            DARK.user_message_bg
+        );
+
+        let open = enter_at(&mut app, "/theme", now);
+        assert!(open.commands.is_empty());
+        assert!(open.visible_changed);
+        let opened = rendered_buffer(&mut app, 80, 20);
+        let (auto_dark_col, auto_dark_row) = cell_start(&opened, "automatic (currently dark)");
+        assert_eq!(opened[(auto_dark_col, auto_dark_row)].bg, DARK.selected_bg);
+
+        assert!(app.handle_key_at(key(KeyCode::Down), now).visible_changed);
+        assert!(app.handle_key_at(key(KeyCode::Down), now).visible_changed);
+        let preview_light = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            preview_light[cell_start(&preview_light, "settled user card")].bg,
+            LIGHT.user_message_bg
+        );
+
+        assert!(app.handle_key_at(key(KeyCode::Up), now).visible_changed);
+        let preview_dark = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            preview_dark[cell_start(&preview_dark, "settled user card")].bg,
+            DARK.user_message_bg
+        );
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Char('g')), now)
+                .visible_changed
+        );
+        let filtered_light = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            filtered_light[cell_start(&filtered_light, "settled user card")].bg,
+            LIGHT.user_message_bg
+        );
+
+        assert!(app.handle_key_at(key(KeyCode::Esc), now).visible_changed);
+        assert!(app.picker.is_none());
+        let restored = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            restored[cell_start(&restored, "settled user card")].bg,
+            DARK.user_message_bg
+        );
+        assert!(!clean_home.path().join(".kiki/config.toml").exists());
+    }
+
+    #[test]
+    fn theme_picker_enter_and_ctrl_s_save_and_report_masking_or_save_errors() {
+        use crate::theme::{Appearance, LIGHT};
+
+        let now = Instant::now();
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        ))
+        .with_appearance(Appearance::Dark);
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "settled user card".to_owned(),
+                    selection: None,
+                },
+            },
+            progress_gap: false,
+        });
+
+        let _ = enter_at(&mut app, "/theme", now);
+        app.handle_key_at(key(KeyCode::End), now);
+        let apply = app.handle_key_at(key(KeyCode::Enter), now);
+        assert!(apply.commands.is_empty());
+        assert!(apply.visible_changed);
+        assert!(app.picker.is_none());
+        assert_eq!(app.notice(), Some("User default saved."));
+        assert_eq!(
+            fs::read_to_string(home.path().join(".kiki/config.toml")).unwrap(),
+            "theme = \"light\"\n"
+        );
+        let after_enter = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            after_enter[cell_start(&after_enter, "settled user card")].bg,
+            LIGHT.user_message_bg
+        );
+
+        let _ = enter_at(&mut app, "/theme", now);
+        app.handle_key_at(key(KeyCode::Up), now);
+        let save = app.handle_key_at(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            now,
+        );
+        assert!(save.commands.is_empty());
+        assert!(save.visible_changed);
+        assert!(app.picker.is_none());
+        assert_eq!(app.notice(), Some("User default saved."));
+        assert_eq!(
+            fs::read_to_string(home.path().join(".kiki/config.toml")).unwrap(),
+            "theme = \"dark\"\n"
+        );
+        let after_ctrl_s = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            after_ctrl_s[cell_start(&after_ctrl_s, "settled user card")].bg,
+            DARK.user_message_bg
+        );
+
+        fs::create_dir_all(workspace.path().join(".kiki")).unwrap();
+        fs::write(
+            workspace.path().join(".kiki/config.toml"),
+            "theme = \"dark\"\n",
+        )
+        .unwrap();
+        let mut masked = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        ))
+        .with_appearance(Appearance::Dark);
+        let _ = enter_at(&mut masked, "/theme", now);
+        masked.handle_key_at(key(KeyCode::End), now);
+        masked.handle_key_at(key(KeyCode::Enter), now);
+        assert!(
+            masked
+                .notice()
+                .is_some_and(|notice| notice.contains("overridden by project settings"))
+        );
+        assert!(std::ptr::eq(masked.theme, &LIGHT));
+        assert_eq!(
+            fs::read_to_string(home.path().join(".kiki/config.toml")).unwrap(),
+            "theme = \"light\"\n"
+        );
+
+        fs::write(home.path().join(".kiki/config.toml"), "theme = [").unwrap();
+        let _ = enter_at(&mut masked, "/theme", now);
+        masked.handle_key_at(key(KeyCode::Home), now);
+        masked.handle_key_at(key(KeyCode::Enter), now);
+        assert!(
+            masked
+                .notice()
+                .is_some_and(|notice| notice.starts_with("Could not save user default:"))
+        );
+        assert!(std::ptr::eq(masked.theme, &DARK));
+    }
+
+    #[test]
+    fn settings_picker_opens_theme_picker_and_returns_on_enter_ctrl_s_or_escape() {
+        use crate::theme::{Appearance, LIGHT};
+
+        let now = Instant::now();
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        ))
+        .with_appearance(Appearance::Dark);
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "settled user card".to_owned(),
+                    selection: None,
+                },
+            },
+            progress_gap: false,
+        });
+
+        let open = enter_at(&mut app, "/settings", now);
+        assert!(open.commands.is_empty());
+        assert!(open.visible_changed);
+        let settings_screen = rendered(&mut app, 80, 20);
+        assert!(settings_screen.contains("Settings"), "{settings_screen}");
+        assert!(
+            settings_screen.contains("Theme  automatic"),
+            "{settings_screen}"
+        );
+
+        app.handle_key_at(key(KeyCode::Enter), now);
+        let theme_screen = rendered(&mut app, 80, 20);
+        assert!(
+            theme_screen.contains("automatic (currently dark)"),
+            "{theme_screen}"
+        );
+
+        app.handle_key_at(key(KeyCode::End), now);
+        let preview = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            preview[cell_start(&preview, "settled user card")].bg,
+            LIGHT.user_message_bg
+        );
+
+        app.handle_key_at(key(KeyCode::Esc), now);
+        let after_esc = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            after_esc[cell_start(&after_esc, "settled user card")].bg,
+            DARK.user_message_bg
+        );
+        let returned_settings = rendered(&mut app, 80, 20);
+        assert!(
+            returned_settings.contains("Theme  automatic"),
+            "{returned_settings}"
+        );
+        assert!(!home.path().join(".kiki/config.toml").exists());
+
+        app.handle_key_at(key(KeyCode::Enter), now);
+        app.handle_key_at(key(KeyCode::End), now);
+        app.handle_key_at(key(KeyCode::Enter), now);
+        let updated_settings = rendered(&mut app, 80, 20);
+        assert!(
+            updated_settings.contains("Theme  light"),
+            "{updated_settings}"
+        );
+        let after_save = rendered_buffer(&mut app, 80, 20);
+        assert_eq!(
+            after_save[cell_start(&after_save, "settled user card")].bg,
+            LIGHT.user_message_bg
+        );
+        assert_eq!(
+            fs::read_to_string(home.path().join(".kiki/config.toml")).unwrap(),
+            "theme = \"light\"\n"
+        );
+
+        app.handle_key_at(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            now,
+        );
+        app.handle_key_at(key(KeyCode::Up), now);
+        app.handle_key_at(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            now,
+        );
+        let ctrl_s_settings = rendered(&mut app, 80, 20);
+        assert!(ctrl_s_settings.contains("Theme  dark"), "{ctrl_s_settings}");
+        assert_eq!(
+            fs::read_to_string(home.path().join(".kiki/config.toml")).unwrap(),
+            "theme = \"dark\"\n"
+        );
+
+        app.handle_key_at(key(KeyCode::Esc), now);
+        assert!(app.picker.is_none());
     }
 
     #[test]
