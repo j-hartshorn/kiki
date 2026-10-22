@@ -156,6 +156,7 @@ pub(crate) struct RowBreaks {
 }
 
 impl RowBreaks {
+    #[cfg(test)]
     pub(crate) fn from_text(text: &Text<'_>, width: u16) -> Self {
         let mut breaks = Vec::new();
         for line in &text.lines {

@@ -10156,7 +10156,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_scrolls_nested_arena_frames_between_source_and_output() {
+    fn transcript_scrolls_code_step_between_source_and_output() {
         let mut app = App::default();
         let source = (1..=33)
             .map(|line| format!("source line {line}"))
@@ -10166,10 +10166,11 @@ mod tests {
 
         let newest = rendered(&mut app, 40, 8);
         assert!(newest.contains("42"), "{newest}");
+        assert!(!newest.contains("source line 1 "), "{newest}");
         assert!(app.handle_key(history_home()).visible_changed);
         let oldest = rendered(&mut app, 40, 8);
-        assert!(oldest.contains("╭code"));
-        assert!(oldest.contains("╭"));
+        assert!(oldest.contains("source line 1 "), "{oldest}");
+        assert!(!oldest.contains("42"), "{oldest}");
         assert!(app.handle_key(history_end()).visible_changed);
         assert!(rendered(&mut app, 40, 8).contains("42"));
     }
@@ -11285,8 +11286,7 @@ mod tests {
             "await read(path)",
             "stderr",
             "diagnostic",
-            "tool calls",
-            "read · failed",
+            "\u{2717} read · failed",
             "failure",
             "interrupted",
             "warning",
@@ -11319,7 +11319,6 @@ mod tests {
         let generation_history = rendered(&mut generation, 120, 40);
         assert!(generation_history.contains("interrupted reasoning"));
         assert!(generation_history.contains("interrupted assistant"));
-        assert!(generation_history.contains("code"));
         assert!(generation_history.contains("interrupted_code()"));
     }
 
@@ -13300,16 +13299,19 @@ mod tests {
             assert_eq!(app.prompt.text(), "kept prompt");
         }
         let collapsed = rendered(&mut app, 60, 40);
-        assert!(!collapsed.contains("code line 01"));
-        assert!(collapsed.contains("code line 33"));
-        assert!(collapsed.contains("[4 earlier tool calls omitted]"));
+        assert!(collapsed.contains("code line 10"));
+        assert!(!collapsed.contains("code line 11"));
+        assert!(collapsed.contains("… 23 more lines · Ctrl-O to expand"));
+        assert!(collapsed.contains("… 12 earlier calls · Ctrl-O to expand"));
+        assert!(!collapsed.contains("read · 12 bytes"));
+        assert!(collapsed.contains("read · 13 bytes"));
 
         let expanded = app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(expanded.commands.is_empty());
         assert!(expanded.visible_changed);
         let expanded = rendered(&mut app, 60, 40);
         assert!(expanded.contains("code line 33"));
-        assert!(!expanded.contains("earlier tool calls omitted"));
+        assert!(!expanded.contains("Ctrl-O to expand"));
         assert!(expanded.contains("read · 1 byte"));
         assert!(expanded.contains("read · 20 bytes"));
     }

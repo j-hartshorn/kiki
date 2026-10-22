@@ -83,6 +83,7 @@ Failed:
 ```
  failed: interrupted by user                        ← tool_error_bg, error colour
  execution: started                                 ← dim
+
  x = tools.read("a.txt")
 
  ✓ read · 12 bytes
