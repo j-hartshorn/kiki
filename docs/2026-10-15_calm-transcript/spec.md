@@ -101,17 +101,18 @@ Failed:
 ### Subagents
 
 ```
- ✓ start_subagent · c1                              ← inside the code step
+ ✓ start_subagent · subagent:c1                     ← inside the code step
 
- ✓ subagent c1 · gpt-5.6-terra · 3 steps · 00:47 · $0.02   ← success bg; error bg on failure, timeout
- Found three issues in the diff: …                  ← ≤3 lines, Ctrl-O for all
+ ✓ subagent:c1 · gpt-5.6-terra · 3 steps · 00:47 · $0.02   ← success bg; error bg on failure, timeout
+ review the diff and…                               ← dim prompt, one line; full with Ctrl-O
+ Found three issues in the diff: …                  ← ≤3 rows, then dim `… Ctrl-O to expand`
 ```
 
-Cancelled uses `tool_pending_bg` with `⊘`. The monitor shows one row per subagent:
+Cancelled uses `tool_pending_bg` with `⊘`. Failed, timed-out and cancelled headers add the state word (`✗ subagent:c1 failed · …`). The prompt moves from the removed Spawned card into this entry. The monitor shows one row per subagent, with the prompt last when it fits:
 
 ```
- … c1  gpt-5.6-terra  3 steps  00:47  $0.02  review the diff and…
- ✓ c2  gpt-5.6-sol    1 step   00:12         summarise tests
+  … subagent:c1  gpt-5.6-terra  3 steps  00:47  $0.02  review the diff and…
+  ✓ subagent:c2  gpt-5.6-sol  1 step  00:12  summarise tests
 ```
 
 Monitor glyphs move to `…` running, `✓` completed, `✗` failed or timed out, `⊘` cancelled, matching tool calls. Tree structure and the four-entry limit stay.
