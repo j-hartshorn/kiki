@@ -131,4 +131,4 @@ Monitor glyphs move to `…` running, `✓` completed, `✗` failed or timed out
 
 1. **Calm code step.** Uniform block gap; frameless code step with glyph call lines, labels only for non-stdout output, pending-only run tails, collapse hints.
 2. **Subagents.** Remove the Spawned card; outcome-tinted finish entry; one-row monitor with shared glyphs and formatter.
-3. **Richer call lines (later).** Persist compact tool arguments and durations so call lines read `✓ read src/main.rs · 12 bytes  4ms`, and add `Took` to code steps. Needs its own spec for the session format change.
+3. **Richer call lines.** Call subjects and durations; see [Call lines](../2026-10-23_call-lines/spec.md).
