@@ -11346,7 +11346,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_monitor_renders_two_rows_above_prompt() {
+    fn subagent_monitor_renders_one_row_above_prompt() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::SubagentSpawned {
             record: crate::subagents::TaskRecord::for_test(
@@ -11373,9 +11373,8 @@ mod tests {
 
         assert_eq!(
             rows[entry].trim_end(),
-            "  ✓ subagent:c1  openai/gpt-5.6-terra  0 steps  04:47"
+            "  ✓ subagent:c1  openai/gpt-5.6-terra  0 steps  04:47  test child"
         );
-        assert!(rows[entry + 1].starts_with("    └ `test child`"));
         assert!(entry < prompt);
     }
 
@@ -11419,8 +11418,14 @@ mod tests {
             .position(|row| row.starts_with("> "))
             .expect("prompt");
 
-        assert!(rows[root + 1].starts_with("    └ `test child`"));
-        assert!(rows[child + 1].starts_with("      └ `test child`"));
+        assert_eq!(
+            rows[root].trim_end(),
+            "  ✓ subagent:00  openai/gpt-5.6-terra  0 steps  00:00  test child"
+        );
+        assert_eq!(
+            rows[child].trim_end(),
+            "    └─✓ subagent:01  openai/gpt-5.6-terra  0 steps  00:00  test child"
+        );
         assert!(root < child && child < prompt, "{screen}");
     }
 
@@ -11477,7 +11482,7 @@ mod tests {
         rendered_at(&mut app, 80, 9, now);
         assert!(app.handle_key_at(history_home(), now).visible_changed);
         assert_eq!(app.history_position, HistoryPosition::Anchored(0));
-        assert!(rendered_at(&mut app, 80, 9, now).contains("• subagent:child1"));
+        assert!(rendered_at(&mut app, 80, 9, now).contains("… subagent:child1"));
     }
 
     #[test]
@@ -11500,17 +11505,17 @@ mod tests {
             now,
         );
 
-        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1  "));
         assert!(
             app.handle_key_at(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL), now)
                 .commands
                 .is_empty()
         );
-        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1  "));
         set_prompt(&mut app, "/model");
         app.handle_key_at(key(KeyCode::Enter), now);
         app.handle_key_at(key(KeyCode::Esc), now);
-        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1  "));
         app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
         set_prompt(&mut app, "busy draft");
         assert!(
@@ -11524,7 +11529,7 @@ mod tests {
             },
             now,
         );
-        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1  "));
 
         app.handle_event_at(
             RuntimeEvent::RecordAppended {
@@ -11540,9 +11545,9 @@ mod tests {
             now,
         );
 
-        assert!(!rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        assert!(!rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1  "));
         app.handle_event_at(RuntimeEvent::SubagentFinished { record }, now);
-        assert!(!rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        assert!(!rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1  "));
     }
 
     #[test]
@@ -11565,8 +11570,12 @@ mod tests {
 
         let before = rendered_at(&mut app, 80, 12, now);
         let before_counts = app.transcript.construction_counts();
-        assert!(before.contains("Completed · subagent:c1"), "{before}");
-        assert!(before.contains("✓ subagent:c1"), "{before}");
+        let monitor_row = "  ✓ subagent:c1  openai/gpt-5.6-terra  0 steps  00:00  test child";
+        assert!(
+            before.contains(" ✓ subagent:c1 · openai/gpt-5.6-terra · 0 steps · 00:00"),
+            "{before}"
+        );
+        assert!(before.contains(monitor_row), "{before}");
 
         let update =
             app.handle_key_at(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL), now);
@@ -11574,7 +11583,7 @@ mod tests {
         assert!(update.visible_changed);
 
         let expanded = rendered_at(&mut app, 80, 12, now);
-        assert!(expanded.contains("✓ subagent:c1"), "{expanded}");
+        assert!(expanded.contains(monitor_row), "{expanded}");
         assert_ne!(app.transcript.construction_counts(), before_counts);
     }
 

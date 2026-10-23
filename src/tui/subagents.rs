@@ -5,9 +5,12 @@ use crate::pricing::RunCostEstimate;
 use crate::runtime::{Record, RestoredTimelineItem, RuntimeEvent};
 use crate::subagents::{TaskId, TaskObservation, TaskRecord, TaskState};
 use crate::theme::Theme;
-use crate::transcript::{format_footer_usd, muted_page_style, normalise_terminal_text};
+use crate::transcript::{
+    format_subagent_cost, format_subagent_elapsed, format_subagent_steps, muted_page_style,
+    normalise_terminal_text, subagent_glyph, subagent_retry_count, subagent_state_label,
+};
 use ratatui::style::Style;
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
 const MAX_ENTRIES: usize = 4;
@@ -49,7 +52,7 @@ impl Entry {
             parent: record.parent().map(ToString::to_string),
             prompt: record.parameters().prompt().to_owned(),
             model: record.parameters().selection().model().id.to_owned(),
-            retry_count: retry_count(record),
+            retry_count: subagent_retry_count(record),
             record_revision: record.revision(),
             observation_revision: record.revision(),
             observation: Observation::from(record.observation()),
@@ -177,7 +180,7 @@ impl SubagentMonitor {
         entry.parent = record.parent().map(ToString::to_string);
         entry.prompt = record.parameters().prompt().to_owned();
         entry.model = record.parameters().selection().model().id.to_owned();
-        entry.retry_count = retry_count(record);
+        entry.retry_count = subagent_retry_count(record);
         entry.record_revision = record.revision();
         if record.revision() >= entry.observation_revision {
             entry.observation_revision = record.revision();
@@ -261,22 +264,7 @@ impl SubagentMonitor {
         let forest = self.forest();
         let selected_path = selected_path(&forest);
         let available_rows = usize::from(available_rows);
-        let Some((projection, padding)) =
-            self.fit_projection(&forest, selected_path, available_rows)
-        else {
-            return MonitorLayout {
-                lines: vec![Line::raw(clipped(
-                    &summary(
-                        self.entries
-                            .iter()
-                            .filter(|(id, entry)| self.is_operationally_active(id, entry))
-                            .count(),
-                        self.entries.len(),
-                    ),
-                    width,
-                ))],
-            };
-        };
+        let (projection, padding) = self.fit_projection(&forest, selected_path, available_rows);
 
         let (mut lines, visible_elapsed) =
             self.render_projection(theme, &forest, &projection, width, now);
@@ -384,38 +372,38 @@ impl SubagentMonitor {
         forest: &Forest,
         selected_path: Vec<String>,
         available_rows: usize,
-    ) -> Option<(Projection, bool)> {
+    ) -> (Projection, bool) {
         let mut projection = Projection::new(forest, selected_path);
         let line_count = projection.line_count();
         if line_count <= available_rows {
-            return Some((projection, line_count.saturating_add(2) <= available_rows));
+            return (projection, line_count.saturating_add(2) <= available_rows);
         }
 
         for root in projection.roots.clone().into_iter().rev() {
             projection.collapsed_root_summaries.remove(&root);
             if projection.line_count() <= available_rows {
-                return Some((projection, false));
+                return (projection, false);
             }
         }
         projection.show_anchor_descendants = false;
         if projection.line_count() <= available_rows {
-            return Some((projection, false));
+            return (projection, false);
         }
 
         for depth in projection.sibling_summaries.clone().into_iter().rev() {
             projection.sibling_summaries.remove(&depth);
             if projection.line_count() <= available_rows {
-                return Some((projection, false));
+                return (projection, false);
             }
         }
         projection.show_root_summary = false;
         if projection.line_count() <= available_rows {
-            return Some((projection, false));
+            return (projection, false);
         }
 
         while projection.roots.pop().is_some() {
             if projection.line_count() <= available_rows {
-                return Some((projection, false));
+                return (projection, false);
             }
         }
 
@@ -423,12 +411,12 @@ impl SubagentMonitor {
             projection.selected_count = projection.selected_count.saturating_sub(1);
             projection.show_deeper = true;
             if projection.line_count() <= available_rows {
-                return Some((projection, false));
+                return (projection, false);
             }
         }
 
         projection.show_deeper = false;
-        (projection.line_count() <= available_rows).then_some((projection, false))
+        (projection, false)
     }
 
     fn render_projection(
@@ -612,10 +600,7 @@ impl Projection {
     }
 
     fn line_count(&self) -> usize {
-        let mut count = self
-            .selected_count
-            .saturating_add(self.roots.len())
-            .saturating_mul(2);
+        let mut count = self.selected_count.saturating_add(self.roots.len());
         if self.show_deeper && self.selected_count < self.selected_path.len() {
             count = count.saturating_add(1);
         }
@@ -693,29 +678,37 @@ fn render_node(
 ) {
     let (id, entry) = node;
     let elapsed = entry.elapsed(now);
-    let header = header_at(
-        id,
-        entry,
-        elapsed,
-        width,
-        &header_prefix(depth, entry.observation.state),
-    );
+    let indent = header_indent(depth);
+    let lead_width = Line::raw(&indent).width().saturating_add(1);
+    let header = header_at(id, entry, elapsed, width, lead_width);
     if is_active(entry.observation.state) && header.shows_elapsed {
         visible_elapsed.push((id.to_owned(), elapsed.as_secs()));
     }
     let style = terminal_style(theme, entry.observation.state);
-    lines.push(Line::styled(header.text, style));
-    lines.push(Line::styled(
-        prompt_preview_at(&entry.prompt, width, depth),
-        style,
-    ));
+    let glyph = subagent_glyph(theme, entry.observation.state);
+    if usize::from(width) <= lead_width {
+        lines.push(Line::styled(
+            clipped(&format!("{indent}{}", glyph.content), width),
+            style,
+        ));
+        return;
+    }
+    let mut spans = vec![
+        Span::styled(indent, style),
+        glyph,
+        Span::styled(header.text, style),
+    ];
+    if let Some(prompt) = header.prompt {
+        spans.push(Span::styled(prompt, muted_page_style(theme)));
+    }
+    lines.push(Line::from(spans));
 }
 
-fn header_prefix(depth: usize, state: TaskState) -> String {
+fn header_indent(depth: usize) -> String {
     if depth == 0 {
-        format!("  {}", indicator(state))
+        "  ".to_owned()
     } else {
-        format!("  {}└─{}", "  ".repeat(depth), indicator(state))
+        format!("  {}└─", "  ".repeat(depth))
     }
 }
 
@@ -724,17 +717,6 @@ fn summary_line(summary_depth: usize, label: &str, width: u16) -> Line<'static> 
         &format!("  {}└─… {label}", "  ".repeat(summary_depth)),
         width,
     ))
-}
-
-fn retry_count(record: &TaskRecord) -> u64 {
-    u64::try_from(
-        record
-            .attempt_evidence()
-            .iter()
-            .filter(|attempt| attempt.provider_attempt() > 1)
-            .count(),
-    )
-    .unwrap_or(u64::MAX)
 }
 
 fn is_active(state: TaskState) -> bool {
@@ -754,32 +736,30 @@ fn terminal_style(theme: &Theme, state: TaskState) -> Style {
 
 struct Header {
     text: String,
+    prompt: Option<String>,
     shows_elapsed: bool,
 }
 
+const MIN_PROMPT_WIDTH: usize = 8;
+
 #[cfg(test)]
 fn header(id: &str, entry: &Entry, elapsed: Duration, width: u16) -> Header {
-    header_at(
-        id,
-        entry,
-        elapsed,
-        width,
-        &header_prefix(0, entry.observation.state),
-    )
+    header_at(id, entry, elapsed, width, 3)
 }
 
-fn header_at(id: &str, entry: &Entry, elapsed: Duration, width: u16, prefix: &str) -> Header {
+fn header_at(id: &str, entry: &Entry, elapsed: Duration, width: u16, lead_width: usize) -> Header {
+    let width = usize::from(width).saturating_sub(lead_width);
     let prefix = format!(
-        "{prefix} subagent:{id}{}",
-        state_label(entry.observation.state)
+        " subagent:{id}{}",
+        subagent_state_label(entry.observation.state)
     );
     let model = entry.model.clone();
-    let mut steps = Some(format_step_count(
+    let mut steps = Some(format_subagent_steps(
         entry.observation.step_count,
         entry.retry_count,
     ));
-    let mut runtime = Some(format_elapsed(elapsed));
-    let mut cost = format_cost(entry.observation.cost);
+    let mut runtime = Some(format_subagent_elapsed(elapsed));
+    let mut cost = format_subagent_cost(entry.observation.cost);
 
     while Line::raw(join_fields(
         &prefix,
@@ -791,39 +771,45 @@ fn header_at(id: &str, entry: &Entry, elapsed: Duration, width: u16, prefix: &st
         ],
     ))
     .width()
-        > usize::from(width)
+        > width
     {
         if steps.take().is_some() || cost.take().is_some() || runtime.take().is_some() {
             continue;
         }
         let prefix_width = Line::raw(&prefix).width();
-        if prefix_width >= usize::from(width) {
+        if prefix_width >= width {
             return Header {
-                text: clipped(&prefix, width),
+                text: crate::transcript::truncate_end(&prefix, width),
+                prompt: None,
                 shows_elapsed: false,
             };
         }
-        let model_width = usize::from(width)
-            .saturating_sub(prefix_width)
-            .saturating_sub(2);
+        let model_width = width.saturating_sub(prefix_width).saturating_sub(2);
         let model =
             (model_width > 0).then(|| crate::transcript::truncate_front(&model, model_width));
         return Header {
             text: join_fields(&prefix, [model.as_deref(), None, None, None]),
+            prompt: None,
             shows_elapsed: false,
         };
     }
 
+    let text = join_fields(
+        &prefix,
+        [
+            Some(model.as_str()),
+            steps.as_deref(),
+            runtime.as_deref(),
+            cost.as_deref(),
+        ],
+    );
+    let prompt_width = width
+        .saturating_sub(Line::raw(&text).width())
+        .saturating_sub(2);
     Header {
-        text: join_fields(
-            &prefix,
-            [
-                Some(model.as_str()),
-                steps.as_deref(),
-                runtime.as_deref(),
-                cost.as_deref(),
-            ],
-        ),
+        prompt: (prompt_width >= MIN_PROMPT_WIDTH)
+            .then(|| format!("  {}", prompt_preview(&entry.prompt, prompt_width))),
+        text,
         shows_elapsed: runtime.is_some(),
     }
 }
@@ -837,85 +823,12 @@ fn join_fields<'a>(prefix: &str, fields: impl IntoIterator<Item = Option<&'a str
     text
 }
 
-fn indicator(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Starting | TaskState::Running => "•",
-        TaskState::Stopping => "…",
-        TaskState::Completed => "✓",
-        TaskState::Failed | TaskState::TimedOut => "!",
-        TaskState::Cancelled => "×",
-    }
-}
-
-fn state_label(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Starting => " starting",
-        TaskState::Running | TaskState::Completed => "",
-        TaskState::Stopping => " stopping",
-        TaskState::Failed => " failed",
-        TaskState::Cancelled => " cancelled",
-        TaskState::TimedOut => " timed out",
-    }
-}
-
-fn format_step_count(count: u64, retries: u64) -> String {
-    let steps = format!("{count} {}", if count == 1 { "step" } else { "steps" });
-    if retries == 0 {
-        steps
-    } else {
-        format!(
-            "{steps}, {retries} {}",
-            if retries == 1 { "retry" } else { "retries" }
-        )
-    }
-}
-
-fn format_elapsed(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
-}
-
-fn format_cost(cost: RunCostEstimate) -> Option<String> {
-    match cost {
-        RunCostEstimate::Complete(cost) => Some(format_footer_usd(cost.as_nanos())),
-        RunCostEstimate::LowerBound(cost) => {
-            Some(format!("≥{}", format_footer_usd(cost.as_nanos())))
-        }
-        RunCostEstimate::Unavailable => None,
-    }
-}
-
-#[cfg(test)]
-fn prompt_preview(prompt: &str, width: u16) -> String {
-    prompt_preview_at(prompt, width, 0)
-}
-
-fn prompt_preview_at(prompt: &str, width: u16, depth: usize) -> String {
+fn prompt_preview(prompt: &str, width: usize) -> String {
     let prompt = normalise_terminal_text(prompt)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let prefix = format!("  {}  └ ", "  ".repeat(depth));
-    let width = usize::from(width);
-    let prefix_width = Line::raw(&prefix).width();
-    if width < prefix_width.saturating_add(2) {
-        return clipped(
-            &format!("{prefix}`{prompt}`"),
-            u16::try_from(width).unwrap_or(u16::MAX),
-        );
-    }
-    let content_width = width.saturating_sub(prefix_width).saturating_sub(2);
-    format!(
-        "{prefix}`{}`",
-        crate::transcript::truncate_end(&prompt, content_width)
-    )
-}
-
-fn summary(active: usize, total: usize) -> String {
-    format!(
-        "  Subagents: {active} active, {} finished",
-        total.saturating_sub(active)
-    )
+    crate::transcript::truncate_end(&prompt, width)
 }
 
 fn clipped(text: &str, width: u16) -> String {
@@ -1112,17 +1025,50 @@ mod tests {
     }
 
     #[test]
-    fn preview_keeps_backticks_and_grapheme_ellipsis() {
-        let preview = prompt_preview("日本🦀e\u{301}abcdefgh", 20);
+    fn monitor_rows_lead_with_shared_glyphs_and_end_with_the_prompt() {
+        let now = Instant::now();
+        let mut monitor = SubagentMonitor::default();
+        monitor.insert_for_test("c1", TaskState::Running, now);
+        monitor.insert_for_test("c2", TaskState::Failed, now);
 
-        assert!(preview.starts_with("    └ `"));
-        assert!(preview.ends_with('`'));
-        assert_eq!(Line::raw(&preview).width(), 20);
-        assert!(preview.contains('…'));
-        assert!(preview.contains("e\u{301}"));
+        let layout = monitor.layout(&crate::theme::DARK, 80, 10, now);
+
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "",
+                "  \u{2026} subagent:c1  openai/gpt-5.6-sol  0 steps  00:00  test child",
+                "  \u{2717} subagent:c2 failed  openai/gpt-5.6-sol  0 steps  00:00  test child",
+                "",
+            ]
+        );
+        assert_eq!(
+            layout.lines[1].spans[1].style.fg,
+            Some(crate::theme::DARK.warning)
+        );
+        assert_eq!(
+            layout.lines[2].spans[1].style.fg,
+            Some(crate::theme::DARK.error)
+        );
+        assert_eq!(
+            layout.lines[1].spans.last().unwrap().style.fg,
+            Some(crate::theme::DARK.muted)
+        );
+    }
+
+    #[test]
+    fn preview_collapses_whitespace_and_keeps_grapheme_ellipsis() {
+        let preview = prompt_preview("日本🦀e\u{301}abcdefgh", 10);
+
+        assert_eq!(preview, "日本🦀e\u{301}ab…");
+        assert_eq!(Line::raw(&preview).width(), 10);
         assert_eq!(
             prompt_preview("first\nsecond\t\x1b", 80),
-            "    └ `first second \\x1B`"
+            "first second \\x1B"
         );
     }
 
@@ -1153,7 +1099,11 @@ mod tests {
 
         assert_eq!(
             complete.text,
-            "  • subagent:child1  openai/gpt-5.6-luna  6 steps  04:47  $0.00002400"
+            " subagent:child1  openai/gpt-5.6-luna  6 steps  04:47  $0.00002400"
+        );
+        assert_eq!(
+            complete.prompt.as_deref(),
+            Some("  Review the cancellation paths and identify every…")
         );
         assert!(lower_bound.text.ends_with("≥$0.00002400"));
         assert!(retries.text.contains("6 steps, 2 retries"));
@@ -1161,29 +1111,25 @@ mod tests {
     }
 
     #[test]
-    fn header_labels_each_lifecycle_state() {
+    fn rows_label_each_lifecycle_state() {
         let now = Instant::now();
-        for (state, indicator, label) in [
-            (TaskState::Starting, "•", " starting"),
-            (TaskState::Running, "•", ""),
+        for (state, glyph, label) in [
+            (TaskState::Starting, "…", " starting"),
+            (TaskState::Running, "…", ""),
             (TaskState::Stopping, "…", " stopping"),
             (TaskState::Completed, "✓", ""),
-            (TaskState::Failed, "!", " failed"),
-            (TaskState::TimedOut, "!", " timed out"),
-            (TaskState::Cancelled, "×", " cancelled"),
+            (TaskState::Failed, "✗", " failed"),
+            (TaskState::TimedOut, "✗", " timed out"),
+            (TaskState::Cancelled, "⊘", " cancelled"),
         ] {
-            let header = header(
-                "child1",
-                &entry(state, RunCostEstimate::Unavailable, now),
-                Duration::from_secs(287),
-                120,
-            );
-            assert!(
-                header
-                    .text
-                    .starts_with(&format!("  {indicator} subagent:child1{label}")),
-                "{}",
-                header.text
+            let mut monitor = SubagentMonitor::default();
+            monitor.insert_for_test("child1", state, now);
+            let text = layout_text(&mut monitor, 120, 1, now);
+            assert_eq!(
+                text,
+                format!(
+                    "  {glyph} subagent:child1{label}  openai/gpt-5.6-sol  0 steps  00:00  test child"
+                )
             );
         }
     }
@@ -1194,18 +1140,18 @@ mod tests {
         let entry = entry(TaskState::Running, priced_cost(false), now);
         let complete = header("child1", &entry, Duration::from_secs(287), 120);
         let without_steps = header("child1", &entry, Duration::from_secs(287), 60);
-        let prefix = "  • subagent:child1";
+        let prefix = " subagent:child1";
         let shortened_model = header(
             "child1",
             &entry,
             Duration::from_secs(287),
-            u16::try_from(Line::raw(prefix).width() + 3).unwrap(),
+            u16::try_from(Line::raw(prefix).width() + 6).unwrap(),
         );
         let without_model = header(
             "child1",
             &entry,
             Duration::from_secs(287),
-            u16::try_from(Line::raw(prefix).width()).unwrap(),
+            u16::try_from(Line::raw(prefix).width() + 3).unwrap(),
         );
 
         assert!(complete.text.contains("6 steps"));
@@ -1253,7 +1199,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("    └─✓ subagent:01"), "{text}");
-        assert!(text.contains("      └─• subagent:02"), "{text}");
+        assert!(text.contains("      └─… subagent:02"), "{text}");
     }
 
     #[test]
@@ -1265,17 +1211,14 @@ mod tests {
         insert_task(&mut monitor, "02", TaskState::Completed, None, now);
         insert_task(&mut monitor, "03", TaskState::Running, Some("02"), now);
 
-        let text = layout_text(&mut monitor, 120, 7, now);
+        let text = layout_text(&mut monitor, 120, 4, now);
         let rows = text.lines().collect::<Vec<_>>();
 
-        assert_eq!(rows.len(), 7, "{text}");
+        assert_eq!(rows.len(), 4, "{text}");
         for (row, prefix) in rows.iter().zip([
             "  ✓ subagent:00",
-            "    └ `",
-            "    └─• subagent:01",
-            "      └ `",
+            "    └─… subagent:01",
             "  ✓ subagent:02",
-            "    └ `",
             "    └─… +1 descendants",
         ]) {
             assert!(row.starts_with(prefix), "expected `{prefix}`: {text}");
@@ -1312,7 +1255,7 @@ mod tests {
             text.find("subagent:00").unwrap() < text.find("subagent:03").unwrap(),
             "{text}"
         );
-        assert!(text.contains("      └─× subagent:02"), "{text}");
+        assert!(text.contains("      └─⊘ subagent:02 cancelled"), "{text}");
     }
 
     #[test]
@@ -1362,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_rows_use_the_specified_indentation_and_backticks() {
+    fn tree_rows_use_the_specified_indentation_and_end_with_the_prompt() {
         let now = Instant::now();
         let mut monitor = SubagentMonitor::default();
         insert_task(&mut monitor, "00", TaskState::Completed, None, now);
@@ -1372,10 +1315,15 @@ mod tests {
 
         let text = layout_text(&mut monitor, 120, 8, now);
 
-        assert!(text.contains("  ✓ subagent:00"), "{text}");
-        assert!(text.contains("    └ `root prompt`"), "{text}");
-        assert!(text.contains("    └─• subagent:01"), "{text}");
-        assert!(text.contains("      └ `child prompt`"), "{text}");
+        assert_eq!(
+            text.split('\n').collect::<Vec<_>>(),
+            [
+                "",
+                "  ✓ subagent:00  openai/gpt-5.6-luna  6 steps  04:47  root prompt",
+                "    └─… subagent:01  openai/gpt-5.6-luna  6 steps  04:47  child prompt",
+                "",
+            ]
+        );
     }
 
     #[test]
@@ -1461,28 +1409,15 @@ mod tests {
         insert_task(&mut monitor, "01", TaskState::Completed, Some("00"), now);
         insert_task(&mut monitor, "02", TaskState::Failed, Some("01"), now);
 
-        let with_summary = layout_text(&mut monitor, 120, 3, now);
-        assert_eq!(with_summary.lines().count(), 3, "{with_summary}");
-        assert_eq!(
-            with_summary.matches("subagent:").count(),
-            1,
-            "{with_summary}"
-        );
-        assert!(with_summary.contains("  • subagent:00"), "{with_summary}");
-        assert!(with_summary.lines().nth(1).unwrap().starts_with("    └ `"));
-        assert!(
-            with_summary.contains("    └─… +2 descendants"),
-            "{with_summary}"
-        );
-        assert!(!with_summary.contains("deeper"), "{with_summary}");
+        let with_summary = layout_text(&mut monitor, 120, 2, now);
+        let rows = with_summary.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{with_summary}");
+        assert!(rows[0].starts_with("  … subagent:00  "), "{with_summary}");
+        assert_eq!(rows[1], "    └─… +2 descendants");
 
-        let root_pair = layout_text(&mut monitor, 120, 2, now);
-        assert_eq!(root_pair.lines().count(), 2, "{root_pair}");
-        assert_eq!(root_pair.matches("subagent:").count(), 1, "{root_pair}");
-        assert!(root_pair.contains("  • subagent:00"), "{root_pair}");
-        assert!(root_pair.lines().nth(1).unwrap().starts_with("    └ `"));
-        assert!(!root_pair.contains("descendants"), "{root_pair}");
-        assert!(!root_pair.contains("deeper"), "{root_pair}");
+        let root_only = layout_text(&mut monitor, 120, 1, now);
+        assert_eq!(root_only.lines().count(), 1, "{root_only}");
+        assert!(root_only.starts_with("  … subagent:00  "), "{root_only}");
     }
 
     #[test]
@@ -1499,12 +1434,12 @@ mod tests {
             insert_task(&mut monitor, id, state, parent, now);
         }
 
-        let text = layout_text(&mut monitor, 120, 5, now);
+        let text = layout_text(&mut monitor, 120, 2, now);
 
         assert!(text.contains("subagent:00"), "{text}");
-        assert!(text.contains("subagent:01"), "{text}");
+        assert!(!text.contains("subagent:01"), "{text}");
         assert!(!text.contains("subagent:02"), "{text}");
-        assert!(text.contains("      └─… +3 deeper · 1 active"), "{text}");
+        assert!(text.contains("    └─… +4 deeper · 1 active"), "{text}");
     }
 
     #[test]
@@ -1516,8 +1451,8 @@ mod tests {
 
         let text = layout_text(&mut monitor, 120, 8, now);
 
-        assert!(text.contains("  • subagent:00"), "{text}");
-        assert!(!text.contains("└─• subagent:00"), "{text}");
+        assert!(text.contains("  … subagent:00"), "{text}");
+        assert!(!text.contains("└─… subagent:00"), "{text}");
     }
 
     #[test]
@@ -1572,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn height_shortening_reanchors_the_deeper_summary_without_half_nodes() {
+    fn height_shortening_reanchors_the_deeper_summary() {
         let now = Instant::now();
         let mut monitor = SubagentMonitor::default();
         let mut parent = None;
@@ -1593,13 +1528,12 @@ mod tests {
         }
 
         for (rows, visible, deeper) in [
-            (9, 4, Some("+2 deeper · 1 active")),
-            (8, 3, Some("+3 deeper · 1 active")),
-            (6, 2, Some("+4 deeper · 1 active")),
-            (5, 2, Some("+4 deeper · 1 active")),
-            (4, 1, Some("+5 deeper · 1 active")),
-            (3, 1, Some("+5 deeper · 1 active")),
-            (2, 1, None),
+            (7, 4, Some("+2 deeper · 1 active")),
+            (5, 4, Some("+2 deeper · 1 active")),
+            (4, 3, Some("+3 deeper · 1 active")),
+            (3, 2, Some("+4 deeper · 1 active")),
+            (2, 1, Some("+5 deeper · 1 active")),
+            (1, 1, None),
         ] {
             let text = layout_text(&mut monitor, 120, rows, now);
             assert_eq!(
@@ -1662,18 +1596,18 @@ mod tests {
 
         let layout = monitor.layout(&crate::theme::DARK, 120, 4, now);
 
-        assert_eq!(
-            layout.lines[1].style,
-            crate::transcript::muted_page_style(&crate::theme::DARK)
-        );
-        assert_eq!(
-            layout.lines[2].style,
-            crate::transcript::muted_page_style(&crate::theme::DARK)
-        );
+        let spans = &layout.lines[1].spans;
+        assert_eq!(spans.len(), 4);
+        for index in [0, 2, 3] {
+            assert_eq!(
+                spans[index].style,
+                crate::transcript::muted_page_style(&crate::theme::DARK)
+            );
+        }
     }
 
     #[test]
-    fn small_layouts_use_a_summary_or_omit_the_list_without_underflowing() {
+    fn small_layouts_keep_the_active_row_or_omit_the_list_without_underflowing() {
         let now = Instant::now();
         let mut monitor = SubagentMonitor::default();
         insert(
@@ -1687,10 +1621,11 @@ mod tests {
             entry(TaskState::Completed, RunCostEstimate::Unavailable, now),
         );
 
-        let summary = monitor.layout(&crate::theme::DARK, 80, 1, now);
+        let single = monitor.layout(&crate::theme::DARK, 80, 1, now);
+        assert_eq!(single.lines.len(), 1);
         assert_eq!(
-            summary.lines[0].to_string(),
-            "  Subagents: 1 active, 1 finished"
+            single.lines[0].to_string(),
+            "  … subagent:run001  openai/gpt-5.6-luna  6 steps  04:47  Review the cancellati…"
         );
         assert!(
             monitor
@@ -1724,7 +1659,7 @@ mod tests {
         assert!(monitor.tick(now + Duration::from_secs(1)));
         monitor.layout(&crate::theme::DARK, 120, 4, now + Duration::from_secs(1));
         assert!(!monitor.tick(now + Duration::from_secs(1) + Duration::from_millis(999)));
-        monitor.layout(&crate::theme::DARK, 120, 1, now + Duration::from_secs(2));
+        monitor.layout(&crate::theme::DARK, 30, 4, now + Duration::from_secs(2));
         assert!(!monitor.tick(now + Duration::from_secs(3)));
     }
 
