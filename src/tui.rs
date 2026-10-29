@@ -52,7 +52,7 @@ use picker::{Picker, PickerAction, PickerItem};
 use tree::{TreeNavigator, TreeNavigatorAction};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
+const MOUSE_WHEEL_SCROLL_ROWS: usize = 1;
 const SETTLED_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
 const TREE_BUSY_NOTICE: &str = "Session tree is unavailable while work is active.";
 const TREE_READ_ONLY_NOTICE: &str = "Session tree is unavailable while the session is read-only.";
@@ -10965,7 +10965,7 @@ mod tests {
 
         assert_eq!(
             app.history_position,
-            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(3))
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(1))
         );
         assert_eq!(redraws, 2);
     }
@@ -10974,7 +10974,7 @@ mod tests {
     fn mouse_wheel_scrolls_transcript_towards_newest_history() {
         let mut app = app_with_history(App::default());
         rendered(&mut app, 40, 7);
-        assert!(app.scroll_older(3).visible_changed);
+        assert!(app.scroll_older(1).visible_changed);
         let mut input =
             FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
 
@@ -10997,7 +10997,7 @@ mod tests {
 
         assert_eq!(
             app.history_position,
-            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(3))
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(1))
         );
         assert_eq!(redraws, 2);
     }
@@ -11007,7 +11007,7 @@ mod tests {
         let mut app =
             app_with_history(App::configuration(crate::config::ready_snapshot_for_test()));
         rendered(&mut app, 40, 7);
-        assert!(app.scroll_older(3).visible_changed);
+        assert!(app.scroll_older(1).visible_changed);
         let mut input =
             FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
 
