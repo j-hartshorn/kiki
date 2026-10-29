@@ -1,107 +1,12 @@
 use super::tests::{arena, arena_with_read_gate, complete, execute_checked};
 use super::{
     Arena, ArenaError, CancellationToken, Checkpoint, Execution, ExecutionOutcome, RuntimeIdentity,
-    ToolValue, TurnEvent, bootstrap, on_print_sync, result_values_from_monty, type_check_stubs,
+    ToolValue,
 };
 use std::collections::BTreeMap;
 
-// Feasibility fixture only, not a production TODO tool or a private-state security boundary.
-const TODO_FIXTURE: &str = r#"
-_kiki_todo_enabled = True
-
-class TodoList:
-    def __init__(self):
-        self._reset()
-
-    def add(self, text, status="pending"):
-        if not _kiki_todo_enabled:
-            raise RuntimeError("TODO proof disabled")
-        item_id = self._next_id
-        self._items.append({"id": item_id, "text": text, "status": status})
-        self._next_id += 1
-        return item_id
-
-    def snapshot(self):
-        if not _kiki_todo_enabled:
-            raise RuntimeError("TODO proof disabled")
-        return [dict(item) for item in self._items]
-
-    def _reset(self):
-        self._items = []
-        self._next_id = 1
-
-todos = TodoList()
-_kiki_host_names = set(_kiki_locals())
-"#;
-
-const TODO_STUBS: &str = r#"
-class TodoList:
-    def __init__(self) -> None: ...
-    def add(self, text: str, status: str = "pending") -> int: ...
-    def snapshot(self) -> list[dict[str, object]]: ...
-
-todos: TodoList
-"#;
-
-async fn install_fixture(arena: &mut Arena) {
-    arena.repl_config.type_check_stubs = Some(format!("{}\n{TODO_STUBS}", type_check_stubs()));
-    arena.checkout.take();
-    let mut checkout = arena.pool.checkout(&arena.repl_config).await.unwrap();
-    bootstrap(&mut checkout).await.unwrap();
-    arena.checkout = Some(checkout);
-    trusted_commit(arena, TODO_FIXTURE).await;
-}
-
 async fn proof_arena(workspace: &tempfile::TempDir) -> Arena {
-    let mut arena = arena(workspace).await;
-    install_fixture(&mut arena).await;
-    arena
-}
-
-async fn trusted_commit(arena: &mut Arena, source: &str) {
-    let mut on_print = on_print_sync(|_, _| {});
-    let checkout = arena.checkout.as_mut().unwrap();
-    let event = checkout
-        .feed(source, vec![], vec![], true, &mut on_print)
-        .await
-        .unwrap();
-    assert!(matches!(event, TurnEvent::Complete(_)), "{event:?}");
-    arena.checkpoint.state = checkout.dump().await.unwrap();
-    arena.bindings = None;
-}
-
-async fn apply_run_policy(arena: &mut Arena, enabled: bool) {
-    trusted_commit(
-        arena,
-        if enabled {
-            "_kiki_todo_enabled = True"
-        } else {
-            "_kiki_todo_enabled = False"
-        },
-    )
-    .await;
-}
-
-async fn restore_for_run(arena: &mut Arena, checkpoint: Checkpoint, enabled: bool) {
-    arena.restore(checkpoint).await.unwrap();
-    apply_run_policy(arena, enabled).await;
-}
-
-async fn child_for_run(
-    parent: &Arena,
-    checkpoint: &Checkpoint,
-    read_only: bool,
-    enabled: bool,
-) -> Arena {
-    let mut progress = |_| {};
-    let mut child = parent
-        .child_source()
-        .child(checkpoint, read_only, &mut progress)
-        .await
-        .unwrap();
-    trusted_commit(&mut child, "todos._reset()").await;
-    apply_run_policy(&mut child, enabled).await;
-    child
+    arena(workspace).await
 }
 
 async fn checked(arena: &mut Arena, source: &str) -> Execution {
@@ -111,30 +16,51 @@ async fn checked(arena: &mut Arena, source: &str) -> Execution {
 }
 
 async fn projection(arena: &Arena) -> ToolValue {
-    let before = arena.checkpoint();
-    arena.validate_checkpoint(&before).unwrap();
-    let pool = Arena::open_pool(arena.worker_path.clone()).await.unwrap();
-    let mut checkout = pool.checkout(&arena.repl_config).await.unwrap();
-    Arena::restore_checkout(&mut checkout, &before)
+    ToolValue::List(
+        arena
+            .todos()
+            .iter()
+            .map(|item| {
+                ToolValue::Dictionary(BTreeMap::from([
+                    ("id".to_owned(), ToolValue::Integer(item.id)),
+                    ("text".to_owned(), ToolValue::String(item.text.clone())),
+                    (
+                        "status".to_owned(),
+                        ToolValue::String(
+                            match item.status {
+                                crate::todos::TodoStatus::Pending => "pending",
+                                crate::todos::TodoStatus::InProgress => "in_progress",
+                                crate::todos::TodoStatus::Completed => "completed",
+                            }
+                            .to_owned(),
+                        ),
+                    ),
+                ]))
+            })
+            .collect(),
+    )
+}
+
+async fn apply_run_policy(arena: &mut Arena, enabled: bool) {
+    arena
+        .apply_todo_policy(crate::todos::TodoPolicy::capture(enabled))
         .await
         .unwrap();
-    let mut on_print = on_print_sync(|_, _| {});
-    let event = checkout
-        .feed(
-            "{'todos': todos.snapshot()}",
-            vec![],
-            vec![],
-            true,
-            &mut on_print,
-        )
-        .await
-        .unwrap();
-    let TurnEvent::Complete(value) = event else {
-        panic!("{event:?}")
-    };
-    let mut values = result_values_from_monty(value).unwrap();
-    assert_eq!(arena.checkpoint(), before);
-    values.remove("todos").unwrap()
+}
+async fn restore_for_run(arena: &mut Arena, checkpoint: Checkpoint, enabled: bool) {
+    arena.restore(checkpoint).await.unwrap();
+    apply_run_policy(arena, enabled).await;
+}
+async fn child_for_run(
+    parent: &Arena,
+    checkpoint: &Checkpoint,
+    read_only: bool,
+    enabled: bool,
+) -> Arena {
+    let mut child = parent.child(checkpoint, read_only).await.unwrap();
+    child.reset_todos().await.unwrap();
+    apply_run_policy(&mut child, enabled).await;
+    child
 }
 
 fn items(texts: &[&str]) -> ToolValue {
@@ -236,6 +162,7 @@ async fn todo_proof_ordinary_exception_commits_object_mutation() {
         error.text
     );
     assert!(execution.changed_bindings.is_empty());
+    assert_eq!(execution.todos.as_ref(), Some(arena.todos()));
     assert_eq!(projection(&arena).await, items(&["first", "before error"]));
     checked(&mut arena, "assert todos.add('after error') == 3").await;
 }
@@ -245,7 +172,6 @@ async fn todo_proof_cancellation_discards_object_mutation_and_allocator() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("file"), "read").unwrap();
     let (mut arena, gate) = arena_with_read_gate(&workspace).await;
-    install_fixture(&mut arena).await;
     checked(&mut arena, "todos.add('committed')").await;
     let checkpoint = arena.checkpoint();
     let cancellation = CancellationToken::new();
@@ -325,7 +251,7 @@ async fn todo_proof_child_reset_preserves_other_bindings_parent_and_read_only_po
         panic!("{unavailable:?}")
     };
     assert!(
-        error.text.contains("RuntimeError: TODO proof disabled"),
+        error.text.contains("RuntimeError: TODO list is disabled"),
         "{}",
         error.text
     );
@@ -360,7 +286,7 @@ async fn todo_proof_child_reset_preserves_other_bindings_parent_and_read_only_po
 async fn todo_proof_run_policy_overrides_enabled_restore_and_retained_references() {
     let workspace = tempfile::tempdir().unwrap();
     let mut arena = proof_arena(&workspace).await;
-    checked(&mut arena, "retained = todos\nretained_add = todos.add\nretained_snapshot = todos.snapshot\ntodos.add('kept')").await;
+    checked(&mut arena, "retained = todos\nretained_add = todos.add\nretained_snapshot = todos.snapshot\nretained_update = todos.update\nretained_remove = todos.remove\nretained_replace = todos.replace\ntodos.add('kept')").await;
     let enabled = arena.checkpoint();
     for source in [
         "todos.add('forbidden')",
@@ -368,6 +294,9 @@ async fn todo_proof_run_policy_overrides_enabled_restore_and_retained_references
         "retained_add('forbidden')",
         "retained_snapshot()",
         "retained.snapshot()",
+        "retained_update(1, text='forbidden')",
+        "retained_remove(1)",
+        "retained_replace([])",
     ] {
         restore_for_run(&mut arena, enabled.clone(), false).await;
         let execution = execute_checked(&mut arena, source).await.unwrap();
@@ -375,7 +304,7 @@ async fn todo_proof_run_policy_overrides_enabled_restore_and_retained_references
             panic!("{source}: {execution:?}")
         };
         assert!(
-            error.text.contains("RuntimeError: TODO proof disabled"),
+            error.text.contains("RuntimeError: TODO list is disabled"),
             "{source}: {}",
             error.text
         );
@@ -387,39 +316,222 @@ async fn todo_proof_run_policy_overrides_enabled_restore_and_retained_references
 }
 
 #[tokio::test]
-async fn todo_proof_pre_fixture_checkpoint_does_not_gain_bootstrap_or_stubs_on_restore() {
+async fn todo_production_identity_replacement_and_copies() {
     let workspace = tempfile::tempdir().unwrap();
-    let mut arena = arena(&workspace).await;
-    checked(&mut arena, "other = [42]").await;
-    let old = arena.checkpoint();
-    install_fixture(&mut arena).await;
-    checked(&mut arena, "todos.add('new fixture')").await;
-    assert_eq!(arena.checkpoint().identity, old.identity);
+    let mut arena = proof_arena(&workspace).await;
+    checked(&mut arena, r#"
+assert todos.add('one') == 1
+assert todos.add('two', 'in_progress') == 2
+todos.update(1, text='edited', status='completed')
+assert todos.update(2) is None
+todos.update(2, text='two edited')
+assert todos.snapshot()[1]['status'] == 'in_progress'
+todos.update(2, status='pending')
+assert todos.snapshot()[1]['text'] == 'two edited'
+todos.update(2, text='two', status='in_progress')
+assert todos.snapshot() == [{'id': 1, 'text': 'edited', 'status': 'completed'}, {'id': 2, 'text': 'two', 'status': 'in_progress'}]
+todos.remove(1)
+assert todos.snapshot() == [{'id': 2, 'text': 'two', 'status': 'in_progress'}]
+assert todos.add('three') == 3
+accepted = todos.replace(todos.snapshot())
+assert accepted == [{'id': 4, 'text': 'two', 'status': 'in_progress'}, {'id': 5, 'text': 'three', 'status': 'pending'}]
+accepted[0]['text'] = 'copy only'
+assert todos.snapshot()[0]['text'] == 'two'
+assert todos.replace([]) == []
+assert todos.add('after clear') == 6
+for stale in [1, 2, 3, 4, 5]:
+    try:
+        todos.update(stale, text='stale')
+        raise AssertionError('stale update accepted')
+    except KeyError:
+        pass
+    try:
+        todos.remove(stale)
+        raise AssertionError('stale remove accepted')
+    except KeyError:
+        pass
+assert todos.snapshot() == [{'id': 6, 'text': 'after clear', 'status': 'pending'}]
+"#).await;
+    assert_eq!(arena.todos()[0].id, 6);
     let before = arena.checkpoint();
-    let mut foreign = old.clone();
-    foreign.identity = RuntimeIdentity("foreign-todo-proof".to_owned());
-    assert!(matches!(
-        arena.restore(foreign).await,
-        Err(ArenaError::IncompatibleCheckpoint { .. })
-    ));
+    let snapshot = arena.todos().clone();
+    assert_eq!(arena.todos(), &snapshot);
     assert_eq!(arena.checkpoint(), before);
-    arena.restore(old).await.unwrap();
-    checked(&mut arena, "assert other == [42]").await;
-    trusted_commit(
+}
+
+#[tokio::test]
+async fn todo_production_validation_is_atomic_and_unicode_bounded() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut arena = proof_arena(&workspace).await;
+    checked(&mut arena, r#"
+from typing import Any
+assert todos.add('🦀' * 512) == 1
+before = todos.snapshot()
+invalid_texts: list[Any] = ['', ' \t\n\u2003', '🦀' * 513, None, 42, ['nested']]
+for invalid_text in invalid_texts:
+    try:
+        todos.add(invalid_text)
+        raise AssertionError('invalid add accepted')
+    except ValueError:
+        pass
+    try:
+        todos.update(1, text=invalid_text)
+        raise AssertionError('invalid update accepted')
+    except ValueError:
+        pass
+    assert todos.snapshot() == before
+invalid_statuses: list[Any] = ['', 'done', 'PENDING', None, 1, ['pending']]
+for invalid_status in invalid_statuses:
+    try:
+        todos.add('invalid', invalid_status)
+        raise AssertionError('invalid status accepted')
+    except ValueError:
+        pass
+    try:
+        todos.update(1, text='must not change', status=invalid_status)
+        raise AssertionError('invalid update status accepted')
+    except ValueError:
+        pass
+    assert todos.snapshot() == before
+bad_replacements: list[Any] = [None, {}, 'text', [42], [{'text': 'missing'}], [{'status': 'pending'}], [{'text': 'extra', 'status': 'pending', 'phase': 'no'}], [{'text': ' ', 'status': 'pending'}], [{'text': 'bad', 'status': 'done'}], [{'text': '🦀' * 513, 'status': 'pending'}]]
+for invalid_replacement in bad_replacements:
+    try:
+        todos.replace([{'text': 'valid first', 'status': 'pending'}, *invalid_replacement] if isinstance(invalid_replacement, list) else invalid_replacement)
+        raise AssertionError('invalid replacement accepted')
+    except ValueError:
+        pass
+    assert todos.snapshot() == before
+assert todos.add('allocator unchanged') == 2
+assert todos.replace([{'id': 'ignored', 'text': 'fresh', 'status': 'completed'}]) == [{'id': 3, 'text': 'fresh', 'status': 'completed'}]
+"#).await;
+    assert_eq!(arena.todos()[0].id, 3);
+}
+
+#[tokio::test]
+async fn todo_production_all_statuses_count_toward_capacity() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut arena = proof_arena(&workspace).await;
+    checked(&mut arena, r#"
+statuses = ['pending', 'in_progress', 'completed']
+for index in range(64):
+    assert todos.add(str(index), statuses[index % 3]) == index + 1
+before = todos.snapshot()
+try:
+    todos.add('65')
+    raise AssertionError('oversized add accepted')
+except ValueError:
+    pass
+try:
+    todos.replace([{'text': str(index), 'status': statuses[index % 3]} for index in range(65)])
+    raise AssertionError('oversized replacement accepted')
+except ValueError:
+    pass
+assert todos.snapshot() == before
+todos.remove(1)
+assert todos.add('not consumed') == 65
+accepted = todos.replace([{'text': '界' * 512, 'status': statuses[index % 3]} for index in range(64)])
+assert len(accepted) == 64
+assert accepted[0]['id'] == 66
+assert accepted[63]['id'] == 129
+"#).await;
+    assert_eq!(arena.todos().len(), 64);
+}
+
+#[tokio::test]
+async fn todo_production_v3_and_foreign_checkpoints_rejected_even_disabled() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut arena = proof_arena(&workspace).await;
+    checked(&mut arena, "other = [42]\ntodos.add('kept')").await;
+    apply_run_policy(&mut arena, false).await;
+    let before = arena.checkpoint();
+    for identity in ["monty-dump-13+type-check-v3", "foreign-todo-proof"] {
+        let mut old = before.clone();
+        old.identity = RuntimeIdentity(identity.to_owned());
+        assert!(matches!(
+            arena.restore(old).await,
+            Err(ArenaError::IncompatibleCheckpoint { .. })
+        ));
+        assert_eq!(arena.checkpoint(), before);
+    }
+    assert!(arena.todo_reference().is_empty());
+    assert!(
+        !arena
+            .child_source()
+            .prompt_reference(false, true)
+            .contains("todos.add")
+    );
+    apply_run_policy(&mut arena, true).await;
+    assert!(arena.todo_reference().contains("todos.add"));
+    assert!(
+        arena
+            .child_source()
+            .prompt_reference(false, true)
+            .contains("todos.add")
+    );
+    checked(
         &mut arena,
-        "assert 'todos' not in _kiki_locals()\nassert 'TodoList' not in _kiki_locals()",
+        "assert other == [42]\nassert todos.add('continued') == 2",
     )
     .await;
-    let missing = execute_checked(&mut arena, "todos.snapshot()")
+}
+
+#[tokio::test]
+async fn todo_production_collection_failure_discards_attempt_without_stale_publication() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut arena = proof_arena(&workspace).await;
+    checked(&mut arena, "other = [42]\ntodos.add('committed')").await;
+    let before = arena.checkpoint();
+    let projection_before = arena.todos().clone();
+    let failed = arena
+        .execute(
+            "todos.add('discarded')\n_kiki_todos._items = 42",
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(failed, Err(ArenaError::Infrastructure { ref message, .. }) if message.contains("TODO projection failed: not a list")),
+        "{failed:?}"
+    );
+    assert_eq!(arena.checkpoint(), before);
+    assert_eq!(arena.todos(), &projection_before);
+    checked(
+        &mut arena,
+        "assert other == [42]\nassert todos.add('continued') == 2",
+    )
+    .await;
+    let enabled = arena.checkpoint();
+    apply_run_policy(&mut arena, false).await;
+    arena.restore(enabled).await.unwrap();
+    arena.checkout.take();
+    let disabled = execute_checked(&mut arena, "todos.snapshot()")
         .await
         .unwrap();
-    let ExecutionOutcome::TypeCheckError(error) = missing.outcome else {
-        panic!("{missing:?}")
-    };
     assert!(
-        error.text.contains("unresolved-reference"),
-        "{}",
-        error.text
+        matches!(disabled.outcome, ExecutionOutcome::PythonError(ref error) if error.text.contains("RuntimeError: TODO list is disabled"))
     );
-    assert!(error.text.contains("todos"), "{}", error.text);
+    assert_eq!(
+        arena.todo_policy(),
+        crate::todos::TodoPolicy::capture(false)
+    );
+    apply_run_policy(&mut arena, true).await;
+    checked(&mut arena, "assert todos.add('after recovery') == 3").await;
+}
+
+#[tokio::test]
+async fn todo_production_checked_snapshot_ids_and_replacement_variables() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut arena = proof_arena(&workspace).await;
+    checked(
+        &mut arena,
+        r#"
+items = [{"text": "first", "status": "pending"}, {"text": "second", "status": "pending"}]
+accepted = todos.replace(items)
+first_id = accepted[0]["id"]
+todos.update(first_id, status="completed")
+copy = todos.snapshot()
+todos.remove(copy[1]["id"])
+assert todos.snapshot() == [{"id": first_id, "text": "first", "status": "completed"}]
+"#,
+    )
+    .await;
 }

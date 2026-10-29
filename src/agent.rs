@@ -6136,6 +6136,7 @@ mod tests {
             tool_calls: Vec::new(),
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
+            todos: None,
             changed_bindings: vec![
                 ArenaBinding {
                     name: "rows".to_owned(),
@@ -6217,6 +6218,7 @@ mod tests {
             read_paths: vec![PathBuf::from("private/effect-sentinel")],
             modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
             changed_bindings: Vec::new(),
+            todos: None,
         };
 
         let feedback = super::execution_feedback(&execution);
@@ -6358,6 +6360,7 @@ mod tests {
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
             changed_bindings: Vec::new(),
+            todos: None,
         };
 
         assert_eq!(

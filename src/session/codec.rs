@@ -236,6 +236,8 @@ struct StoredExecution {
     tool_calls: Vec<StoredToolCall>,
     read_paths: Vec<String>,
     modified_paths: Vec<String>,
+    #[serde(default)]
+    todos: Option<crate::todos::TodoSnapshot>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1290,6 +1292,7 @@ fn encode_execution_value(execution: &Execution) -> Result<StoredExecution, Code
         tool_calls: execution.tool_calls.iter().map(encode_tool_call).collect(),
         read_paths: encode_effect_paths(&execution.read_paths)?,
         modified_paths: encode_effect_paths(&execution.modified_paths)?,
+        todos: execution.todos.clone(),
     })
 }
 
@@ -1325,6 +1328,7 @@ fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, Code
         modified_paths: decode_effect_paths(&execution.modified_paths)?,
         // Only model feedback reads these, and it is stored as rendered text.
         changed_bindings: Vec::new(),
+        todos: execution.todos.clone(),
     })
 }
 
@@ -2129,6 +2133,48 @@ mod tests {
     }
 
     #[test]
+    fn todo_projection_codec_roundtrip_and_old_record_default() {
+        let empty = super::decode_observation(&super::StoredObservation {
+            head: String::new(),
+            tail: None,
+            head_lines: 0,
+            tail_lines: 0,
+            total_lines: 0,
+            total_bytes: 0,
+            omitted_lines: 0,
+            omitted_bytes: 0,
+            head_ends_mid_line: false,
+            tail_starts_mid_line: false,
+            partial_lines: false,
+        });
+        let mut execution = Execution {
+            stdout: empty.clone(),
+            stderr: empty,
+            outcome: ExecutionOutcome::Complete { result: None },
+            tool_calls: Vec::new(),
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
+            changed_bindings: Vec::new(),
+            todos: None,
+        };
+        execution.todos = Some(vec![crate::todos::TodoItem {
+            id: 7,
+            text: "界🦀".to_owned(),
+            status: crate::todos::TodoStatus::InProgress,
+        }]);
+        let stored = super::encode_execution_value(&execution).unwrap();
+        let mut json = serde_json::to_value(stored).unwrap();
+        let decoded: super::StoredExecution = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            super::decode_execution_value(&decoded).unwrap().todos,
+            execution.todos
+        );
+        json.as_object_mut().unwrap().remove("todos");
+        let old: super::StoredExecution = serde_json::from_value(json).unwrap();
+        assert_eq!(super::decode_execution_value(&old).unwrap().todos, None);
+    }
+
+    #[test]
     fn execution_codec_preserves_observations_and_errors() {
         let observation = |head: &str| Observation {
             head: head.to_owned(),
@@ -2151,6 +2197,7 @@ mod tests {
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
             changed_bindings: Vec::new(),
+            todos: None,
         };
 
         for outcome in [
@@ -2415,6 +2462,7 @@ mod tests {
             read_paths: vec![PathBuf::from("nested/read")],
             modified_paths: vec![PathBuf::from("nested/modified")],
             changed_bindings: Vec::new(),
+            todos: None,
         };
         let attempts = vec![
             crate::model::AttemptAccounting::KnownUsageWithUntrackedRetries(
@@ -3141,6 +3189,7 @@ mod tests {
             read_paths: vec![PathBuf::from("nested/read")],
             modified_paths: vec![PathBuf::from("nested/modified")],
             changed_bindings: Vec::new(),
+            todos: None,
         }
     }
 

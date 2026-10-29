@@ -655,13 +655,14 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
 ];
 
 pub(crate) fn bootstrap_source() -> String {
-    tool_source(false)
+    format!("{}\n{}", tool_source(false), crate::todos::BOOTSTRAP)
 }
 
 pub(crate) fn type_check_stubs() -> String {
     format!(
-        "{}\n\nclass FileNotFoundError(OSError): ...\nclass IsADirectoryError(OSError): ...\nclass NotADirectoryError(OSError): ...\nclass PermissionError(OSError): ...\n\ndef format(value: object, format_spec: str = '', /) -> str: ...\n\nresult_values: dict[str, object] = {{}}",
-        type_reference_source(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), true)
+        "{}\n{}\n\nclass FileNotFoundError(OSError): ...\nclass IsADirectoryError(OSError): ...\nclass NotADirectoryError(OSError): ...\nclass PermissionError(OSError): ...\n\ndef format(value: object, format_spec: str = '', /) -> str: ...\n\nresult_values: dict[str, object] = {{}}",
+        type_reference_source(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), true),
+        crate::todos::STUBS
     )
 }
 
@@ -674,7 +675,21 @@ fn prompt_reference_with_visibility(
     read_only: bool,
     subagents_visible: bool,
 ) -> String {
-    prompt_reference_for(
+    prompt_reference_with_todo_policy(
+        load_skill_visible,
+        read_only,
+        subagents_visible,
+        crate::todos::TodoPolicy::default(),
+    )
+}
+
+fn prompt_reference_with_todo_policy(
+    load_skill_visible: bool,
+    read_only: bool,
+    subagents_visible: bool,
+    todo_policy: crate::todos::TodoPolicy,
+) -> String {
+    let reference = prompt_reference_for(
         &ACTIVE_TOOLS
             .iter()
             .filter(|definition| {
@@ -684,7 +699,8 @@ fn prompt_reference_with_visibility(
             .collect::<Vec<_>>(),
         read_only,
         subagents_visible,
-    )
+    );
+    format!("{reference}\n{}", todo_policy.reference())
 }
 
 fn prompt_reference_for(
@@ -1872,11 +1888,21 @@ impl ToolHost {
     }
 
     /// Children that cannot start subagents do not see the subagent functions.
+    #[cfg(test)]
     pub(crate) fn prompt_reference(&self, can_delegate: bool) -> String {
-        prompt_reference_with_visibility(
+        self.prompt_reference_with_todo_policy(can_delegate, crate::todos::TodoPolicy::default())
+    }
+
+    pub(crate) fn prompt_reference_with_todo_policy(
+        &self,
+        can_delegate: bool,
+        policy: crate::todos::TodoPolicy,
+    ) -> String {
+        prompt_reference_with_todo_policy(
             self.skill_catalog.rendered_catalog().is_some(),
             self.read_only,
             can_delegate,
+            policy,
         )
     }
 
@@ -7899,9 +7925,10 @@ mod tests {
                     "    return CommandResult(**await _kiki_run(command, cwd))\n\n",
                     "async def load_skill(name: str) -> str:\n",
                     "    \"\"\"Activate one model-invocable skill from the process catalog.\"\"\"\n",
-                    "    return await _kiki_load_skill(name)\n\n{}"
+                    "    return await _kiki_load_skill(name)\n\n{}\n{}"
                 ),
-                invocation_source(false)
+                invocation_source(false),
+                crate::todos::BOOTSTRAP
             )
         );
         let reference = prompt_reference(&SkillCatalog::default());

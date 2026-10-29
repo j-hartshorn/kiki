@@ -238,3 +238,24 @@ that cannot honor the agreed source contract.
   publication/retention acceptance tests remain in task 4; actual generated
   context, compaction, budgeting, and provider request tests remain in task 5.
   Those are not claimed implemented or verified by the test-only fixture.
+
+- Task 3: production `src/todos.py` + `src/todos.rs`, generated bootstrap/checking
+  declarations, v4 checkpoint identity, host policy/reset/read hooks, committed
+  Execution projections, and backward-readable StoredExecution fields implemented.
+  The toy proof object was removed; its checked-path assertions now use production.
+  Coordinator admission, settings, generated context, and UI remain later tasks.
+- Task 3 interruption: implementer 7 timed out after25steps, leaving compiling code.
+  Orchestrator inspected every affected module/diff and completed verification.
+  Original implementer red evidence was unavailable; explicit bootstrap-absence
+  fault injection reproduced missing-capability failure and was exactly restored.
+- Task 3 review: fixed valid snapshot-ID/replacement-variable checking rejection
+  via permissive dictionary values in those two declarations, preserving typed
+  method arguments and all runtime schema/limit checks. Added checked regression:
+  observed3invalid-argument-type errors red, then14focused TODO tests green.
+  Independent re-review CLEAN. Wheel-scroll observation declined as unrelated
+  root-main divergence; actual task-base diff has only Execution fixture fields.
+- Task 3 current evidence: `RUST_TEST_THREADS=1 just test` passed1795unit +5credentials
+  +17sessions CLI tests,8ignored. `just lint`, fmtcheck, diffcheck passed. Serial
+  execution avoids independently observed pre-body worker-startup deadline flakes;
+  no worker timing behavior changed. Root guidance/policy lifecycle remains an
+  explicit task5/6 integration requirement, not a completed capability toggle.

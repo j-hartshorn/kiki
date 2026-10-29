@@ -5153,6 +5153,7 @@ mod tests {
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
                 changed_bindings: Vec::new(),
+                todos: None,
             }),
             attempts: Vec::new(),
         };
@@ -5612,6 +5613,7 @@ mod tests {
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
             changed_bindings: Vec::new(),
+            todos: None,
         }
     }
 
@@ -5794,6 +5796,7 @@ mod tests {
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
                 changed_bindings: Vec::new(),
+                todos: None,
             },
         )
         .await
@@ -7469,6 +7472,7 @@ mod tests {
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
             changed_bindings: Vec::new(),
+            todos: None,
         };
         let (_, execution) = settle_fixture_execution_with(
             &session,
@@ -8637,6 +8641,7 @@ mod tests {
                 read_paths: vec![PathBuf::from("a-b"), PathBuf::from("a/b")],
                 modified_paths: vec![PathBuf::from("m-n"), PathBuf::from("m/n")],
                 changed_bindings: Vec::new(),
+                todos: None,
             },
         )
         .await;
@@ -9715,6 +9720,7 @@ mod tests {
                     read_paths: Vec::new(),
                     modified_paths: Vec::new(),
                     changed_bindings: Vec::new(),
+                    todos: None,
                 },
                 vec![crate::model::AttemptAccounting::UsageUnavailable],
             )],
@@ -10602,6 +10608,7 @@ mod tests {
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
                                     changed_bindings: Vec::new(),
+                                    todos: None,
                                 }),
                                 attempts: Vec::new(),
                             },
@@ -10972,6 +10979,7 @@ mod tests {
                             read_paths: Vec::new(),
                             modified_paths: Vec::new(),
                             changed_bindings: Vec::new(),
+                            todos: None,
                         }),
                         attempts: Vec::new(),
                     },
@@ -11115,6 +11123,7 @@ mod tests {
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
                 changed_bindings: Vec::new(),
+                todos: None,
             }),
             attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
         };
@@ -11284,6 +11293,7 @@ mod tests {
                 read_paths: Vec::new(),
                 modified_paths: Vec::new(),
                 changed_bindings: Vec::new(),
+                todos: None,
             }),
             attempts: Vec::new(),
         };

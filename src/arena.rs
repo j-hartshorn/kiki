@@ -45,6 +45,7 @@ use crate::{
     },
 };
 
+use crate::todos::{TodoItem, TodoPolicy, TodoSnapshot, TodoStatus};
 pub(crate) use crate::tools::ToolName;
 
 /// Identity of the Monty worker runtime. A standalone `monty` prints exactly
@@ -162,6 +163,7 @@ pub struct Execution {
     pub(crate) modified_paths: Vec<PathBuf>,
     /// Top-level bindings created or rebound, not objects mutated in place.
     pub(crate) changed_bindings: Vec<ArenaBinding>,
+    pub(crate) todos: Option<TodoSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -768,6 +770,7 @@ pub(crate) struct ArenaChildSource {
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     model_type_check_disabled: bool,
+    todo_policy: TodoPolicy,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
@@ -808,6 +811,12 @@ impl ArenaChildSource {
         progress(ChildArenaConstructionPhase::CheckedOut);
         Arena::restore_checkout(&mut checkout, checkpoint).await?;
         progress(ChildArenaConstructionPhase::CheckpointRestored);
+        let todos = timeout(self.execution_timeout, async {
+            apply_todo_policy_checkout(&mut checkout, self.todo_policy).await?;
+            read_todos(&mut checkout).await
+        })
+        .await
+        .map_err(|_| todo_failure("child collection timed out"))??;
         reset_result_values(&mut checkout).await?;
         progress(ChildArenaConstructionPhase::ResultValuesReset);
         let state = checkout.dump().await.map_err(pool_failure)?;
@@ -827,6 +836,8 @@ impl ArenaChildSource {
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
             model_type_check_disabled: self.model_type_check_disabled,
+            todo_policy: self.todo_policy,
+            todos,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -843,7 +854,7 @@ impl ArenaChildSource {
     pub(crate) fn prompt_reference(&self, read_only: bool, can_delegate: bool) -> String {
         self.tool_host
             .for_child(read_only)
-            .prompt_reference(can_delegate)
+            .prompt_reference_with_todo_policy(can_delegate, self.todo_policy)
     }
 
     pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
@@ -857,11 +868,13 @@ pub struct Arena {
     checkout: Option<Checkout>,
     tool_host: ToolHost,
     checkpoint: Checkpoint,
+    todos: TodoSnapshot,
     /// The checkpoint's top-level bindings, when already read.
     bindings: Option<Bindings>,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     model_type_check_disabled: bool,
+    todo_policy: TodoPolicy,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
@@ -974,6 +987,8 @@ impl Arena {
             runtime,
             repl_config,
             model_type_check_disabled: false,
+            todo_policy: TodoPolicy::default(),
+            todos: Vec::new(),
             execution_timeout,
             clock,
             #[cfg(test)]
@@ -1001,6 +1016,7 @@ impl Arena {
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
             model_type_check_disabled: self.model_type_check_disabled,
+            todo_policy: self.todo_policy,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -1130,6 +1146,7 @@ impl Arena {
             &self.tool_host,
             code,
             self.bindings.take(),
+            &self.todos,
             skip_type_check,
             context.as_ref(),
             max_memory,
@@ -1148,6 +1165,7 @@ impl Arena {
                 state,
                 changed_bindings,
                 bindings,
+                todos,
             }) => {
                 let skill_activations = if matches!(&outcome, ExecutionOutcome::Complete { .. }) {
                     skill_ledger.into_captured()
@@ -1161,6 +1179,7 @@ impl Arena {
                     authorisations,
                 };
                 self.bindings = Some(bindings);
+                self.todos = todos.clone();
                 let (tool_calls, read_paths, modified_paths) = interruption.tools.into_parts();
                 Ok((
                     Execution {
@@ -1171,6 +1190,7 @@ impl Arena {
                         read_paths,
                         modified_paths,
                         changed_bindings,
+                        todos: Some(todos),
                     },
                     skill_activations,
                 ))
@@ -1182,6 +1202,39 @@ impl Arena {
                 Err(self.recover(error).await)
             }
         }
+    }
+
+    pub fn todo_policy(&self) -> TodoPolicy {
+        self.todo_policy
+    }
+
+    pub fn todo_reference(&self) -> &'static str {
+        self.todo_policy.reference()
+    }
+
+    pub fn todos(&self) -> &TodoSnapshot {
+        &self.todos
+    }
+
+    pub async fn apply_todo_policy(&mut self, policy: TodoPolicy) -> Result<(), ArenaError> {
+        self.todo_policy = policy;
+        self.checkout.take();
+        self.restore_current_checkpoint_if_needed().await
+    }
+
+    pub async fn reset_todos(&mut self) -> Result<(), ArenaError> {
+        self.restore_current_checkpoint_if_needed().await?;
+        let mut checkout = self.checkout.take().expect("restored checkout");
+        let state = timeout(self.execution_timeout, async {
+            trusted_todo_feed(&mut checkout, "_kiki_todos._reset()").await?;
+            checkout.dump().await.map_err(pool_failure)
+        })
+        .await
+        .map_err(|_| todo_failure("reset timed out"))??;
+        self.checkpoint.state = state;
+        self.todos.clear();
+        self.checkout = Some(checkout);
+        Ok(())
     }
 
     pub fn checkpoint(&self) -> Checkpoint {
@@ -1295,7 +1348,11 @@ impl Arena {
     pub async fn restore(&mut self, checkpoint: Checkpoint) -> Result<(), ArenaError> {
         self.validate_checkpoint(&checkpoint)?;
         self.checkout.take();
-        let checkout = self.checkout_from_checkpoint(&checkpoint).await?;
+        let mut checkout = self.checkout_from_checkpoint(&checkpoint).await?;
+        let todos = timeout(self.execution_timeout, read_todos(&mut checkout))
+            .await
+            .map_err(|_| todo_failure("collection timed out"))??;
+        self.todos = todos;
         self.checkout = Some(checkout);
         self.checkpoint = checkpoint;
         self.bindings = None;
@@ -1385,6 +1442,12 @@ impl Arena {
             .await
             .map_err(pool_failure)?;
         Self::restore_checkout(&mut checkout, checkpoint).await?;
+        timeout(
+            self.execution_timeout,
+            apply_todo_policy_checkout(&mut checkout, self.todo_policy),
+        )
+        .await
+        .map_err(|_| todo_failure("policy application timed out"))??;
         Ok(checkout)
     }
 
@@ -1402,6 +1465,83 @@ impl Arena {
         }
         Ok(())
     }
+}
+
+fn todo_failure(detail: impl fmt::Display) -> ArenaError {
+    ArenaError::Infrastructure {
+        message: format!("Arena TODO projection failed: {detail}"),
+        execution: None,
+    }
+}
+
+async fn trusted_todo_feed(
+    checkout: &mut Checkout,
+    source: &str,
+) -> Result<MontyObject, ArenaError> {
+    let mut on_print = on_print_sync(|_, _| {});
+    match checkout
+        .feed(source, vec![], vec![], true, &mut on_print)
+        .await
+    {
+        Ok(TurnEvent::Complete(value)) => Ok(value),
+        Ok(event) => Err(todo_failure(format!("unexpected suspension {event:?}"))),
+        Err(error) => Err(todo_failure(error)),
+    }
+}
+
+async fn apply_todo_policy_checkout(
+    checkout: &mut Checkout,
+    policy: TodoPolicy,
+) -> Result<(), ArenaError> {
+    trusted_todo_feed(checkout, policy.source()).await?;
+    Ok(())
+}
+
+async fn read_todos(checkout: &mut Checkout) -> Result<TodoSnapshot, ArenaError> {
+    let value = trusted_todo_feed(checkout, "_kiki_todos._items").await?;
+    let Transfer::List(items) = Transfer::of(value.as_ref()) else {
+        return Err(todo_failure("not a list"));
+    };
+    if items.len() > 64 {
+        return Err(todo_failure("more than 64 items"));
+    }
+    let mut snapshot = Vec::with_capacity(items.len());
+    let mut ids = BTreeSet::new();
+    for item in items {
+        let Transfer::Dict(fields) = Transfer::of(item) else {
+            return Err(todo_failure("item is not a dictionary"));
+        };
+        if fields.len() != 3 {
+            return Err(todo_failure("invalid item fields"));
+        }
+        let (mut id, mut text, mut status) = (None, None, None);
+        for (key, value) in fields {
+            match (key.as_str(), Transfer::of(value)) {
+                (Some("id"), Transfer::Int(value)) if value > 0 => id = Some(value),
+                (Some("text"), Transfer::String(value))
+                    if !value.trim().is_empty() && value.chars().count() <= 512 =>
+                {
+                    text = Some(value.to_owned())
+                }
+                (Some("status"), Transfer::String("pending")) => status = Some(TodoStatus::Pending),
+                (Some("status"), Transfer::String("in_progress")) => {
+                    status = Some(TodoStatus::InProgress)
+                }
+                (Some("status"), Transfer::String("completed")) => {
+                    status = Some(TodoStatus::Completed)
+                }
+                _ => return Err(todo_failure("invalid item field")),
+            }
+        }
+        let (Some(id), Some(text), Some(status)) = (id, text, status) else {
+            return Err(todo_failure("missing item field"));
+        };
+        if !ids.insert(id) {
+            return Err(todo_failure("duplicate item ID"));
+        }
+        snapshot.push(TodoItem { id, text, status });
+    }
+    Ok(snapshot)
 }
 
 async fn reset_result_values(checkout: &mut Checkout) -> Result<(), ArenaError> {
@@ -1617,7 +1757,7 @@ fn checkpoint_runtime(state: &[u8]) -> Result<RuntimeIdentity, ArenaError> {
             execution: None,
         })?;
     Ok(RuntimeIdentity(format!(
-        "monty-dump-{version}+type-check-v3"
+        "monty-dump-{version}+type-check-v4"
     )))
 }
 
@@ -1686,6 +1826,7 @@ async fn execute_checkout(
     tool_host: &ToolHost,
     code: &str,
     bindings: Option<Bindings>,
+    committed_todos: &TodoSnapshot,
     skip_type_check: bool,
     context: Option<&TrustedExecutionContext>,
     max_memory: Option<usize>,
@@ -1746,6 +1887,15 @@ async fn execute_checkout(
     } else {
         read_bindings_within_budget(checkout, budget, cancellation).await?
     };
+    let todos = if unsafe_memory || matches!(outcome, ExecutionOutcome::TypeCheckError(_)) {
+        committed_todos.clone()
+    } else {
+        budget
+            .wait(cancellation, read_todos(checkout))
+            .await
+            .map_err(AttemptFailure::from)?
+            .map_err(AttemptFailure::Driver)?
+    };
     let state = budget
         .wait(cancellation, checkout.dump())
         .await
@@ -1772,6 +1922,7 @@ async fn execute_checkout(
         state,
         changed_bindings: changed_bindings(&before, &after),
         bindings: after,
+        todos,
     })
 }
 
@@ -1780,6 +1931,7 @@ struct ExecutedCheckout {
     state: Vec<u8>,
     changed_bindings: Vec<ArenaBinding>,
     bindings: Bindings,
+    todos: TodoSnapshot,
 }
 
 /// Each top-level binding's type name and object identity, which Monty can
@@ -3744,12 +3896,13 @@ mod tests {
     async fn legacy_checkpoints_cannot_disable_model_type_checks() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
-        assert_eq!(arena.checkpoint().identity.0, "monty-dump-13+type-check-v3");
+        assert_eq!(arena.checkpoint().identity.0, "monty-dump-13+type-check-v4");
         for identity in [
             RUNTIME_IDENTITY.to_owned(),
             format!("{RUNTIME_IDENTITY}+type-check"),
             format!("{RUNTIME_IDENTITY}+type-check-v3"),
             "monty-dump-13+type-check-v2".to_owned(),
+            "monty-dump-13+type-check-v3".to_owned(),
         ] {
             let mut checkpoint = arena.checkpoint();
             checkpoint.identity = RuntimeIdentity(identity);
