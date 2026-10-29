@@ -216,14 +216,24 @@ fn slash_argument(rest: &str) -> Option<&str> {
 }
 
 fn prefix_matches(commands: &[CompletionCommand], draft: &str, caret_at_end: bool) -> Vec<usize> {
-    if !caret_at_end || draft.contains('\n') || !draft.starts_with('/') {
+    let Some(name_prefix) = draft.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if !caret_at_end
+        || draft.chars().any(char::is_whitespace)
+        || CATALOGUE.iter().any(|command| command.token == draft)
+    {
         return Vec::new();
     }
     commands
         .iter()
         .enumerate()
         .filter(|(_, command)| {
-            draft.len() < command.token.len() && command.token.starts_with(draft)
+            (draft.len() < command.token.len() && command.token.starts_with(draft))
+                || command
+                    .token
+                    .strip_prefix("/skill:")
+                    .is_some_and(|name| name.starts_with(name_prefix))
         })
         .map(|(index, _)| index)
         .collect()
@@ -261,6 +271,97 @@ mod tests {
             Some("review-more")
         );
         assert_eq!(parse("/skill:").unwrap().skill_name, Some(""));
+    }
+
+    #[test]
+    fn skill_completion_matches_names_and_canonical_tokens_without_duplicates() {
+        let mut completion =
+            Completion::with_skills([("review-more", "Review more"), ("review", "Review code")]);
+        for draft in ["/", "/revi", "/review", "/skill:", "/skill:revi"] {
+            completion.sync(draft, true);
+            let rows = completion.visible_rows(usize::MAX);
+            let skills = rows
+                .iter()
+                .filter(|row| row.token.starts_with("/skill:"))
+                .map(|row| (row.token, row.purpose))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                skills,
+                [
+                    ("/skill:review", "Review code"),
+                    ("/skill:review-more", "Review more"),
+                ],
+                "{draft}"
+            );
+        }
+        completion.sync("/review-more", true);
+        assert_eq!(completion.selected_token(), Some("/skill:review-more"));
+        assert_eq!(completion.visible_rows(usize::MAX).len(), 1);
+        completion.sync("/skill:review-more", true);
+        assert!(completion.visible_rows(usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn exact_builtins_take_priority_over_skill_name_matches() {
+        let mut skills = super::CATALOGUE
+            .iter()
+            .map(|command| (command.token.strip_prefix('/').unwrap(), "Same name"))
+            .collect::<Vec<_>>();
+        skills.push(("model-review", "Longer name"));
+        let mut completion = Completion::with_skills(skills);
+        completion.sync("/mo", true);
+        assert_eq!(
+            completion
+                .visible_rows(usize::MAX)
+                .iter()
+                .map(|row| row.token)
+                .collect::<Vec<_>>(),
+            ["/model", "/skill:model", "/skill:model-review"]
+        );
+        for command in super::CATALOGUE {
+            completion.sync(command.token, true);
+            assert!(
+                completion.visible_rows(usize::MAX).is_empty(),
+                "{}",
+                command.token
+            );
+        }
+        completion.sync("/skill:mo", true);
+        assert_eq!(completion.selected_token(), Some("/skill:model"));
+    }
+
+    #[test]
+    fn skill_name_completion_keeps_token_boundaries_and_case_sensitivity() {
+        let mut completion = Completion::with_skills([("review", "Review code")]);
+        for (draft, caret_at_end) in [
+            ("/Revi", true),
+            ("/evi", true),
+            ("/reviewing", true),
+            ("revi", true),
+            (" /revi", true),
+            ("/revi ", true),
+            ("/revi inspect this", true),
+            ("/revi\n", true),
+            ("/revi\t", true),
+            ("/revi", false),
+        ] {
+            completion.sync(draft, caret_at_end);
+            assert!(completion.visible_rows(usize::MAX).is_empty(), "{draft:?}");
+        }
+    }
+
+    #[test]
+    fn skill_selection_is_preserved_between_name_and_canonical_searches() {
+        let mut completion =
+            Completion::with_skills([("review", "Review code"), ("revision", "Revise code")]);
+        completion.sync("/rev", true);
+        assert_eq!(completion.selected_token(), Some("/skill:review"));
+        assert!(completion.move_selection(1));
+        assert_eq!(completion.selected_token(), Some("/skill:revision"));
+        completion.sync("/skill:rev", true);
+        assert_eq!(completion.selected_token(), Some("/skill:revision"));
+        completion.sync("/review", true);
+        assert_eq!(completion.selected_token(), Some("/skill:review"));
     }
 
     #[test]
