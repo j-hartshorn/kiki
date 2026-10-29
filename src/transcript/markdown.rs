@@ -1,3 +1,4 @@
+mod records;
 mod wrapping;
 
 use std::ops::Range;
@@ -68,7 +69,10 @@ pub(super) fn render(
         if natural_width <= usize::from(width) {
             None
         } else {
-            constrained_grid(table, width, options)
+            Some(
+                constrained_grid(table, width, options)
+                    .unwrap_or_else(|| records::render(table, width)),
+            )
         }
     })
 }
@@ -618,6 +622,54 @@ mod tests {
                     .all(|line| line.to_string().starts_with("> "))
             );
         }
+    }
+
+    #[test]
+    fn adapter_switches_four_line_rows_to_records_without_dropping_fields() {
+        let options = super::super::markdown_options(&DARK);
+        let source = "| H |\n| --- |\n| one two six ten |";
+        let layout = render(source, 7, options);
+        assert_eq!(layout.text.to_string(), "- H:\none two\nsix ten");
+        assert_eq!(
+            layout.breaks,
+            [LineBreak::Hard, LineBreak::Word, LineBreak::Word]
+        );
+    }
+
+    #[test]
+    fn displayed_markdown_link_destinations_keep_the_scheme_whole() {
+        let source = "| H |\n| --- |\n| [guide](https://example.com/a) |";
+        let layout = render(source, 8, super::super::markdown_options(&DARK));
+        assert!(
+            layout
+                .text
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("https://")),
+            "{:?}",
+            layout.text
+        );
+        assert!(
+            !layout
+                .text
+                .lines
+                .iter()
+                .any(|line| line.to_string().ends_with("https:/"))
+        );
+    }
+
+    #[test]
+    fn one_document_can_show_natural_wrapped_and_record_tables() {
+        let source = "| x |\n| --- |\n| a |\n\n| H |\n| --- |\n| one two six ten one two six ten |\n\n| H |\n| --- |\n| identifier_with_many_segments |";
+        let layout = render(source, 20, super::super::markdown_options(&DARK));
+        let display = layout.text.to_string();
+        assert!(display.contains("┌───┐"));
+        assert!(display.contains("┌──────────────────┐"));
+        assert!(
+            display.contains("- H:\nidentifier_with_\nmany_segments"),
+            "{display}"
+        );
+        assert!(layout.text.lines.iter().all(|line| line.width() <= 20));
     }
 
     #[test]
