@@ -129,3 +129,5 @@ Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdow
 ## Implementation notes
 
 - Task 1: structural integration uses header-only carrier tables and original delimiter rows. Cell rendering reuses the pinned renderer through a one-cell table with document references; output structure is covered by compatibility fixtures. The module stays test-only until Task 4.
+- Task 2: capped-even allocation uses whole-token minima and a bounded level search; cell wrapping lives in a private helper and preserves styled word boundaries, including Unicode no-space continuations. Completed grid rows are all hard breaks for copy.
+- Task 2 review fix: cells carry structural inline-code ranges, preserved with collision-free inline-code carriers during synthetic cell rendering. The wrapper treats code identifiers as whole tokens even in scripts where prose can break without spaces; matching text/style alone is not used as code identity.

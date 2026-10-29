@@ -1,3 +1,5 @@
+mod wrapping;
+
 use std::ops::Range;
 
 use pulldown_cmark::{Alignment, Event, Options as ParseOptions, Parser, Tag, TagEnd};
@@ -25,10 +27,25 @@ impl MarkdownLayout {
     }
 }
 
+#[derive(Clone)]
+struct Cell {
+    line: Line<'static>,
+    protected: Vec<Range<usize>>,
+}
+
+impl Cell {
+    fn plain(line: Line<'static>) -> Self {
+        Self {
+            line,
+            protected: Vec::new(),
+        }
+    }
+}
+
 struct Table {
     alignments: Vec<Alignment>,
-    header: Vec<Line<'static>>,
-    rows: Vec<Vec<Line<'static>>>,
+    header: Vec<Cell>,
+    rows: Vec<Vec<Cell>>,
 }
 
 struct SourceTable {
@@ -45,7 +62,15 @@ pub(super) fn render(
     content_width: u16,
     options: &MarkdownOptions,
 ) -> MarkdownLayout {
-    render_with(source, content_width, options, |_, _| None)
+    render_with(source, content_width, options, |table, width| {
+        let natural = natural_columns(table);
+        let natural_width = natural.iter().sum::<usize>() + natural.len() * 3 + 1;
+        if natural_width <= usize::from(width) {
+            None
+        } else {
+            constrained_grid(table, width, options)
+        }
+    })
 }
 
 fn parse_options() -> ParseOptions {
@@ -146,21 +171,56 @@ fn extract(source: &str) -> (Vec<SourceTable>, String, String) {
     (tables, references, marker_text)
 }
 
-fn render_cell(
-    source: &str,
-    header: bool,
-    references: &str,
-    options: &MarkdownOptions,
-) -> Line<'static> {
+fn render_cell(source: &str, header: bool, references: &str, options: &MarkdownOptions) -> Cell {
     let cell_source = if header {
         format!("| {source} |\n| --- |\n\n{references}")
     } else {
         format!("| Cell |\n| --- |\n| {source} |\n\n{references}")
     };
-    let text = owned(from_str_with_options(&cell_source, options));
+    let events = Parser::new_ext(&cell_source, parse_options())
+        .into_offset_iter()
+        .collect::<Vec<_>>();
+    let mut marker_text = cell_source.clone();
+    for (event, _) in &events {
+        match event {
+            Event::Text(text) | Event::Code(text) => marker_text.push_str(text),
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+                marker_text.push_str(dest_url)
+            }
+            _ => {}
+        }
+    }
+    let mut nonce = 0;
+    while marker_text.contains(&format!("KikiInline{nonce}")) {
+        nonce += 1;
+    }
+    let mut codes = Vec::new();
+    let mut rewritten = String::new();
+    let mut cursor = 0;
+    for (event, range) in events {
+        if let Event::Code(code) = event {
+            let marker = format!("KikiInline{nonce}Code{}", codes.len());
+            rewritten.push_str(&cell_source[cursor..range.start]);
+            rewritten.push_str(&format!("`{marker}`"));
+            cursor = range.end;
+            codes.push((marker, code.into_string()));
+        }
+    }
+    rewritten.push_str(&cell_source[cursor..]);
+    let text = owned(from_str_with_options(&rewritten, options));
     let line = &text.lines[if header { 1 } else { 3 }];
     // The pinned renderer emits border, padding, inline spans, padding, border.
-    Line::from(line.spans[2..line.spans.len() - 2].to_vec())
+    let mut line = Line::from(line.spans[2..line.spans.len() - 2].to_vec());
+    let mut offset = 0;
+    let mut protected = Vec::new();
+    for span in &mut line.spans {
+        if let Some((_, code)) = codes.iter().find(|(marker, _)| span.content == *marker) {
+            span.content = code.clone().into();
+            protected.push(offset..offset + code.len());
+        }
+        offset += span.content.len();
+    }
+    Cell { line, protected }
 }
 
 struct Placement {
@@ -313,6 +373,133 @@ fn owned(text: Text<'_>) -> Text<'static> {
     }
 }
 
+fn natural_columns(table: &Table) -> Vec<usize> {
+    let mut widths = vec![1; table.alignments.len()];
+    for row in std::iter::once(&table.header).chain(&table.rows) {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.line.width());
+        }
+    }
+    widths
+}
+
+fn allocate_columns(natural: &[usize], minimum: &[usize], budget: usize) -> Option<Vec<usize>> {
+    if minimum.iter().sum::<usize>() > budget {
+        return None;
+    }
+    if natural.iter().sum::<usize>() <= budget {
+        return Some(natural.to_vec());
+    }
+    let mut low = 0;
+    let mut high = budget;
+    while low < high {
+        let level = low + (high - low).div_ceil(2);
+        let used: usize = natural
+            .iter()
+            .zip(minimum)
+            .map(|(&cap, &floor)| cap.min(floor.max(level)))
+            .sum();
+        if used <= budget {
+            low = level;
+        } else {
+            high = level - 1;
+        }
+    }
+    let mut widths: Vec<_> = natural
+        .iter()
+        .zip(minimum)
+        .map(|(&cap, &floor)| cap.min(floor.max(low)))
+        .collect();
+    let mut remaining = budget - widths.iter().sum::<usize>();
+    for (width, &cap) in widths.iter_mut().zip(natural) {
+        if remaining > 0 && *width <= low && *width < cap {
+            *width += 1;
+            remaining -= 1;
+        }
+    }
+    Some(widths)
+}
+
+fn constrained_grid(
+    table: &Table,
+    width: u16,
+    options: &MarkdownOptions,
+) -> Option<MarkdownLayout> {
+    let natural = natural_columns(table);
+    if natural.is_empty() {
+        return None;
+    }
+    let budget = usize::from(width).checked_sub(natural.len() * 3 + 1)?;
+    let mut minimum = vec![1; natural.len()];
+    for row in std::iter::once(&table.header).chain(&table.rows) {
+        for (floor, cell) in minimum.iter_mut().zip(row) {
+            *floor = (*floor).max(wrapping::minimum_width(&cell.line, &cell.protected));
+        }
+    }
+    let widths = allocate_columns(&natural, &minimum, budget)?;
+    let mut rows = Vec::new();
+    for row in std::iter::once(&table.header).chain(&table.rows) {
+        let mut cells = Vec::new();
+        for (index, &width) in widths.iter().enumerate() {
+            let empty = Cell::plain(Line::default());
+            let cell = row.get(index).unwrap_or(&empty);
+            let cell = wrapping::wrap_words(&cell.line, width, &cell.protected)?;
+            if cell.text.lines.len() > 3 {
+                return None;
+            }
+            cells.push(cell);
+        }
+        rows.push(cells);
+    }
+    let border_style = from_str_with_options("| |\n| - |", options).lines[0].spans[0].style;
+    let border = |left: char, middle: char, right: char| {
+        let mut text = left.to_string();
+        for (index, width) in widths.iter().enumerate() {
+            if index > 0 {
+                text.push(middle);
+            }
+            text.push_str(&"─".repeat(width + 2));
+        }
+        text.push(right);
+        Line::styled(text, border_style)
+    };
+    let mut lines = vec![border('┌', '┬', '┐')];
+    for (row_index, cells) in rows.iter().enumerate() {
+        let height = cells
+            .iter()
+            .map(|cell| cell.text.lines.len())
+            .max()
+            .unwrap_or(1);
+        for y in 0..height {
+            let mut spans = vec![Span::styled("│", border_style)];
+            for (column, (&width, cell)) in widths.iter().zip(cells).enumerate() {
+                let empty = Line::default();
+                let line = cell.text.lines.get(y).unwrap_or(&empty);
+                let padding = width.saturating_sub(line.width());
+                let left = match table.alignments[column] {
+                    Alignment::Right => padding,
+                    Alignment::Center => padding / 2,
+                    _ => 0,
+                };
+                spans.push(Span::raw(" ".repeat(left + 1)));
+                spans.extend(
+                    line.spans.iter().map(|span| {
+                        Span::styled(span.content.clone(), line.style.patch(span.style))
+                    }),
+                );
+                spans.push(Span::raw(" ".repeat(padding - left + 1)));
+                spans.push(Span::styled("│", border_style));
+            }
+            lines.push(Line::from(spans));
+        }
+        if row_index + 1 < rows.len() {
+            lines.push(border('├', '┼', '┤'));
+        }
+    }
+    lines.push(border('└', '┴', '┘'));
+    Some(MarkdownLayout::hard(Text::from(lines)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +513,156 @@ mod tests {
     use ratatui::widgets::{Paragraph, Widget};
 
     const TABLE: &str = "| H |\n| --- |\n| v |";
+
+    fn text_table(header: &[&str], rows: &[&[&str]]) -> Table {
+        Table {
+            alignments: vec![Alignment::None; header.len()],
+            header: header
+                .iter()
+                .map(|value| Cell::plain(Line::raw((*value).to_owned())))
+                .collect(),
+            rows: rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| Cell::plain(Line::raw((*value).to_owned())))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn constrained_grid_wraps_rows_at_two_and_three_word_lines() {
+        let options = super::super::markdown_options(&DARK);
+        for (value, lines) in [("one two", 2), ("one two six", 3)] {
+            let source = format!("| H |\n| --- |\n| {value} |");
+            let layout = render(&source, 7, options);
+            assert!(
+                layout.text.lines.iter().all(|line| line.width() <= 7),
+                "{:?}",
+                layout.text
+            );
+            assert_eq!(layout.text.lines.len(), lines + 4);
+            assert_eq!(layout.text.lines[3].to_string(), "│ one │");
+            assert_eq!(layout.text.lines[4].to_string(), "│ two │");
+            assert!(layout.breaks.iter().all(|br| *br == LineBreak::Hard));
+        }
+    }
+
+    #[test]
+    fn inline_code_identifiers_remain_whole_while_cjk_prose_can_wrap() {
+        let options = super::super::markdown_options(&DARK);
+        for (value, eligible) in [("東京京都大阪", true), ("`東京京都大阪`", false)] {
+            let source = format!("| H |\n| --- |\n| {value} |");
+            let mut checked = false;
+            render_with(&source, 8, options, |table, width| {
+                checked = true;
+                assert_eq!(
+                    constrained_grid(table, width, options).is_some(),
+                    eligible,
+                    "{value}"
+                );
+                Some(replacement())
+            });
+            assert!(checked);
+        }
+    }
+
+    #[test]
+    fn code_protection_comes_from_syntax_not_matching_text_or_styles() {
+        let source =
+            "| H |\n| --- |\n| 東京京都大阪 `東京京都大阪` [marker](KikiInline&#48;Code0) |";
+        let options = super::super::markdown_options(&DARK);
+        render_with(source, 8, options, |table, _| {
+            let cell = &table.rows[0][0];
+            let text = cell.line.to_string();
+            let start = "東京京都大阪 ".len();
+            assert_eq!(cell.protected, vec![start..start + "東京京都大阪".len()]);
+            assert_eq!(text, "東京京都大阪 東京京都大阪 marker (KikiInline0Code0)");
+            Some(replacement())
+        });
+    }
+
+    #[test]
+    fn wrapped_grids_keep_inline_styles_unicode_and_container_widths() {
+        for theme in [&DARK, &LIGHT] {
+            let options = super::super::markdown_options(theme);
+            let source = "| Name |\n| --- |\n| **one** *two* `six` |";
+            let grid = render(source, 8, options);
+            assert!(grid.text.lines.iter().all(|line| line.width() <= 8));
+            assert!(
+                style_at(&grid.text, "one")
+                    .add_modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert!(
+                style_at(&grid.text, "two")
+                    .add_modifier
+                    .contains(Modifier::ITALIC)
+            );
+            assert_eq!(style_at(&grid.text, "six").fg, Some(theme.md_code));
+            assert_eq!(style_at(&grid.text, "┌").fg, Some(theme.border_muted));
+            for value in ["東京京都大阪", "cafe\u{301} 👩‍💻"] {
+                let source = format!("| H |\n| --- |\n| {value} |");
+                let grid = render(&source, 8, options);
+                assert!(grid.text.lines.iter().all(|line| line.width() <= 8));
+            }
+            let source = "> | H |\n> | --- |\n> | one two six |";
+            let grid = render(source, 9, options);
+            assert!(grid.text.lines.iter().all(|line| line.width() <= 9));
+            assert!(
+                grid.text
+                    .lines
+                    .iter()
+                    .all(|line| line.to_string().starts_with("> "))
+            );
+        }
+    }
+
+    #[test]
+    fn grid_allocation_caps_short_columns_and_obeys_whole_token_minima() {
+        assert_eq!(allocate_columns(&[2, 20], &[1, 4], 16), Some(vec![2, 14]));
+        assert_eq!(allocate_columns(&[9, 9], &[3, 3], 9), Some(vec![5, 4]));
+        assert_eq!(allocate_columns(&[9, 9], &[6, 4], 9), None);
+        assert_eq!(allocate_columns(&[9, 9], &[6, 4], 10), Some(vec![6, 4]));
+    }
+
+    #[test]
+    fn grid_policy_counts_content_lines_not_row_separators_or_table_height() {
+        let options = super::super::markdown_options(&DARK);
+        for (header, value, eligible) in [
+            ("H", "one two six", true),
+            ("H", "one two six ten", false),
+            ("one two six", "v", true),
+            ("one two six ten", "v", false),
+        ] {
+            let table = text_table(&[header], &[&[value]]);
+            assert_eq!(
+                constrained_grid(&table, 7, options).is_some(),
+                eligible,
+                "{header} / {value}"
+            );
+        }
+        let table = text_table(&["H"], &[&["a"], &["b"], &["c"], &["d"], &["e"]]);
+        let grid = constrained_grid(&table, 5, options).unwrap();
+        assert_eq!(grid.text.lines.len(), 13);
+        assert_eq!(grid.text.lines[4].to_string(), "├───┤");
+    }
+
+    #[test]
+    fn grid_respects_alignment_borders_and_indivisible_tokens() {
+        let options = super::super::markdown_options(&DARK);
+        let mut table = text_table(&["L", "R", "C"], &[&["a bb", "a bb", "a bb"]]);
+        table.alignments = vec![Alignment::Left, Alignment::Right, Alignment::Center];
+        let grid = constrained_grid(&table, 19, options).unwrap();
+        assert_eq!(grid.text.lines[3].to_string(), "│ a   │   a │  a  │");
+        assert_eq!(grid.text.lines[4].to_string(), "│ bb  │  bb │ bb  │");
+        assert!(grid.text.lines.iter().all(|line| line.width() == 19));
+        let table = text_table(&["H"], &[&["long_identifier"]]);
+        assert!(constrained_grid(&table, 10, options).is_none());
+        assert!(constrained_grid(&table, 0, options).is_none());
+    }
 
     fn styles(text: &Text<'_>) -> Vec<Vec<(char, Style)>> {
         text.lines
@@ -396,16 +733,20 @@ mod tests {
                 assert_eq!(width, 16);
                 assert_eq!(table.alignments, vec![Alignment::Left, Alignment::Right]);
                 assert_eq!(
-                    table.header.iter().map(Line::to_string).collect::<Vec<_>>(),
+                    table
+                        .header
+                        .iter()
+                        .map(|cell| cell.line.to_string())
+                        .collect::<Vec<_>>(),
                     ["Name", "Value"]
                 );
                 assert_eq!(table.rows.len(), 1);
-                assert_eq!(table.rows[0][0].to_string(), "a|b");
+                assert_eq!(table.rows[0][0].line.to_string(), "a|b");
                 assert_eq!(
-                    table.rows[0][1].to_string(),
+                    table.rows[0][1].line.to_string(),
                     "c|d guide (https://example.com/path) [img] pic old[n]"
                 );
-                let cell = Text::from(table.rows[0][1].clone());
+                let cell = Text::from(table.rows[0][1].line.clone());
                 assert_eq!(style_at(&cell, "c|d").fg, Some(theme.md_code));
                 assert!(
                     style_at(&cell, "guide")
@@ -419,8 +760,8 @@ mod tests {
                         .contains(Modifier::CROSSED_OUT)
                 );
                 Some(MarkdownLayout::hard(Text::from(vec![
-                    table.header[0].clone(),
-                    table.rows[0][1].clone(),
+                    table.header[0].line.clone(),
+                    table.rows[0][1].line.clone(),
                 ])))
             });
             assert_eq!(calls, 1);
@@ -548,10 +889,12 @@ mod tests {
         let actual = render_with(source, 10, options, |table, _| {
             calls += 1;
             assert_eq!(
-                table.rows[0][0].to_string(),
+                table.rows[0][0].line.to_string(),
                 "guide (https://example.com/a?x=1&y=2)"
             );
-            Some(MarkdownLayout::hard(Text::from(table.rows[0][0].clone())))
+            Some(MarkdownLayout::hard(Text::from(
+                table.rows[0][0].line.clone(),
+            )))
         });
         assert_eq!(calls, 1);
         assert!(
