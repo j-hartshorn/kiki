@@ -173,7 +173,7 @@ Append generated tool documentation to both bundled and overridden base prompts 
 
 Generalise the existing read-specific progress and trace into one row per valid host call. Retain rows in Monty pending-call order and update each in place from pending to a safe count or status summary despite out-of-order completion. Examples include `read · 4 KiB`, `write · replaced`, `grep · 12 matches`, `run · exit 1`, `edit · failed`, and `glob · pending`.
 
-The trace remains reliable, display-only evidence and never enters model context. It stores no paths, arguments, shell commands, error text, tool output, or arbitrary user text. Preserve unbounded authoritative retention per execution and the existing last-16 collapsed display. Lossy live progress may project the same safe summaries; settled execution records remain authoritative through cancellation races.
+The trace remains reliable, display-only evidence and never enters model context. It stores no paths, arguments, shell commands, error text, tool output, or arbitrary user text. (Superseded for call subjects by [Call lines](../2026-10-23_call-lines/spec.md): the trace now keeps one bounded subject per call, such as a path or command.) Preserve unbounded authoritative retention per execution and the existing last-16 collapsed display. Lossy live progress may project the same safe summaries; settled execution records remain authoritative through cancellation races.
 
 ### Limits and platform
 

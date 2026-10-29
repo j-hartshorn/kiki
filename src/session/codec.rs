@@ -264,6 +264,10 @@ struct StoredObservation {
 struct StoredToolCall {
     tool: StoredToolName,
     summary: StoredToolCallSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1429,6 +1433,10 @@ fn encode_tool_call(call: &ToolCall) -> StoredToolCall {
             ToolCallSummary::Applied => StoredToolCallSummary::Applied,
             ToolCallSummary::Subagent(id) => StoredToolCallSummary::Subagent(id.clone()),
         },
+        subject: call.subject.clone(),
+        duration_ms: call
+            .duration
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
     }
 }
 
@@ -1453,6 +1461,11 @@ fn decode_tool_call(call: &StoredToolCall) -> Result<ToolCall, CodecError> {
             StoredToolName::CancelSubagent => ToolName::CancelSubagent,
         },
         summary: decode_tool_call_summary(&call.summary),
+        subject: call
+            .subject
+            .as_deref()
+            .map(crate::arena::bound_call_subject),
+        duration: call.duration_ms.map(std::time::Duration::from_millis),
     })
 }
 
@@ -2162,11 +2175,49 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_subjects_and_durations_round_trip_and_stay_optional() {
+        let mut execution = task_execution();
+        execution.tool_calls = vec![crate::arena::ToolCall {
+            tool: crate::arena::ToolName::Read,
+            summary: crate::arena::ToolCallSummary::Count(12),
+            subject: Some("src/main.rs".to_owned()),
+            duration: Some(std::time::Duration::from_millis(4)),
+        }];
+        let stored = encode_execution_value(&execution).expect("encode execution");
+        assert_eq!(decode_execution_value(&stored).unwrap(), execution);
+        let json = serde_json::to_value(&stored).unwrap();
+        assert_eq!(json["tool_calls"][0]["subject"], "src/main.rs");
+        assert_eq!(json["tool_calls"][0]["duration_ms"], 4);
+        let decode = |json: serde_json::Value| {
+            let stored: super::StoredExecution = serde_json::from_value(json).unwrap();
+            decode_execution_value(&stored).unwrap()
+        };
+
+        let mut legacy = json.clone();
+        let call = legacy["tool_calls"][0].as_object_mut().unwrap();
+        call.remove("subject");
+        call.remove("duration_ms");
+        let decoded = decode(legacy);
+        assert_eq!(decoded.tool_calls[0].subject, None);
+        assert_eq!(decoded.tool_calls[0].duration, None);
+
+        let mut oversized = json;
+        oversized["tool_calls"][0]["subject"] = serde_json::json!("x".repeat(2000));
+        let decoded = decode(oversized);
+        assert_eq!(
+            decoded.tool_calls[0].subject,
+            Some(format!("{}\u{2026}", "x".repeat(1024)))
+        );
+    }
+
+    #[test]
     fn load_skill_codec_accepts_only_a_single_successful_count() {
         let mut execution = task_execution();
         execution.tool_calls = vec![crate::arena::ToolCall {
             tool: crate::arena::ToolName::LoadSkill,
             summary: crate::arena::ToolCallSummary::Count(1),
+            subject: None,
+            duration: None,
         }];
         let stored = encode_execution_value(&execution).expect("encode skill tool call");
         assert_eq!(decode_execution_value(&stored).unwrap(), execution);
@@ -2231,6 +2282,8 @@ mod tests {
         execution.tool_calls.push(crate::arena::ToolCall {
             tool: crate::arena::ToolName::StartSubagent,
             summary: crate::arena::ToolCallSummary::Subagent("00".to_owned()),
+            subject: None,
+            duration: None,
         });
         let code = crate::session::PersistedCode {
             source: "value = 1".to_owned(),
@@ -2356,6 +2409,8 @@ mod tests {
             tool_calls: vec![crate::arena::ToolCall {
                 tool: crate::arena::ToolName::Run,
                 summary: crate::arena::ToolCallSummary::Exit(7),
+                subject: None,
+                duration: None,
             }],
             read_paths: vec![PathBuf::from("nested/read")],
             modified_paths: vec![PathBuf::from("nested/modified")],
@@ -2616,6 +2671,8 @@ mod tests {
             tool_calls: vec![crate::arena::ToolCall {
                 tool: crate::arena::ToolName::Write,
                 summary: crate::arena::ToolCallSummary::Created,
+                subject: None,
+                duration: None,
             }],
             read_paths: vec![PathBuf::from("src/lib.rs")],
             modified_paths: vec![PathBuf::from("notes.md")],

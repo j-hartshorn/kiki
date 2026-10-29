@@ -36,6 +36,7 @@ After phases 1 and 2, a code step lists one line per tool call, but a settled ca
 - **Aligned tool name column.** Names are padded to the widest name among the step's shown calls, so subjects line up. Rejected: inline names (ragged in long lists) and a full table with aligned results (shortens subjects early and needs a narrow-width fallback).
 - **Duration on every settled call, always dim.** Consistent rows beat hiding fast calls. Rejected: slow-only durations, and durations only when expanded.
 - **No step total.** Per-call durations carry the useful timing; a `Took` line would add a row to every step for little gain.
+- **Retain subjects in the trace.** This supersedes the default-agent-tools rule that the trace stores no paths, arguments or commands. The session already stores the code that names them, and subjects help analyse agent trajectories. Output and error text stay out of the trace. Revisit if retention causes problems.
 - **Optional stored fields, no format bump.** New sessions add `subject` and `duration_ms`; old sessions decode without them and render as they do today. Older binaries ignore the unknown fields.
 
 ## Proposed approach
@@ -70,14 +71,14 @@ Collapsed, a row never wraps: the subject is truncated from the end with `…` s
 |---|---|
 | `read`, `write`, `edit` | path |
 | `list_dir` | path, or `.` when omitted |
-| `glob` | `"pattern"`, then ` path` when given |
-| `grep` | `"pattern"`, then ` path` and ` file_glob` when given |
-| `run` | command; ` (in cwd)` when `cwd` is given |
+| `glob` | `"pattern"`, then ` path` unless it is the default `.` |
+| `grep` | `"pattern"`, then ` path` unless it is `.`, and ` file_glob` when given |
+| `run` | command; ` (in cwd)` unless `cwd` is the default `.` |
 | `load_skill` | skill name |
 | `get_subagent`, `refresh_subagent`, `wait_subagent`, `cancel_subagent` | `subagent:<id>` |
 | `start_subagent` | none while pending; `subagent:<id>` once settled |
 
-The subject is built when the call is admitted (and for `start_subagent`, when it settles), normalised with `normalise_terminal_text`, newlines collapsed to spaces, and bounded to 1 KiB. Arguments with unexpected shapes give no subject. Subagent summaries stop repeating the id: a subagent call's result is dropped, since the subject already says `subagent:<id>`.
+The subject is built when the call is admitted (and for `start_subagent`, when it settles), with newlines collapsed to spaces, and bounded to 1 KiB. Rendering normalises it with `normalise_terminal_text`, like other transcript text. Arguments with unexpected shapes give no subject. Subagent summaries stop repeating the id: a subagent call's result is dropped, since the subject already says `subagent:<id>`.
 
 ### Results and durations
 

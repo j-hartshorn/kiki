@@ -625,10 +625,8 @@ fn root_settlement(record: &Record) -> Settlement {
 fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
     match progress {
         AgentProgress::ModelProgress(progress) => model_progress_payload_bytes(progress),
-        AgentProgress::ToolUpdated { .. } => 0,
-        AgentProgress::RunPreviewUpdated { preview, .. } => {
-            preview.command.len() + preview.stdout.len()
-        }
+        AgentProgress::ToolUpdated { call, .. } => call.subject.as_ref().map_or(0, String::len),
+        AgentProgress::RunPreviewUpdated { preview, .. } => preview.stdout.len(),
         AgentProgress::StdoutDelta { text } => text.len(),
         AgentProgress::StdoutTruncated => 0,
         AgentProgress::ExecutionStarted { commentary, .. } => {
@@ -641,10 +639,8 @@ fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
 fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
     match event {
         RuntimeEvent::ModelProgress { progress, .. } => model_progress_payload_bytes(progress),
-        RuntimeEvent::ToolUpdated { .. } => 0,
-        RuntimeEvent::RunPreviewUpdated { preview, .. } => {
-            preview.command.len() + preview.stdout.len()
-        }
+        RuntimeEvent::ToolUpdated { call, .. } => call.subject.as_ref().map_or(0, String::len),
+        RuntimeEvent::RunPreviewUpdated { preview, .. } => preview.stdout.len(),
         RuntimeEvent::StdoutDelta { text, .. } => text.len(),
         RuntimeEvent::StdoutTruncated { .. } => 0,
         RuntimeEvent::ExecutionStarted { commentary, .. } => {
@@ -1830,6 +1826,7 @@ impl<M: Model> RuntimeController<M> {
                         token,
                         call,
                     } => {
+                        let bytes = call.subject.as_ref().map_or(0, String::len);
                         progress_sender.publish(
                             WorkerProgress {
                                 run_id: RunId(run_id),
@@ -1838,7 +1835,7 @@ impl<M: Model> RuntimeController<M> {
                                 progress: AgentProgress::ToolUpdated { token, call },
                             },
                             false,
-                            0,
+                            bytes,
                         );
                     }
                     PersistedAgentEvent::RunPreviewUpdated {
@@ -1847,7 +1844,7 @@ impl<M: Model> RuntimeController<M> {
                         token,
                         preview,
                     } => {
-                        let bytes = preview.command.len() + preview.stdout.len();
+                        let bytes = preview.stdout.len();
                         progress_sender.publish(
                             WorkerProgress {
                                 run_id: RunId(run_id),
@@ -8362,6 +8359,7 @@ mod tests {
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent(_),
+                    ..
                 }
             )
         }));
@@ -9073,6 +9071,8 @@ mod tests {
             tool_call_label(ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Created,
+                subject: None,
+                duration: None,
             }),
             "write:created"
         );
@@ -9080,6 +9080,8 @@ mod tests {
             tool_call_label(ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Replaced,
+                subject: None,
+                duration: None,
             }),
             "write:replaced"
         );
@@ -9087,6 +9089,8 @@ mod tests {
             tool_call_label(ToolCall {
                 tool: ToolName::Edit,
                 summary: ToolCallSummary::Applied,
+                subject: None,
+                duration: None,
             }),
             "edit:applied"
         );
@@ -9102,6 +9106,8 @@ mod tests {
         ] {
             assert_eq!(
                 tool_call_label(ToolCall {
+                    subject: None,
+                    duration: None,
                     tool: ToolName::Run,
                     summary,
                 }),
@@ -9162,6 +9168,23 @@ mod tests {
                 _ => None,
             })
             .expect("completed execution record")
+    }
+
+    fn without_durations(calls: &[ToolCall]) -> Vec<ToolCall> {
+        calls
+            .iter()
+            .map(|call| {
+                assert_eq!(
+                    call.duration.is_some(),
+                    call.summary != ToolCallSummary::Pending,
+                    "{call:?}"
+                );
+                ToolCall {
+                    duration: None,
+                    ..call.clone()
+                }
+            })
+            .collect()
     }
 
     fn result_head(execution: &Execution) -> &str {
@@ -11615,6 +11638,7 @@ mod tests {
                         call: ToolCall {
                             tool: ToolName::Run,
                             summary: ToolCallSummary::Exit(0),
+                            ..
                         },
                         ..
                     }
@@ -11647,8 +11671,7 @@ mod tests {
                 step_id: ModelStepId(1),
                 preview,
                 ..
-            } if preview.command == "printf 'preview stdout'"
-                && preview.stdout == "preview stdout"
+            } if preview.stdout == "preview stdout"
         )));
     }
 
@@ -11825,15 +11848,19 @@ mod tests {
 
         let execution = completed_execution(&records, RunId(1), ModelStepId(1));
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(8),
+                    subject: Some("input".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("missing".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -11845,14 +11872,18 @@ mod tests {
                     ..
                 },
                 ..
-            } if execution.tool_calls == [
+            } if without_durations(&execution.tool_calls) == [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(8),
+                    subject: Some("input".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("missing".to_owned()),
+                    duration: None,
                 },
             ]
         )));
@@ -13946,6 +13977,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: Some("Cargo.toml".to_owned()),
+                duration: None,
             }]
         );
         assert!(evidence.cancellation_warning.is_some());
@@ -14409,6 +14442,8 @@ mod tests {
                         && evidence.tool_calls == [ToolCall {
                             tool: ToolName::Read,
                             summary: ToolCallSummary::Pending,
+                            subject: Some("blocked".to_owned()),
+                            duration: None,
                         }]
                         && evidence.cancellation_warning.is_some()
                         && matches!(
@@ -16964,70 +16999,98 @@ mod tests {
 
         let first_execution = completed_execution(&records, RunId(1), ModelStepId(2));
         assert_eq!(
-            first_execution.tool_calls,
+            without_durations(&first_execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent("1".to_owned()),
+                    subject: Some("subagent:1".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
             ]
         );
         let clarification = completed_execution(&records, RunId(2), ModelStepId(4));
         assert_eq!(result_head(clarification), "'missing'");
         assert_eq!(
-            clarification.tool_calls,
+            without_durations(&clarification.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("1".to_owned()),
+                    subject: Some("subagent:1".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
                     summary: ToolCallSummary::Subagent("1".to_owned()),
+                    subject: Some("subagent:1".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("2.0".to_owned()),
+                    subject: Some("subagent:2.0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
                     summary: ToolCallSummary::Subagent("2.0".to_owned()),
+                    subject: Some("subagent:2.0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::CancelSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
                     summary: ToolCallSummary::Subagent("2.0".to_owned()),
+                    subject: Some("subagent:2.0".to_owned()),
+                    duration: None,
                 },
             ]
         );

@@ -7450,14 +7450,20 @@ mod tests {
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(7),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Write,
                     summary: ToolCallSummary::Created,
+                    subject: None,
+                    duration: None,
                 },
             ],
             read_paths: Vec::new(),
@@ -7883,6 +7889,8 @@ mod tests {
             vec![ToolCall {
                 tool: ToolName::StartSubagent,
                 summary: ToolCallSummary::Subagent("00".to_owned()),
+                subject: None,
+                duration: None,
             }],
         )
         .await;

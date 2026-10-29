@@ -501,13 +501,21 @@ impl TranscriptBlock {
                     .map(|heading| normalise_terminal_text(&heading)),
                 status: arena.status.map(|status| normalise_terminal_text(&status)),
                 source: arena.source.map(|source| normalise_terminal_text(&source)),
-                tool_calls: arena.tool_calls,
+                tool_calls: arena
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        subject: call
+                            .subject
+                            .map(|subject| normalise_terminal_text(&subject)),
+                        ..call
+                    })
+                    .collect(),
                 run_previews: arena
                     .run_previews
                     .into_iter()
                     .map(|preview| {
                         preview.map(|preview| RunPreview {
-                            command: normalise_terminal_text(&preview.command),
                             stdout: normalise_terminal_text(&preview.stdout),
                         })
                     })
@@ -636,19 +644,30 @@ fn tool_call_text(
     run_previews: &[Option<RunPreview>],
     expanded: bool,
     background: Color,
+    width: u16,
 ) -> Text<'static> {
     let omitted = if expanded {
         0
     } else {
         tool_calls.len().saturating_sub(CALL_PREVIEW_COUNT)
     };
+    let name_width = tool_calls
+        .iter()
+        .skip(omitted)
+        .filter(|call| call.subject.is_some())
+        .map(|call| call.tool.label().len())
+        .max()
+        .unwrap_or_default();
+    let row_width = (!expanded).then_some(usize::from(width));
     let mut lines = Vec::new();
     if omitted > 0 {
         lines.push(expand_hint(theme, background, omitted, "earlier call"));
     }
     for (index, call) in tool_calls.iter().enumerate().skip(omitted) {
         let preview = run_previews.get(index).and_then(Option::as_ref);
-        lines.push(tool_call_line(theme, call, preview, background));
+        lines.push(tool_call_line(
+            theme, call, name_width, row_width, background,
+        ));
         if let Some(preview) = preview.filter(|_| call.summary == ToolCallSummary::Pending) {
             lines.extend(
                 logical_lines(&preview.stdout).into_iter().map(|line| {
@@ -663,7 +682,8 @@ fn tool_call_text(
 fn tool_call_line(
     theme: &Theme,
     call: &ToolCall,
-    preview: Option<&RunPreview>,
+    name_width: usize,
+    row_width: Option<usize>,
     background: Color,
 ) -> Line<'static> {
     let (glyph, colour) = match call.summary {
@@ -673,21 +693,102 @@ fn tool_call_line(
         _ => ("\u{2713}", theme.success),
     };
     let style = card_style(theme, background);
-    let mut spans = vec![
+    let name = match call.subject {
+        Some(_) => format!("{:name_width$}  ", call.tool.label()),
+        None => call.tool.label().to_owned(),
+    };
+    let mut head = vec![
         Span::styled(glyph, style.fg(colour)),
         Span::styled(" ", style),
-        Span::styled(call.tool.label(), style.fg(theme.accent)),
+        Span::styled(name, style.fg(theme.accent)),
     ];
-    if let Some(preview) = preview {
-        spans.push(Span::styled(format!(" $ {}", preview.command), style));
-    }
+    let mut tail = Vec::new();
     if let Some(summary) = tool_call_summary(call) {
-        spans.push(Span::styled(
+        tail.push(Span::styled(
             format!(" \u{b7} {summary}"),
             muted_card_style(theme, background),
         ));
     }
+    if let Some(duration) = call.duration {
+        tail.push(Span::styled(
+            format!("  {}", format_call_duration(duration)),
+            dim_card_style(theme, background),
+        ));
+    }
+    if let Some(subject) = &call.subject {
+        let subject = match row_width {
+            Some(row_width) => {
+                let used = Line::from(head.clone()).width() + Line::from(tail.clone()).width();
+                truncate_end(subject, row_width.saturating_sub(used))
+            }
+            None => subject.clone(),
+        };
+        head.push(Span::styled(subject, style));
+    }
+    head.extend(tail);
+    let line = Line::from(head);
+    match row_width {
+        Some(row_width) if line.width() > row_width => truncate_line(line, row_width),
+        _ => line,
+    }
+}
+
+fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+    let mut remaining = width;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if remaining == 0 {
+            break;
+        }
+        let span_width = span.width();
+        if span_width <= remaining {
+            remaining -= span_width;
+            spans.push(span);
+        } else {
+            spans.push(Span::styled(
+                truncate_end(&span.content, remaining),
+                span.style,
+            ));
+            break;
+        }
+    }
     Line::from(spans)
+}
+
+fn format_call_duration(duration: std::time::Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else if millis < 60_000 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        let seconds = duration.as_secs();
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.0;
+    for unit in ["KB", "MB", "GB"] {
+        if value < 9.95 {
+            return format!("{value:.1} {unit}");
+        }
+        if value < 999.5 || unit == "GB" {
+            return format!("{value:.0} {unit}");
+        }
+        value /= 1000.0;
+    }
+    unreachable!("the last unit always returns")
+}
+
+fn call_count_text(tool: ToolName, count: usize) -> String {
+    match tool {
+        ToolName::Read => format_size(count),
+        _ => format!("{count} {}", tool.count_label(count)),
+    }
 }
 
 fn tool_call_summary(call: &ToolCall) -> Option<String> {
@@ -696,11 +797,12 @@ fn tool_call_summary(call: &ToolCall) -> Option<String> {
         ToolCallSummary::Failed => "failed".to_owned(),
         ToolCallSummary::Exit(code) => format!("exit {code}"),
         ToolCallSummary::Signal => "signal".to_owned(),
-        ToolCallSummary::Count(count) => format!("{count} {}", call.tool.count_label(*count)),
+        ToolCallSummary::Count(count) => call_count_text(call.tool, *count),
         ToolCallSummary::Created => "created".to_owned(),
         ToolCallSummary::Replaced => "replaced".to_owned(),
         ToolCallSummary::Applied => "applied".to_owned(),
-        ToolCallSummary::Subagent(id) => format!("subagent:{id}"),
+        ToolCallSummary::Subagent(id) if call.subject.is_none() => format!("subagent:{id}"),
+        ToolCallSummary::Subagent(_) => return None,
     })
 }
 
@@ -720,9 +822,7 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
         ToolCallSummary::Failed => "failed".to_owned(),
         ToolCallSummary::Exit(code) => format!("exit {code}"),
         ToolCallSummary::Signal => "signal".to_owned(),
-        ToolCallSummary::Count(count) => {
-            format!("{count} {}", call.tool.count_label(*count))
-        }
+        ToolCallSummary::Count(count) => call_count_text(call.tool, *count),
         ToolCallSummary::Created => "created".to_owned(),
         ToolCallSummary::Replaced => "replaced".to_owned(),
         ToolCallSummary::Applied => "applied".to_owned(),
@@ -1317,6 +1417,7 @@ impl ArenaRenderBlock {
             &arena.run_previews,
             expanded,
             background,
+            content_width,
         ));
         groups.push(output_text(theme, &arena.content, expanded, background));
         if let Some(accounting) = arena.accounting.filter(|accounting| !accounting.is_empty()) {
@@ -1443,6 +1544,7 @@ impl NormalisedArenaBlock {
                 &self.run_previews,
                 false,
                 Color::Reset,
+                u16::MAX,
             );
             lines.push(format!("tool calls:\n{tool_calls}"));
         }
@@ -2605,6 +2707,8 @@ impl Transcript {
                 let activity = tool_call_label(&ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 });
                 let mut accepted = false;
                 let mut changed =
@@ -2629,6 +2733,8 @@ impl Transcript {
                                 ToolCall {
                                     tool: ToolName::Run,
                                     summary: ToolCallSummary::Pending,
+                                    subject: None,
+                                    duration: None,
                                 },
                                 Some(preview),
                             );
@@ -6048,6 +6154,8 @@ mod tests {
             tool_call_label(&ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Created,
+                subject: None,
+                duration: None,
             }),
             "write · created"
         );
@@ -6055,6 +6163,8 @@ mod tests {
             tool_call_label(&ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Replaced,
+                subject: None,
+                duration: None,
             }),
             "write · replaced"
         );
@@ -6062,6 +6172,8 @@ mod tests {
             tool_call_label(&ToolCall {
                 tool: ToolName::Edit,
                 summary: ToolCallSummary::Applied,
+                subject: None,
+                duration: None,
             }),
             "edit · applied"
         );
@@ -6621,6 +6733,8 @@ mod tests {
         ] {
             assert_eq!(
                 tool_call_label(&ToolCall {
+                    subject: None,
+                    duration: None,
                     tool: ToolName::Run,
                     summary,
                 }),
@@ -6636,6 +6750,8 @@ mod tests {
         ] {
             assert_eq!(
                 tool_call_label(&ToolCall {
+                    subject: None,
+                    duration: None,
                     tool,
                     summary: ToolCallSummary::Subagent("child1".to_owned()),
                 }),
@@ -7320,6 +7436,8 @@ mod tests {
                 step_id: ModelStepId(1),
                 token,
                 call: ToolCall {
+                    subject: None,
+                    duration: None,
                     tool: ToolName::Run,
                     summary,
                 },
@@ -7328,19 +7446,13 @@ mod tests {
         )
     }
 
-    fn apply_run_preview(
-        transcript: &mut Transcript,
-        token: ToolCallToken,
-        command: &str,
-        stdout: &str,
-    ) -> bool {
+    fn apply_run_preview(transcript: &mut Transcript, token: ToolCallToken, stdout: &str) -> bool {
         transcript.apply(
             RuntimeEvent::RunPreviewUpdated {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
                 token,
                 preview: RunPreview {
-                    command: command.to_owned(),
                     stdout: stdout.to_owned(),
                 },
             },
@@ -8265,6 +8377,8 @@ Problems: none"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -10086,6 +10200,8 @@ truncated"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -10838,6 +10954,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -10946,6 +11064,8 @@ truncated"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -11087,14 +11207,20 @@ truncated"
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(1),
+                subject: None,
+                duration: None,
             },
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Failed,
+                subject: None,
+                duration: None,
             },
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             },
         ];
         transcript.apply(
@@ -11128,7 +11254,7 @@ truncated"
                 "",
                 "await read('authoritative-path')",
                 "",
-                "\u{2713} read \u{b7} 1 byte",
+                "\u{2713} read \u{b7} 1 B",
                 "\u{2717} read \u{b7} failed",
                 "\u{2026} read",
                 "",
@@ -11155,6 +11281,8 @@ truncated"
             .map(|count| ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(count),
+                subject: None,
+                duration: None,
             })
             .collect();
         transcript.apply(
@@ -11168,7 +11296,7 @@ truncated"
         expected.push("\u{2026} 23 more lines \u{b7} Ctrl-O to expand".to_owned());
         expected.push(String::new());
         expected.push("\u{2026} 12 earlier calls \u{b7} Ctrl-O to expand".to_owned());
-        expected.extend((13..=20).map(|count| format!("\u{2713} read \u{b7} {count} bytes")));
+        expected.extend((13..=20).map(|count| format!("\u{2713} read \u{b7} {count} B")));
         expected.push(String::new());
         expected.push("\u{2026} 10 earlier lines \u{b7} Ctrl-O to expand".to_owned());
         expected.extend((11..=17).map(|line| format!("output {line}")));
@@ -11202,12 +11330,15 @@ truncated"
                 "pass",
                 "",
                 vec![ToolCall {
-                    tool: ToolName::Read,
+                    tool: ToolName::Grep,
                     summary: ToolCallSummary::Count(usize::MAX),
+                    subject: None,
+                    duration: None,
                 }],
             ),
             false,
         );
+        transcript.toggle_arena_expansion();
 
         let full = rendered_buffer(&mut transcript, 16);
         assert_eq!(
@@ -11216,20 +11347,20 @@ truncated"
                 "",
                 "pass",
                 "",
-                "\u{2713} read \u{b7}",
+                "\u{2713} grep \u{b7}",
                 "18446744073709",
-                "551615 bytes",
+                "551615 matches",
                 "",
                 "result",
                 "result",
                 "",
             ]
         );
-        let call_row = row_containing(&full, "\u{2713} read");
+        let call_row = row_containing(&full, "\u{2713} grep");
         let layout = transcript.layout(&DARK, 16);
         let mut clipped = Buffer::empty(Rect::new(0, 0, 16, 2));
         layout.render(clipped.area, call_row + 1, &mut clipped);
-        assert_eq!(trimmed_rows(&clipped), ["18446744073709", "551615 bytes"]);
+        assert_eq!(trimmed_rows(&clipped), ["18446744073709", "551615 matches"]);
         assert_eq!(clipped[(0, 0)].symbol(), " ");
         assert_ne!(clipped[(1, 0)].symbol(), " ");
         assert_row_background(&clipped, 0, DARK.tool_success_bg);
@@ -11536,10 +11667,14 @@ truncated"
                     ToolCall {
                         tool: ToolName::Glob,
                         summary: ToolCallSummary::Count(12),
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Run,
                         summary: ToolCallSummary::Exit(0),
+                        subject: None,
+                        duration: None,
                     },
                 ],
             ),
@@ -11583,18 +11718,26 @@ truncated"
                     ToolCall {
                         tool: ToolName::Read,
                         summary: ToolCallSummary::Count(3),
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Write,
                         summary: ToolCallSummary::Failed,
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Run,
                         summary: ToolCallSummary::Exit(2),
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Run,
                         summary: ToolCallSummary::Signal,
+                        subject: None,
+                        duration: None,
                     },
                 ],
             ),
@@ -11604,7 +11747,7 @@ truncated"
         let buffer = rendered_buffer(&mut transcript, 40);
 
         for (line, glyph) in [
-            ("\u{2713} read \u{b7} 3 bytes", DARK.success),
+            ("\u{2713} read \u{b7} 3 B", DARK.success),
             ("\u{2717} write \u{b7} failed", DARK.error),
             ("\u{2717} run \u{b7} exit 2", DARK.error),
             ("\u{2717} run \u{b7} signal", DARK.error),
@@ -11613,29 +11756,206 @@ truncated"
         }
         let name = cell_at(&buffer, "read \u{b7}");
         assert_eq!(name.fg, DARK.accent);
-        assert_eq!(cell_at(&buffer, "3 bytes").fg, DARK.muted);
+        assert_eq!(cell_at(&buffer, "3 B").fg, DARK.muted);
+    }
+
+    fn call(
+        tool: ToolName,
+        summary: ToolCallSummary,
+        subject: Option<&str>,
+        millis: Option<u64>,
+    ) -> ToolCall {
+        ToolCall {
+            tool,
+            summary,
+            subject: subject.map(str::to_owned),
+            duration: millis.map(std::time::Duration::from_millis),
+        }
     }
 
     #[test]
-    fn run_command_tail_shows_only_while_the_call_is_pending() {
+    fn call_lines_align_names_and_show_subject_result_and_duration() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution_with_tool_calls(
+                1,
+                1,
+                "pass",
+                "",
+                vec![
+                    call(
+                        ToolName::Read,
+                        ToolCallSummary::Count(84_123),
+                        Some("src/transcript.rs"),
+                        Some(4),
+                    ),
+                    call(
+                        ToolName::Grep,
+                        ToolCallSummary::Count(12),
+                        Some("\"fn tool_call\" src/"),
+                        Some(31),
+                    ),
+                    call(
+                        ToolName::StartSubagent,
+                        ToolCallSummary::Subagent("c1".to_owned()),
+                        Some("subagent:c1"),
+                        Some(1),
+                    ),
+                    call(
+                        ToolName::Run,
+                        ToolCallSummary::Exit(101),
+                        Some("just test"),
+                        Some(44_900),
+                    ),
+                ],
+            ),
+            false,
+        );
+
+        let buffer = rendered_buffer(&mut transcript, 80);
+        let rows = trimmed_rows(&buffer);
+
+        for row in [
+            "\u{2713} read            src/transcript.rs \u{b7} 84 KB  4ms",
+            "\u{2713} grep            \"fn tool_call\" src/ \u{b7} 12 matches  31ms",
+            "\u{2713} start_subagent  subagent:c1  1ms",
+            "\u{2717} run             just test \u{b7} exit 101  44.9s",
+        ] {
+            assert!(rows.contains(&row.to_owned()), "{row}\n{rows:#?}");
+        }
+        assert_eq!(cell_at(&buffer, "read   ").fg, DARK.accent);
+        assert_eq!(cell_at(&buffer, "src/transcript.rs").fg, DARK.text);
+        assert_eq!(cell_at(&buffer, "84 KB").fg, DARK.muted);
+        assert_eq!(cell_at(&buffer, "44.9s").fg, DARK.dim);
+    }
+
+    #[test]
+    fn call_line_subject_truncates_to_keep_its_result_until_ctrl_o() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution_with_tool_calls(
+                1,
+                1,
+                "pass",
+                "",
+                vec![call(
+                    ToolName::Run,
+                    ToolCallSummary::Exit(0),
+                    Some("just test 2>&1 | grep -E 'test result'"),
+                    Some(2_000),
+                )],
+            ),
+            false,
+        );
+
+        let collapsed = trimmed_rows(&rendered_buffer(&mut transcript, 34));
+        assert!(
+            collapsed.contains(&"\u{2713} run  just test\u{2026} \u{b7} exit 0  2.0s".to_owned()),
+            "{collapsed:#?}"
+        );
+
+        transcript.toggle_arena_expansion();
+        let expanded = trimmed_rows(&rendered_buffer(&mut transcript, 34));
+        assert!(
+            expanded
+                .join(" ")
+                .contains("just test 2>&1 | grep -E 'test result'"),
+            "{expanded:#?}"
+        );
+    }
+
+    #[test]
+    fn calls_without_subjects_render_as_before() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution_with_tool_calls(
+                1,
+                1,
+                "pass",
+                "",
+                vec![
+                    call(ToolName::Read, ToolCallSummary::Count(512), None, None),
+                    call(
+                        ToolName::StartSubagent,
+                        ToolCallSummary::Subagent("c1".to_owned()),
+                        None,
+                        None,
+                    ),
+                ],
+            ),
+            false,
+        );
+
+        let rows = trimmed_rows(&rendered_buffer(&mut transcript, 40));
+
+        assert!(
+            rows.contains(&"\u{2713} read \u{b7} 512 B".to_owned()),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.contains(&"\u{2713} start_subagent \u{b7} subagent:c1".to_owned()),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn sizes_and_durations_read_at_a_glance() {
+        for (bytes, text) in [
+            (0, "0 B"),
+            (999, "999 B"),
+            (1_000, "1.0 KB"),
+            (1_234, "1.2 KB"),
+            (9_960, "10 KB"),
+            (84_123, "84 KB"),
+            (999_600, "1.0 MB"),
+            (3_400_000, "3.4 MB"),
+            (12_000_000_000_000, "12000 GB"),
+        ] {
+            assert_eq!(super::format_size(bytes), text, "{bytes}");
+        }
+        for (millis, text) in [
+            (0, "0ms"),
+            (999, "999ms"),
+            (1_000, "1.0s"),
+            (44_900, "44.9s"),
+            (59_999, "60.0s"),
+            (60_000, "1m00s"),
+            (125_000, "2m05s"),
+        ] {
+            assert_eq!(
+                super::format_call_duration(std::time::Duration::from_millis(millis)),
+                text,
+                "{millis}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_call_reads_the_same_while_pending_and_shows_its_tail() {
         let mut transcript = Transcript::default();
         start_live_run(&mut transcript);
         let token = ToolCallToken::for_test(0);
-        apply_run_tool_update(&mut transcript, token, ToolCallSummary::Pending);
-        apply_run_preview(
-            &mut transcript,
-            token,
-            "cargo test",
-            "running 2 tests\nok\n",
-        );
+        let update = |transcript: &mut Transcript, summary, millis| {
+            transcript.apply(
+                RuntimeEvent::ToolUpdated {
+                    run_id: RunId(1),
+                    step_id: ModelStepId(1),
+                    token,
+                    call: call(ToolName::Run, summary, Some("cargo test"), millis),
+                },
+                false,
+            )
+        };
+        update(&mut transcript, ToolCallSummary::Pending, None);
+        apply_run_preview(&mut transcript, token, "running 2 tests\nok\n");
 
-        let live = trimmed_rows(&rendered_buffer(&mut transcript, 40));
+        let buffer = rendered_buffer(&mut transcript, 40);
+        let live = trimmed_rows(&buffer);
         assert!(
-            live.contains(&"\u{2026} run $ cargo test".to_owned()),
+            live.contains(&"\u{2026} run  cargo test".to_owned()),
             "{live:?}"
         );
         assert!(live.contains(&"running 2 tests".to_owned()), "{live:?}");
-        let buffer = rendered_buffer(&mut transcript, 40);
         assert_eq!(cell_at(&buffer, "\u{2026} run").fg, DARK.warning);
         assert_eq!(cell_at(&buffer, "running 2 tests").fg, DARK.dim);
         assert_eq!(
@@ -11647,11 +11967,11 @@ truncated"
             "r"
         );
 
-        apply_run_tool_update(&mut transcript, token, ToolCallSummary::Exit(0));
+        update(&mut transcript, ToolCallSummary::Exit(0), Some(1_500));
 
         let settled = trimmed_rows(&rendered_buffer(&mut transcript, 40));
         assert!(
-            settled.contains(&"\u{2713} run $ cargo test \u{b7} exit 0".to_owned()),
+            settled.contains(&"\u{2713} run  cargo test \u{b7} exit 0  1.5s".to_owned()),
             "{settled:?}"
         );
         assert!(!settled.iter().any(|row| row.contains("running 2 tests")));
@@ -11741,6 +12061,8 @@ truncated"
             .map(|_| ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(1),
+                subject: None,
+                duration: None,
             })
             .collect();
         let mut transcript = Transcript::default();
@@ -11751,7 +12073,7 @@ truncated"
 
         let rows = trimmed_rows(&rendered_buffer(&mut transcript, 50));
 
-        let read = "\u{2713} read \u{b7} 1 byte";
+        let read = "\u{2713} read \u{b7} 1 B";
         let mut expected = vec!["".to_owned()];
         expected.extend((1..=10).map(|line| format!("x{line} = {line}")));
         expected.push("\u{2026} 2 more lines \u{b7} Ctrl-O to expand".to_owned());
@@ -11860,12 +12182,9 @@ truncated"
         let stdout = (3..=10)
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
-        apply_run_preview(&mut transcript, token, "printf 'ten lines'", &stdout);
+        apply_run_preview(&mut transcript, token, &stdout);
 
-        let mut expected = vec![
-            String::new(),
-            "\u{2026} run $ printf 'ten lines'".to_owned(),
-        ];
+        let mut expected = vec![String::new(), "\u{2026} run".to_owned()];
         expected.extend((3..=10).map(|line| format!("line {line}")));
         expected.push(String::new());
         assert_eq!(
@@ -11880,7 +12199,6 @@ truncated"
                 step_id: ModelStepId(1),
                 token,
                 preview: RunPreview {
-                    command: "stale command".to_owned(),
                     stdout: "stale output".to_owned(),
                 },
             },
@@ -11894,7 +12212,7 @@ truncated"
                 "",
                 "display gap: some live progress was dropped",
                 "",
-                "\u{2713} run $ printf 'ten lines' \u{b7} exit 0",
+                "\u{2713} run \u{b7} exit 0",
                 "",
             ]
         );
@@ -11907,31 +12225,22 @@ truncated"
         assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
         let token = ToolCallToken::for_test(0);
 
-        assert!(apply_run_preview(
-            &mut transcript,
-            token,
-            "first",
-            "first output"
-        ));
+        assert!(apply_run_preview(&mut transcript, token, "first output"));
         assert_live_run_rows(
             &transcript,
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
-                command: "first".to_owned(),
                 stdout: "first output".to_owned(),
             })],
         );
         assert!(rendered_text(&transcript).contains("first output"));
 
-        assert!(apply_run_preview(
-            &mut transcript,
-            token,
-            "latest",
-            "latest output"
-        ));
+        assert!(apply_run_preview(&mut transcript, token, "latest output"));
         assert!(!apply_run_tool_update(
             &mut transcript,
             token,
@@ -11942,9 +12251,10 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
-                command: "latest".to_owned(),
                 stdout: "latest output".to_owned(),
             })],
         );
@@ -11959,9 +12269,10 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
-                command: "latest".to_owned(),
                 stdout: "latest output".to_owned(),
             })],
         );
@@ -11976,20 +12287,16 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(0),
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
-                command: "latest".to_owned(),
                 stdout: "latest output".to_owned(),
             })],
         );
         let status = transcript.status().to_owned();
 
-        assert!(!apply_run_preview(
-            &mut transcript,
-            token,
-            "stale",
-            "stale output"
-        ));
+        assert!(!apply_run_preview(&mut transcript, token, "stale output"));
         assert!(!apply_run_tool_update(
             &mut transcript,
             token,
@@ -12000,9 +12307,10 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(0),
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
-                command: "latest".to_owned(),
                 stdout: "latest output".to_owned(),
             })],
         );
@@ -12024,6 +12332,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(1),
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12036,6 +12346,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12047,10 +12359,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(1),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[None, None],
@@ -12073,17 +12389,14 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(7),
+                subject: None,
+                duration: None,
             }],
             &[None],
         );
         assert_eq!(transcript.status(), "run · exit 7");
 
-        assert!(!apply_run_preview(
-            &mut transcript,
-            token,
-            "stale command",
-            "stale output"
-        ));
+        assert!(!apply_run_preview(&mut transcript, token, "stale output"));
         assert!(!apply_run_tool_update(
             &mut transcript,
             token,
@@ -12094,6 +12407,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(7),
+                subject: None,
+                duration: None,
             }],
             &[None],
         );
@@ -12163,6 +12478,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12173,10 +12490,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[None, None],
@@ -12195,27 +12516,25 @@ truncated"
             second,
             ToolCallSummary::Exit(0)
         ));
-        assert!(apply_run_preview(
-            &mut transcript,
-            first,
-            "first",
-            "first output"
-        ));
+        assert!(apply_run_preview(&mut transcript, first, "first output"));
         assert_live_run_rows(
             &transcript,
             &[
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[
                 Some(RunPreview {
-                    command: "first".to_owned(),
                     stdout: "first output".to_owned(),
                 }),
                 None,
@@ -12230,18 +12549,8 @@ truncated"
         let first = ToolCallToken::for_test(0);
         let second = ToolCallToken::for_test(1);
 
-        assert!(apply_run_preview(
-            &mut transcript,
-            first,
-            "first",
-            "first output"
-        ));
-        assert!(apply_run_preview(
-            &mut transcript,
-            second,
-            "second",
-            "second output"
-        ));
+        assert!(apply_run_preview(&mut transcript, first, "first output"));
+        assert!(apply_run_preview(&mut transcript, second, "second output"));
         assert!(apply_run_tool_update(
             &mut transcript,
             first,
@@ -12253,19 +12562,21 @@ truncated"
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[
                 Some(RunPreview {
-                    command: "first".to_owned(),
                     stdout: "first output".to_owned(),
                 }),
                 Some(RunPreview {
-                    command: "second".to_owned(),
                     stdout: "second output".to_owned(),
                 }),
             ],
@@ -12274,7 +12585,6 @@ truncated"
         assert!(apply_run_preview(
             &mut transcript,
             second,
-            "second latest",
             "second latest output"
         ));
         assert!(apply_run_tool_update(
@@ -12288,19 +12598,21 @@ truncated"
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(1),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[
                 Some(RunPreview {
-                    command: "first".to_owned(),
                     stdout: "first output".to_owned(),
                 }),
                 Some(RunPreview {
-                    command: "second latest".to_owned(),
                     stdout: "second latest output".to_owned(),
                 }),
             ],
@@ -12308,18 +12620,13 @@ truncated"
     }
 
     #[test]
-    fn completed_execution_keeps_run_preview_commands() {
+    fn completed_execution_replaces_live_run_previews() {
         let mut transcript = Transcript::default();
         start_live_run(&mut transcript);
         let token = ToolCallToken::for_test(0);
 
-        assert!(apply_run_preview(
-            &mut transcript,
-            token,
-            "live command",
-            "live output"
-        ));
-        assert!(rendered_text(&transcript).contains("live command"));
+        assert!(apply_run_preview(&mut transcript, token, "live output"));
+        assert!(rendered_text(&transcript).contains("live output"));
         assert!(transcript.apply(
             completed_execution_with_tool_calls(
                 1,
@@ -12329,24 +12636,21 @@ truncated"
                 vec![ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 }],
             ),
             false,
         ));
 
         let retained = rendered_text(&transcript);
-        assert!(retained.contains("\u{2713} run $ live command · exit 0"));
+        assert!(retained.contains("\u{2713} run · exit 0"));
         assert!(!retained.contains("live output"));
         assert!(transcript.live_step.is_none());
         assert!(transcript.apply(RuntimeEvent::RunSettled { run_id: RunId(1) }, false));
         assert!(transcript.is_idle());
 
-        assert!(!apply_run_preview(
-            &mut transcript,
-            token,
-            "stale command",
-            "stale output"
-        ));
+        assert!(!apply_run_preview(&mut transcript, token, "stale output"));
         assert_eq!(rendered_text(&transcript), retained);
     }
 
@@ -12381,6 +12685,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12408,6 +12714,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(12),
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12419,7 +12727,7 @@ truncated"
                 "",
                 "pass",
                 "",
-                "\u{2713} read \u{b7} 12 bytes",
+                "\u{2713} read \u{b7} 12 B",
                 "",
                 "live output",
                 "stdout preview",
@@ -12450,6 +12758,8 @@ truncated"
                     call: ToolCall {
                         tool: ToolName::Read,
                         summary: ToolCallSummary::Pending,
+                        subject: None,
+                        duration: None,
                     },
                 },
                 false,
@@ -12465,6 +12775,8 @@ truncated"
                     step_id: ModelStepId(1),
                     token,
                     call: ToolCall {
+                        subject: None,
+                        duration: None,
                         tool: ToolName::Read,
                         summary,
                     },
@@ -12483,10 +12795,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(5),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: None,
+                    duration: None,
                 },
             ]
         );
@@ -12841,6 +13157,8 @@ truncated"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -13129,6 +13447,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -13142,11 +13462,13 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(12),
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
         );
-        assert_eq!(transcript.status(), "read · 12 bytes");
+        assert_eq!(transcript.status(), "read · 12 B");
         transcript.apply(
             RuntimeEvent::SubmissionRejectedBusy {
                 active_run_id: Some(RunId(3)),

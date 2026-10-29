@@ -1620,14 +1620,20 @@ mod tests {
                         ToolCall {
                             tool: ToolName::Run,
                             summary: ToolCallSummary::Exit(7),
+                            subject: None,
+                            duration: None,
                         },
                         ToolCall {
                             tool: ToolName::Read,
                             summary: ToolCallSummary::Failed,
+                            subject: None,
+                            duration: None,
                         },
                         ToolCall {
                             tool: ToolName::Write,
                             summary: ToolCallSummary::Signal,
+                            subject: None,
+                            duration: None,
                         },
                     ],
                 ),
@@ -3483,6 +3489,8 @@ mod tests {
                 tool_calls: tool_summaries
                     .into_iter()
                     .map(|summary| ToolCall {
+                        subject: None,
+                        duration: None,
                         tool: ToolName::Read,
                         summary,
                     })

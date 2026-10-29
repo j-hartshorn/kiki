@@ -9792,6 +9792,8 @@ mod tests {
                         .map(|count| ToolCall {
                             tool: ToolName::Read,
                             summary: ToolCallSummary::Count(count),
+                            subject: None,
+                            duration: None,
                         })
                         .collect(),
                     read_paths: Vec::new(),
@@ -9825,7 +9827,7 @@ mod tests {
         app.handle_key(history_end());
         let expanded = rendered(&mut app, 60, 200);
         assert!(expanded.contains("saved arena line 01"));
-        assert!(expanded.contains("read · 20 bytes"));
+        assert!(expanded.contains("read · 20 B"));
         set_prompt(&mut app, "draft");
         assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
     }
@@ -11262,6 +11264,8 @@ mod tests {
                             tool_calls: vec![ToolCall {
                                 tool: ToolName::Read,
                                 summary: ToolCallSummary::Failed,
+                                subject: None,
+                                duration: None,
                             }],
                             read_paths: Vec::new(),
                             modified_paths: Vec::new(),
@@ -13274,6 +13278,8 @@ mod tests {
                             .map(|count| ToolCall {
                                 tool: ToolName::Read,
                                 summary: ToolCallSummary::Count(count),
+                                subject: None,
+                                duration: None,
                             })
                             .collect(),
                         read_paths: Vec::new(),
@@ -13312,8 +13318,8 @@ mod tests {
         assert!(!collapsed.contains("code line 11"));
         assert!(collapsed.contains("… 23 more lines · Ctrl-O to expand"));
         assert!(collapsed.contains("… 12 earlier calls · Ctrl-O to expand"));
-        assert!(!collapsed.contains("read · 12 bytes"));
-        assert!(collapsed.contains("read · 13 bytes"));
+        assert!(!collapsed.contains("read · 12 B"));
+        assert!(collapsed.contains("read · 13 B"));
 
         let expanded = app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(expanded.commands.is_empty());
@@ -13321,8 +13327,8 @@ mod tests {
         let expanded = rendered(&mut app, 60, 40);
         assert!(expanded.contains("code line 33"));
         assert!(!expanded.contains("Ctrl-O to expand"));
-        assert!(expanded.contains("read · 1 byte"));
-        assert!(expanded.contains("read · 20 bytes"));
+        assert!(expanded.contains("read · 1 B"));
+        assert!(expanded.contains("read · 20 B"));
     }
 
     #[test]
@@ -13538,6 +13544,8 @@ mod tests {
             call: ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             },
         });
 
@@ -13567,6 +13575,8 @@ mod tests {
             call: ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             },
         });
 
