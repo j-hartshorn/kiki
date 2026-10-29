@@ -4,7 +4,7 @@ use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, H
 
 use crate::theme::Theme;
 
-const HIGHLIGHT_NAMES: [&str; 5] = ["comment", "keyword", "function", "string", "number"];
+const HIGHLIGHT_NAMES: [&str; 6] = ["comment", "keyword", "function", "string", "number", "type"];
 
 pub(crate) struct PythonHighlighter {
     state: Option<(Highlighter, Box<HighlightConfiguration>)>,
@@ -15,7 +15,7 @@ impl PythonHighlighter {
         let mut configuration = match HighlightConfiguration::new(
             tree_sitter_python::LANGUAGE.into(),
             "python",
-            tree_sitter_python::HIGHLIGHTS_QUERY,
+            include_str!("highlight/python.scm"),
             "",
             "",
         ) {
@@ -105,6 +105,7 @@ fn style_for(highlight: Highlight, theme: &Theme) -> Option<Style> {
         2 => theme.syntax_function,
         3 => theme.syntax_string,
         4 => theme.syntax_number,
+        5 => theme.syntax_type,
         _ => return None,
     };
     Some(Style::new().fg(colour))
@@ -193,6 +194,44 @@ mod tests {
             style_for_content(&text, "42"),
             Style::new().fg(DARK.syntax_number)
         );
+    }
+
+    #[test]
+    fn colours_definitions_builtins_and_constants_but_not_calls() {
+        let source = "@cache\nclass Report:\n    pass\nfor path in paths:\n    text = await read(path)\n    print(len(text) > 0 and True or None)\n";
+        let mut highlighter = PythonHighlighter::new();
+        let text = highlighter.highlight(source, &DARK);
+
+        assert_eq!(reconstruct(&text), source);
+        for (content, colour) in [
+            ("@cache", Some(DARK.syntax_function)),
+            ("Report", Some(DARK.syntax_type)),
+            ("in", Some(DARK.syntax_keyword)),
+            ("and", Some(DARK.syntax_keyword)),
+            ("await", Some(DARK.syntax_keyword)),
+            ("read", None),
+            ("path", None),
+            ("print", Some(DARK.syntax_type)),
+            ("len", Some(DARK.syntax_type)),
+            ("0", Some(DARK.syntax_number)),
+            ("True", Some(DARK.syntax_number)),
+            ("None", Some(DARK.syntax_number)),
+        ] {
+            let style = text
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| {
+                    span.content == content || (colour.is_none() && span.content.contains(content))
+                })
+                .expect("span")
+                .style;
+            assert_eq!(
+                style,
+                colour.map_or_else(Style::new, |colour| Style::new().fg(colour)),
+                "{content}"
+            );
+        }
     }
 
     #[test]
