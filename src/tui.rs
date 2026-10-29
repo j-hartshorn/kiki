@@ -5183,6 +5183,71 @@ mod tests {
     }
 
     #[test]
+    fn skill_name_completion_expands_before_submitting_canonical_activation() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        for name in ["review", "review-more"] {
+            write_skill(
+                &home.path().join(".agents/skills"),
+                name,
+                "description: Review code\ndisable-model-invocation: true\n",
+                "Review this.\n",
+            );
+        }
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        for draft in ["/revi", "/review"] {
+            for accept in [KeyCode::Tab, KeyCode::Enter] {
+                let mut app = App::default().with_skill_catalog(catalog.clone());
+                set_prompt(&mut app, draft);
+                app.refresh_completion();
+                assert_eq!(app.completion.selected_token(), Some("/skill:review"));
+                assert!(app.handle_key(key(accept)).commands.is_empty());
+                assert_eq!(app.prompt.text(), "/skill:review");
+                assert_eq!(app.completion.selected_token(), None);
+                let update = app.handle_key(key(KeyCode::Enter));
+                let [
+                    RuntimeCommand::Submit {
+                        request,
+                        activation: Some(activation),
+                    },
+                ] = update.commands.as_slice()
+                else {
+                    panic!("expected canonical skill submission for {draft:?} via {accept:?}");
+                };
+                assert_eq!(request, "/skill:review");
+                assert_eq!(activation.name(), "review");
+                assert!(app.prompt.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exact_builtin_is_not_intercepted_by_skill_name_completion() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        for name in ["model", "model-review"] {
+            write_skill(
+                &home.path().join(".agents/skills"),
+                name,
+                "description: Model workflow\n",
+                "Use this workflow.\n",
+            );
+        }
+        let mut app = app_with_user_skills(home.path(), project.path());
+        set_prompt(&mut app, "/model");
+        app.refresh_completion();
+        assert_eq!(app.completion.selected_token(), None);
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(app.prompt.is_empty());
+        assert!(app.picker.is_some());
+    }
+
+    #[test]
     fn direct_only_skill_completes_and_submits_captured_activation() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
@@ -5235,9 +5300,11 @@ mod tests {
             "Hidden body\n",
         );
         let mut app = app_with_user_skills(home.path(), project.path());
-        set_prompt(&mut app, "/skill:hid");
-        app.refresh_completion();
-        assert!(app.completion.visible_rows(5).is_empty());
+        for draft in ["/hid", "/rejected", "/skill:hid"] {
+            set_prompt(&mut app, draft);
+            app.refresh_completion();
+            assert!(app.completion.visible_rows(5).is_empty(), "{draft}");
+        }
         set_prompt(&mut app, "/skill:hidden");
         assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
         assert!(app.notice().unwrap().contains("hidden"));
