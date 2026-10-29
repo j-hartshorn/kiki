@@ -36,7 +36,7 @@ Internally, separate structural extraction/context handling, a pure column/layou
 
 Markers are private, per-render bookkeeping, checked absent from the input; do not use persistent IDs, raw-source instructions, or box-drawing detection. Independently rendering arbitrary document slices is not an acceptable shortcut.
 
-**This integration has not been prototyped.** Task 1 must prove container/reference behavior through final rendered output before proceeding. If the marker approach cannot preserve it simply, stop and revise the plan rather than silently forking the dependency or dropping nested-table support.
+**Task 1 proved this integration through rendered container/reference fixtures.** The original gate required that evidence before proceeding. If the marker approach cannot preserve it simply, stop and revise the plan rather than silently forking the dependency or dropping nested-table support.
 
 ### Dependencies and policy
 
@@ -116,7 +116,7 @@ From the implementation worktree:
 - `cargo fmt --all -- --check`.
 - Manual: resize a table through natural grid, two-/three-line wrapped grid, and records in both directions and both themes. Include another compact table in the message. Repeat with reasoning and expanded compaction; scroll and copy both wrapped grids and records.
 
-Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdown-tables` for implementation. No session codec, model prompt, or unrelated renderer changes. This documentation-only revision has not run application tests and does not claim the integration strategy has been prototyped.
+Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdown-tables` for implementation. No session codec, model prompt, or unrelated renderer changes. Implementation verification is recorded below; interactive real-terminal validation remains a user check.
 
 ## Evidence
 
@@ -134,3 +134,13 @@ Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdow
 - Task 3: record formatting is private to `markdown/records.rs`; scalar safety uses the existing YAML scalar classifier plus conservative JSON-compatible quoting, not arbitrary YAML document loading. Record wrapping preserves field indentation and distinct word/token continuation metadata; full-token separator and final grapheme policies are isolated from grid wrapping.
 - Task 4: production Markdown cards carry optional boxed row metadata: untouched `Original` lines retain Paragraph wrapping; prepared grid/record rows render once. Explicit copy-prefix widths remove repeated list/quote prefixes only from soft continuations. `RowBreaks::single` bridges prepared rows to existing extraction. A test-only unconstrained `markdown` helper remains for renderer compatibility/style tests; production uses `markdown_layout` with usable widths.
 - Approved implementation clarification: schemes and escape units remain protected when they fit a full usable line. If the unit itself is wider, emergency grapheme splitting may override that protection; prepared rows must fit and rendered copy must remain lossless. This replaces clipping of an overwide protected sequence, with an explicit exception only for an individual grapheme wider than the view.
+- Task 5: added transcript/cache/streaming/chunked-copy regressions and independent TUI reflow/scroll/resize/mouse-copy tests. This was a verification-only task against implemented behavior: tests were run first without manufacturing a failing production change. A test-coordinate error involving UTF-8 byte offsets was corrected in the fixture, not production code.
+
+## Verification evidence
+
+- `just test`: exit 0, 1840 unit tests passed, 8 pre-existing ignored; 5 credentials and 17 sessions integration tests passed.
+- `just lint`: exit 0.
+- `cargo fmt --all -- --check`: exit 0.
+- `git diff --check`: exit 0.
+- Reviewed rendered previews at natural-grid, wrapped-grid, record, and restored-wide widths. Automated TUI coverage includes both themes, bottom-follow/manual scroll, resize selection invalidation, and mouse-copy of wrapped URLs.
+- Still requires user validation: actual-terminal appearance and interactive resize/copy with real assistant output, visible reasoning, and expanded compaction. No live provider request or rollout was performed.

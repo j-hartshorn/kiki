@@ -7112,6 +7112,136 @@ mod tests {
     }
 
     #[test]
+    fn responsive_reflow_reuses_rasters_and_matches_fresh_layouts() {
+        let source = "| H |\n| --- |\n| one two six ten |".to_owned();
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+            markdown: source.clone(),
+            accounting: None,
+        }]);
+        for theme in [&DARK, &LIGHT] {
+            for width in [24, 11, 7, 24] {
+                let before = transcript.construction_counts();
+                let cached = transcript.layout(theme, width);
+                let built = transcript.construction_counts();
+                assert_eq!(built.rasterisations, before.rasterisations + 1);
+                let selection = Selection::new(
+                    DocumentPosition::new(0, 0),
+                    DocumentPosition::new(cached.total_height(), 0),
+                );
+                let copied = cached.extract_selection(selection);
+                if width == 7 {
+                    assert_eq!(copied, "- H: one two six ten");
+                } else {
+                    assert!(copied.contains('┌'));
+                    assert!(!copied.contains("- H:"));
+                }
+                transcript.layout(theme, width);
+                assert_eq!(transcript.construction_counts(), built);
+                let fresh = transcript.layout_fresh(theme, width);
+                assert_eq!(cached.total_height(), fresh.total_height());
+                for top in [0, 1, cached.total_height().saturating_sub(2)] {
+                    let area = Rect::new(3, 2, width, 4);
+                    assert_eq!(
+                        layout_buffer(&cached, area, top, Some(selection)),
+                        layout_buffer(&fresh, area, top, Some(selection))
+                    );
+                }
+                assert_eq!(copied, fresh.extract_selection(selection));
+            }
+        }
+        assert_eq!(
+            transcript.settled_blocks[0].source,
+            NormalisedBlock::Assistant {
+                markdown: source,
+                accounting: None
+            }
+        );
+    }
+
+    #[test]
+    fn responsive_streamed_tables_reflow_then_settle_without_stale_rows() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        let mut source = String::new();
+        for (index, chunk) in ["| H |", "\n| --- |", "\n| one two", " six", " ten |"]
+            .into_iter()
+            .enumerate()
+        {
+            source.push_str(chunk);
+            assert!(transcript.apply(
+                RuntimeEvent::ModelProgress {
+                    run_id: RunId(1),
+                    step_id: ModelStepId(1),
+                    epoch: 0,
+                    progress: ModelProgress::AssistantTextChunk {
+                        text: chunk.to_owned()
+                    },
+                },
+                false
+            ));
+            assert_cached_layout_matches_fresh(&mut transcript, 7);
+            let copied = copied_text(&mut transcript, 7);
+            if index == 0 {
+                assert!(!copied.contains('┌'));
+            } else if index < 4 {
+                assert!(copied.contains('┌'), "{copied}");
+            } else {
+                assert_eq!(copied, "- H: one two six ten");
+            }
+            assert_eq!(
+                transcript.live_step.as_ref().unwrap().assistant_text,
+                source
+            );
+        }
+        for width in [24, 11, 7, 24] {
+            assert_cached_layout_matches_fresh(&mut transcript, width);
+        }
+        let before = transcript.layout(&DARK, 7);
+        let before_area = Rect::new(0, 0, 7, before.total_height() as u16);
+        let before_buffer = layout_buffer(&before, before_area, 0, None);
+        transcript.apply(final_message(1, 1, &source, Vec::new(), false), false);
+        assert!(transcript.live_step.is_none());
+        let after = transcript.layout(&DARK, 7);
+        assert_eq!(before.total_height(), after.total_height());
+        assert_eq!(before_buffer, layout_buffer(&after, before_area, 0, None));
+        assert_eq!(copied_text(&mut transcript, 7), "- H: one two six ten");
+        assert_cached_layout_matches_fresh(&mut transcript, 7);
+    }
+
+    #[test]
+    fn responsive_long_records_copy_across_clipped_raster_chunks() {
+        let mut source = "| H |\n| --- |".to_owned();
+        let mut expected = Vec::new();
+        for index in 0..48 {
+            let value = format!("item_{index}_long_identifier_suffix");
+            source.push_str(&format!("\n| {value} |"));
+            expected.push(format!("- H: {value}"));
+        }
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+            markdown: source,
+            accounting: None,
+        }]);
+        let cached = transcript.layout(&DARK, 17);
+        let fresh = transcript.layout_fresh(&DARK, 17);
+        assert!(cached.total_height() > 128);
+        let selection = Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(cached.total_height(), 0),
+        );
+        assert_eq!(cached.extract_selection(selection), expected.join("\n\n"));
+        assert_eq!(fresh.extract_selection(selection), expected.join("\n\n"));
+        for top in [0, 1, 63, 64, 65, cached.total_height().saturating_sub(3)] {
+            let area = Rect::new(2, 1, 17, 4);
+            assert_eq!(
+                layout_buffer(&cached, area, top, Some(selection)),
+                layout_buffer(&fresh, area, top, Some(selection))
+            );
+        }
+    }
+
+    #[test]
     fn markdown_compatibility() {
         let heading = markdown("# Heading", &DARK, None);
         assert_eq!(heading.to_string(), "# Heading");

@@ -13201,6 +13201,176 @@ mod tests {
         assert!(rendered(&mut active, 120, 40).contains("↑100 ↓100 R0 W0 $0.002400 0.0%/272k"));
     }
 
+    fn responsive_table_tui_app(theme: &'static crate::theme::Theme) -> App {
+        let mut app = App {
+            theme,
+            ..App::default()
+        };
+        let rows = (1..=20)
+            .map(|row| format!("| r{row:02} | one two three four five six seven eight nine ten |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: format!("| ID | Description |\n| --- | --- |\n{rows}\n\nend of table"),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        app
+    }
+
+    #[test]
+    fn responsive_table_tui_bottom_follow_survives_reflow() {
+        for theme in [&DARK, &crate::theme::LIGHT] {
+            let mut app = responsive_table_tui_app(theme);
+            let mut heights = Vec::new();
+            let mut screens = Vec::new();
+            for width in [64, 34, 18, 64] {
+                let screen = rendered(&mut app, width, 14);
+                assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+                assert_eq!(
+                    app.history_document_top(),
+                    app.history_rows.saturating_sub(app.history_height)
+                );
+                assert!(app.newest_history_top() > 0);
+                assert!(screen.contains("end of table"), "{screen}");
+                match width {
+                    64 => {
+                        assert!(
+                            screen.contains("one two three four five six seven eight nine ten")
+                        );
+                        assert!(screen.contains('│'));
+                    }
+                    34 => {
+                        assert!(screen.contains("six seven eight nine ten"), "{screen}");
+                        assert!(screen.contains('│'));
+                        assert!(
+                            !screen.contains("one two three four five six seven eight nine ten")
+                        );
+                        assert!(!screen.contains("- ID:"));
+                    }
+                    18 => {
+                        assert!(screen.contains("- ID: r20"), "{screen}");
+                        assert!(screen.contains("Description:"));
+                        assert!(!screen.contains('│'));
+                    }
+                    _ => unreachable!(),
+                }
+                heights.push(app.history_rows);
+                screens.push(screen);
+            }
+            assert!(heights[0] < heights[1]);
+            assert!(heights[1] < heights[2]);
+            assert_eq!(heights[0], heights[3]);
+            assert_eq!(screens[0], screens[3]);
+        }
+    }
+
+    #[test]
+    fn responsive_table_tui_manual_scroll_stays_bounded_across_reflow() {
+        let mut app = responsive_table_tui_app(&DARK);
+        rendered(&mut app, 64, 14);
+        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(top) if top > 0));
+
+        for width in [34, 18, 64] {
+            let screen = rendered(&mut app, width, 14);
+            let HistoryPosition::Anchored(top) = app.history_position else {
+                panic!("manual scroll unexpectedly followed the bottom at width {width}");
+            };
+            assert!(top < app.newest_history_top());
+            assert!(top + app.history_height <= app.history_rows);
+            assert!(!screen.contains("end of table"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn responsive_table_tui_resize_clears_selection_and_records_copy_rejoins_url() {
+        let url = "https://example.test/alpha/beta/gamma?first=one&second=two#section";
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: format!("| Link | State |\n| --- | --- |\n| `{url}` | ready |"),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        let buffer = rendered_buffer(&mut app, 100, 30);
+        let (_, row) = cell_start(&buffer, url);
+        let column = (buffer.area.left()..buffer.area.right())
+            .find(|&column| buffer[(column, row)].symbol() == "h")
+            .expect("URL start cell");
+        let end = column + u16::try_from(url.len() - 1).unwrap();
+        let now = Instant::now();
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), column),
+            (MouseEventKind::Drag(MouseButton::Left), end),
+            (MouseEventKind::Up(MouseButton::Left), end),
+        ] {
+            app.handle_mouse(mouse_event(kind, column, row), now);
+        }
+        rendered_buffer(&mut app, 100, 30);
+        let mut clipboard = FakeClipboard::available();
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(clipboard.writes, [url]);
+        assert!(app.selection.is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Resize(24, 30)), Some(quit_event())]);
+        let (commands, _received) = tokio::sync::mpsc::channel(1);
+        let (_events, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress, mut progress_receiver) = tokio::sync::mpsc::channel(1);
+        super::run_loop(
+            &mut terminal,
+            &mut app,
+            &mut input,
+            &commands,
+            &mut event_receiver,
+            &mut progress_receiver,
+            &mut clipboard,
+        )
+        .unwrap();
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert!(app.flash.is_none());
+        assert!(app.notice().is_none());
+
+        let buffer = rendered_buffer(&mut app, 24, 30);
+        let (start_column, start_row) = cell_start(&buffer, "- Link:");
+        let (end_column, end_row) = cell_start(&buffer, "State: ready");
+        let end_column = end_column + u16::try_from("State: ready".len() - 1).unwrap();
+        assert!(end_row > start_row + 2);
+        assert!(!buffer_row(&buffer, start_row + 1).contains(url));
+        for (kind, column, row) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                start_column,
+                start_row,
+            ),
+            (MouseEventKind::Drag(MouseButton::Left), end_column, end_row),
+            (MouseEventKind::Up(MouseButton::Left), end_column, end_row),
+        ] {
+            app.handle_mouse(mouse_event(kind, column, row), now);
+        }
+        rendered_buffer(&mut app, 24, 30);
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(
+            clipboard.writes,
+            [url.to_owned(), format!("- Link: {url}\n  State: ready")]
+        );
+    }
+
     #[test]
     fn transcript_following_bottom_and_manual_scroll_survive_live_replacement() {
         let mut app = App::default();
