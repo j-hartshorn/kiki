@@ -10,6 +10,7 @@ use super::{MarkdownOptions, from_str_with_options};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LineBreak {
+    Original,
     Hard,
     Word,
     Token,
@@ -19,12 +20,26 @@ pub(super) enum LineBreak {
 pub(super) struct MarkdownLayout {
     pub(super) text: Text<'static>,
     pub(super) breaks: Vec<LineBreak>,
+    pub(super) prefixes: Vec<usize>,
 }
 
 impl MarkdownLayout {
-    fn hard(text: Text<'static>) -> Self {
+    pub(super) fn original(text: Text<'static>) -> Self {
+        let breaks = vec![LineBreak::Original; text.lines.len()];
+        Self {
+            text,
+            breaks,
+            prefixes: Vec::new(),
+        }
+    }
+
+    pub(super) fn hard(text: Text<'static>) -> Self {
         let breaks = vec![LineBreak::Hard; text.lines.len()];
-        Self { text, breaks }
+        Self {
+            text,
+            breaks,
+            prefixes: Vec::new(),
+        }
     }
 }
 
@@ -298,11 +313,12 @@ fn render_with(
         });
     }
     if placements.is_empty() {
-        return MarkdownLayout::hard(owned(from_str_with_options(source, options)));
+        return MarkdownLayout::original(owned(from_str_with_options(source, options)));
     }
     rewritten.push_str(&source[cursor..]);
     let mut text = owned(from_str_with_options(&rewritten, options));
-    let mut breaks = vec![LineBreak::Hard; text.lines.len()];
+    let mut breaks = vec![LineBreak::Original; text.lines.len()];
+    let mut prefixes = vec![0; text.lines.len()];
     for placement in placements.into_iter().rev() {
         let header = text
             .lines
@@ -317,6 +333,25 @@ fn render_with(
         let first_prefix = prefix(&text.lines[first], placement.carrier_width);
         let continuation = prefix(&text.lines[header], placement.carrier_width);
         let context_style = text.lines[first].style;
+        let replacement_prefixes = placement
+            .layout
+            .breaks
+            .iter()
+            .enumerate()
+            .map(|(index, br)| {
+                let context_width = if matches!(br, LineBreak::Word | LineBreak::Token) {
+                    let spans = if index == 0 {
+                        &first_prefix
+                    } else {
+                        &continuation
+                    };
+                    spans.iter().map(Span::width).sum::<usize>()
+                } else {
+                    0
+                };
+                placement.layout.prefixes.get(index).copied().unwrap_or(0) + context_width
+            })
+            .collect::<Vec<_>>();
         let lines = placement
             .layout
             .text
@@ -338,8 +373,13 @@ fn render_with(
             });
         text.lines.splice(first..first + 4, lines);
         breaks.splice(first..first + 4, placement.layout.breaks);
+        prefixes.splice(first..first + 4, replacement_prefixes);
     }
-    MarkdownLayout { text, breaks }
+    MarkdownLayout {
+        text,
+        breaks,
+        prefixes,
+    }
 }
 
 fn prefix(line: &Line<'static>, carrier_width: usize) -> Vec<Span<'static>> {
@@ -637,9 +677,9 @@ mod tests {
     }
 
     #[test]
-    fn displayed_markdown_link_destinations_keep_the_scheme_whole() {
+    fn displayed_markdown_link_destinations_keep_the_scheme_whole_when_it_fits() {
         let source = "| H |\n| --- |\n| [guide](https://example.com/a) |";
-        let layout = render(source, 8, super::super::markdown_options(&DARK));
+        let layout = render(source, 12, super::super::markdown_options(&DARK));
         assert!(
             layout
                 .text
@@ -670,6 +710,204 @@ mod tests {
             "{display}"
         );
         assert!(layout.text.lines.iter().all(|line| line.width() <= 20));
+    }
+
+    #[test]
+    fn mixed_documents_keep_original_and_prepared_row_metadata() {
+        let source = "before\n\n| x |\n| --- |\n| a |\n\nbetween grids\n\n| H |\n| --- |\n| one two six ten one two six ten |\n\nbetween records\n\n| H |\n| --- |\n| identifier_with_many_segments |\n\nafter";
+        let layout = render(source, 20, super::super::markdown_options(&DARK));
+        let rows = layout
+            .text
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let grid = rows
+            .iter()
+            .position(|row| row == "┌──────────────────┐")
+            .unwrap();
+        let grid_end = rows
+            .iter()
+            .position(|row| row == "└──────────────────┘")
+            .unwrap();
+        let record = rows.iter().position(|row| row == "- H:").unwrap();
+        let mut expected = vec![LineBreak::Original; rows.len()];
+        expected[grid..=grid_end].fill(LineBreak::Hard);
+        expected[record..record + 3].copy_from_slice(&[
+            LineBreak::Hard,
+            LineBreak::Word,
+            LineBreak::Token,
+        ]);
+        assert_eq!(layout.breaks, expected);
+        assert!(layout.prefixes.iter().all(|&width| width == 0));
+    }
+
+    #[test]
+    fn record_continuations_keep_visible_context_and_skip_its_display_width_for_copy() {
+        let fixtures = [
+            (
+                "> | H |\n> | --- |\n> | ab/**cd**/efgh one two six ten |",
+                "> ",
+                "> ",
+            ),
+            (
+                "- | H |\n  | --- |\n  | ab/**cd**/efgh one two six ten |",
+                "- ",
+                "  ",
+            ),
+            (
+                "123. | H |\n     | --- |\n     | ab/**cd**/efgh one two six ten |",
+                "123. ",
+                "     ",
+            ),
+            (
+                "- outer\n  - | H |\n    | --- |\n    | ab/**cd**/efgh one two six ten |",
+                "    - ",
+                "      ",
+            ),
+            (
+                "> > 12. intro\n> >\n> >     | H |\n> >     | --- |\n> >     | ab/**cd**/efgh one two six ten |",
+                ">>     ",
+                ">>     ",
+            ),
+        ];
+        for theme in [&DARK, &LIGHT] {
+            let options = super::super::markdown_options(theme);
+            for (source, first_prefix, continuation) in fixtures {
+                let source_prefix_bytes = source.lines().last().unwrap().find('|').unwrap();
+                let width = Line::raw(continuation).width();
+                let layout = render(source, (9 + width) as u16, options);
+                let rows = layout
+                    .text
+                    .lines
+                    .iter()
+                    .map(Line::to_string)
+                    .collect::<Vec<_>>();
+                let first = rows.iter().position(|row| row.ends_with("- H:")).unwrap();
+                let values = ["- H:", "ab/cd/", "efgh one", "two six", "ten"];
+                let mut copied = String::new();
+                for (offset, value) in values.iter().enumerate() {
+                    let index = first + offset;
+                    let prefix = if offset == 0 {
+                        first_prefix
+                    } else {
+                        continuation
+                    };
+                    assert_eq!(rows[index], format!("{prefix}{value}"), "{source}");
+                    assert_eq!(
+                        layout.prefixes.get(index).copied().unwrap_or(0),
+                        if offset == 0 { 0 } else { width },
+                        "{source}"
+                    );
+                    match layout.breaks[index] {
+                        LineBreak::Hard => copied.push_str(prefix),
+                        LineBreak::Word => copied.push(' '),
+                        LineBreak::Token => {}
+                        LineBreak::Original => panic!("record continuation was not prepared"),
+                    }
+                    copied.push_str(rows[index].strip_prefix(prefix).unwrap());
+                }
+                assert_eq!(
+                    copied,
+                    format!("{first_prefix}- H: ab/cd/efgh one two six ten")
+                );
+                if source_prefix_bytes != width {
+                    assert_ne!(layout.prefixes[first + 1], source_prefix_bytes);
+                }
+                assert!(
+                    style_at(&layout.text, "cd")
+                        .add_modifier
+                        .contains(Modifier::BOLD)
+                );
+                let original = from_str_with_options(source, options);
+                let header = original
+                    .lines
+                    .iter()
+                    .position(|line| line.to_string().contains('H'))
+                    .unwrap();
+                let original_styles = styles(&original);
+                let actual_styles = styles(&layout.text);
+                assert_eq!(
+                    &actual_styles[first][..first_prefix.len()],
+                    &original_styles[header - 1][..first_prefix.len()]
+                );
+                for offset in 1..values.len() {
+                    assert_eq!(
+                        &actual_styles[first + offset][..width],
+                        &original_styles[header][..width]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_substitutions_align_internal_and_context_copy_prefixes() {
+        use LineBreak::{Hard, Original, Token, Word};
+        let source = "before\n\n> | A |\n> | --- |\n> | v |\n\nbetween one\n\n- | B |\n  | --- |\n  | v |\n- following\n\nbetween two\n\n> > | C |\n> > | --- |\n> > | v |\n\nafter";
+        let options = super::super::markdown_options(&DARK);
+        let original = from_str_with_options(source, options);
+        let mut expected_rows = original
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let mut expected_breaks = vec![Original; expected_rows.len()];
+        let mut expected_prefixes = vec![0; expected_rows.len()];
+        for (label, rows, breaks, prefixes) in [
+            ("C", vec![">> final"], vec![Hard], vec![0]),
+            (
+                "B",
+                vec!["- field:", "  word", "  --part", "  next:", "  tail"],
+                vec![Hard, Word, Token, Hard, Word],
+                vec![0, 2, 4, 0, 2],
+            ),
+            (
+                "A",
+                vec!["> field:", "> xxleft", "> right"],
+                vec![Hard, Word, Token],
+                vec![0, 4, 2],
+            ),
+        ] {
+            let first = expected_rows
+                .iter()
+                .position(|row| row.contains(label))
+                .unwrap()
+                - 1;
+            expected_rows.splice(first..first + 5, rows.into_iter().map(str::to_owned));
+            expected_breaks.splice(first..first + 5, breaks);
+            expected_prefixes.splice(first..first + 5, prefixes);
+        }
+        let mut calls = 0;
+        let layout = render_with(source, 20, options, |_, _| {
+            calls += 1;
+            Some(match calls {
+                1 => MarkdownLayout {
+                    text: Text::from("field:\nxxleft\nright"),
+                    breaks: vec![Hard, Word, Token],
+                    prefixes: vec![0, 2],
+                },
+                2 => MarkdownLayout {
+                    text: Text::from("field:\nword\n--part\nnext:\ntail"),
+                    breaks: vec![Hard, Word, Token, Hard, Word],
+                    prefixes: vec![0, 0, 2],
+                },
+                3 => MarkdownLayout::hard(Text::from("final")),
+                _ => panic!("unexpected table"),
+            })
+        });
+        assert_eq!(calls, 3);
+        assert_eq!(
+            layout
+                .text
+                .lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>(),
+            expected_rows
+        );
+        assert_eq!(layout.breaks, expected_breaks);
+        assert_eq!(layout.prefixes, expected_prefixes);
     }
 
     #[test]
@@ -760,9 +998,28 @@ mod tests {
                 assert_eq!(actual.text, from_str_with_options(source, options));
                 assert_eq!(
                     actual.breaks,
-                    vec![LineBreak::Hard; actual.text.lines.len()]
+                    vec![LineBreak::Original; actual.text.lines.len()]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn raw_and_literal_lines_keep_original_wrapping_provenance() {
+        let options = super::super::markdown_options(&DARK);
+        for source in [
+            "",
+            "ordinary words that still need paragraph wrapping",
+            r"`a|b` and a \| b",
+        ] {
+            let layout = render(source, 4, options);
+            assert_eq!(layout.text, from_str_with_options(source, options));
+            assert!(layout.prefixes.is_empty());
+            assert_eq!(
+                layout.breaks,
+                vec![LineBreak::Original; layout.text.lines.len()],
+                "{source:?}"
+            );
         }
     }
 
@@ -878,10 +1135,9 @@ mod tests {
                 });
                 assert_eq!(calls, 1, "{source}");
                 assert_eq!(styles(&actual.text), expected, "{source}");
-                assert_eq!(
-                    actual.breaks,
-                    vec![LineBreak::Hard; actual.text.lines.len()]
-                );
+                let mut expected_breaks = vec![LineBreak::Original; original.lines.len()];
+                expected_breaks.splice(first..first + 5, [LineBreak::Hard; 2]);
+                assert_eq!(actual.breaks, expected_breaks);
             }
         }
     }
@@ -1016,6 +1272,7 @@ mod tests {
             Some(MarkdownLayout {
                 text: Text::from("field:\nword\ntoken"),
                 breaks: vec![LineBreak::Hard, LineBreak::Word, LineBreak::Token],
+                prefixes: Vec::new(),
             })
         });
         assert_eq!(actual.text.to_string(), "field:\nword\ntoken");

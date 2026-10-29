@@ -49,6 +49,7 @@ pub(super) fn wrap_words(
     Some(MarkdownLayout {
         text: Text::from(lines),
         breaks,
+        prefixes: Vec::new(),
     })
 }
 
@@ -61,6 +62,7 @@ pub(super) fn wrap_records(
         return MarkdownLayout {
             text: Text::default(),
             breaks: Vec::new(),
+            prefixes: Vec::new(),
         };
     }
     let content = line.to_string();
@@ -108,6 +110,7 @@ pub(super) fn wrap_records(
     MarkdownLayout {
         text: Text::from(lines),
         breaks,
+        prefixes: Vec::new(),
     }
 }
 
@@ -158,8 +161,14 @@ fn record_units(content: &str, tokens: &[Range<usize>]) -> Vec<Range<usize>> {
         {
             let end = token.start + text.len() - prefix.len() + scheme + 3;
             let host = content[end..token.end].graphemes(true).next().unwrap_or("");
-            // Keep a scheme with its first host grapheme, never stranded by itself.
-            units.push(token.start..end + host.len());
+            let mut host_end = end + host.len();
+            for unit in &units {
+                if unit.start < host_end && host_end < unit.end {
+                    host_end = unit.end;
+                }
+            }
+            // Keep the first host unit whole, including an overlapping escape.
+            units.push(token.start..host_end);
         }
     }
     units
@@ -178,7 +187,9 @@ fn record_break(
     for (offset, grapheme) in content[token.clone()].grapheme_indices(true) {
         let start = token.start + offset;
         let end = start + grapheme.len();
-        if units.iter().any(|unit| unit.start < end && end < unit.end) {
+        if units.iter().any(|unit| {
+            unit.start < end && end < unit.end && slice(line, unit.start..unit.end).width() <= width
+        }) {
             continue;
         }
         first = end;
@@ -511,7 +522,7 @@ mod tests {
         for (index, line) in layout.text.lines.iter().enumerate() {
             if index > 0 {
                 match layout.breaks[index] {
-                    LineBreak::Hard => text.push('\n'),
+                    LineBreak::Original | LineBreak::Hard => text.push('\n'),
                     LineBreak::Word => text.push(' '),
                     LineBreak::Token => {}
                 }
@@ -584,6 +595,27 @@ mod tests {
     }
 
     #[test]
+    fn overwide_protected_sequences_use_lossless_grapheme_fallback() {
+        for token in [
+            "https://example.com/a",
+            "(https://example.com/a)",
+            "(https://%65xample.com/a)",
+            "%2F",
+            r#""a\u0000b\\c\"d""#,
+        ] {
+            for width in 1..=16 {
+                let layout = wrap_records(&Line::from(token), width, &[]);
+                assert!(
+                    layout.text.lines.iter().all(|line| line.width() <= width),
+                    "{token:?} at {width}: {:?}",
+                    layout.text
+                );
+                assert_eq!(copied(&layout), token, "{token:?} at {width}");
+            }
+        }
+    }
+
+    #[test]
     fn records_protect_schemes_and_percent_escapes() {
         for (token, width, rows) in [
             (
@@ -594,10 +626,10 @@ mod tests {
             (
                 "https://example.com/a",
                 8,
-                vec!["https://e", "xample.", "com/a"],
+                vec!["https://", "example.", "com/a"],
             ),
             ("ab%2Fcd/efgh", 5, vec!["ab%2F", "cd/", "efgh"]),
-            ("%2F", 1, vec!["%2F"]),
+            ("%2F", 1, vec!["%", "2", "F"]),
         ] {
             let mut breaks = vec![LineBreak::Token; rows.len()];
             breaks[0] = LineBreak::Hard;
@@ -613,7 +645,7 @@ mod tests {
             &Line::from(token),
             5,
             &[],
-            &[r#""ab\n"#, r#"cd\"e"#, r"f\\gh", r"\u0000", "ij\""],
+            &[r#""ab\n"#, r#"cd\"e"#, r"f\\gh", r"\u000", "0ij\""],
             &[
                 LineBreak::Hard,
                 LineBreak::Token,

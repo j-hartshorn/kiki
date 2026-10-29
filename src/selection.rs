@@ -143,7 +143,7 @@ impl CardId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowBreak {
+pub(crate) enum RowBreak {
     Hard,
     Soft,
     SoftWord,
@@ -156,6 +156,13 @@ pub(crate) struct RowBreaks {
 }
 
 impl RowBreaks {
+    pub(crate) fn single(break_before: RowBreak) -> Self {
+        Self {
+            start: 0,
+            breaks: vec![break_before],
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_text(text: &Text<'_>, width: u16) -> Self {
         let mut breaks = Vec::new();

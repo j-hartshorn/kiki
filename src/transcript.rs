@@ -32,14 +32,13 @@ use crate::runtime::{
     RuntimeInitialState, StoredRecord, TerminalDetails,
 };
 use crate::selection::{
-    CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
+    CardId, Extraction, RowBreak, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
 use crate::session::{CompactionOutcome, CompactionReason};
 use crate::skills::SkillOrigin;
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 use crate::theme::{DARK, LIGHT, Theme};
 
-#[cfg(test)]
 mod markdown;
 
 #[derive(Clone, Copy)]
@@ -182,6 +181,7 @@ fn markdown_options(theme: &'static Theme) -> &'static MarkdownOptions {
     }
 }
 
+#[cfg(test)]
 fn markdown<'a>(
     source: &'a str,
     theme: &'static Theme,
@@ -192,6 +192,27 @@ fn markdown<'a>(
         construction_counts.markdown += 1;
     }
     from_str_with_options(source, markdown_options(theme))
+}
+
+fn markdown_layout(
+    source: &str,
+    theme: &'static Theme,
+    width: u16,
+    #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
+) -> markdown::MarkdownLayout {
+    #[cfg(test)]
+    if let Some(counts) = construction_counts {
+        counts.markdown += 1;
+    }
+    markdown::render(source, width, markdown_options(theme))
+}
+
+fn append_markdown_line(layout: &mut markdown::MarkdownLayout, line: Line<'static>) {
+    layout.text.lines.push(line);
+    layout.breaks.push(markdown::LineBreak::Original);
+    if !layout.prefixes.is_empty() {
+        layout.prefixes.push(0);
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -584,6 +605,11 @@ fn effective_padding(width: u16, wanted: u16) -> (u16, u16) {
     let total = wanted.saturating_mul(2).min(width.saturating_sub(1));
     let left = wanted.min(total.saturating_add(1) / 2);
     (left, total.saturating_sub(left))
+}
+
+fn effective_content_width(width: u16, wanted: u16) -> u16 {
+    let (left, right) = effective_padding(width, wanted);
+    width.saturating_sub(left.saturating_add(right))
 }
 
 fn logical_lines(text: &str) -> Vec<&str> {
@@ -1021,25 +1047,27 @@ fn assistant_text(
     theme: &'static Theme,
     markdown_source: &str,
     accounting: Option<String>,
+    width: u16,
     #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
-) -> Text<'static> {
-    let mut text = own_styled_text(
-        markdown(
-            markdown_source,
-            theme,
-            #[cfg(test)]
-            construction_counts,
-        ),
-        page_style(theme),
+) -> markdown::MarkdownLayout {
+    let mut layout = markdown_layout(
+        markdown_source,
+        theme,
+        width,
+        #[cfg(test)]
+        construction_counts,
     );
+    layout.text = own_styled_text(layout.text, page_style(theme));
     if let Some(accounting) = accounting {
         if !markdown_source.is_empty() {
-            text.lines.push(Line::raw(""));
+            append_markdown_line(&mut layout, Line::raw(""));
         }
-        text.lines
-            .push(accounting_line(accounting, muted_page_style(theme)));
+        append_markdown_line(
+            &mut layout,
+            accounting_line(accounting, muted_page_style(theme)),
+        );
     }
-    text
+    layout
 }
 
 fn literal_text(text: &str, style: Style) -> Text<'static> {
@@ -1183,6 +1211,7 @@ fn selectable_text_regions(
     placement: TextPlacement,
     card: CardId,
     buffer: &Buffer,
+    rows: Option<&MarkdownRows>,
 ) -> Vec<SelectableRegion> {
     if placement.width == 0 {
         return Vec::new();
@@ -1190,31 +1219,57 @@ fn selectable_text_regions(
 
     let mut regions = Vec::new();
     let mut line_top = placement.text_top;
-    for line in &text.lines {
+    for (index, line) in text.lines.iter().enumerate() {
         let line_text = Text::from(line.clone());
-        let line_height = Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(placement.width);
+        let kind = rows
+            .and_then(|rows| rows.breaks.get(index))
+            .copied()
+            .unwrap_or(markdown::LineBreak::Original);
+        let prepared = kind != markdown::LineBreak::Original;
+        let line_height = if prepared {
+            1
+        } else {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(placement.width)
+        };
         if let Some(clip) = vertical_clip(
             line_top,
             line_height,
             placement.top,
             placement.viewport.height,
         ) {
-            let breaks = RowBreaks::for_rows(
-                &line_text,
-                placement.width,
-                clip.top.saturating_sub(line_top),
-                clip.bottom.saturating_sub(clip.top),
-            );
+            let breaks = if prepared {
+                RowBreaks::single(match kind {
+                    markdown::LineBreak::Word => RowBreak::SoftWord,
+                    markdown::LineBreak::Token => RowBreak::Soft,
+                    _ => RowBreak::Hard,
+                })
+            } else {
+                RowBreaks::for_rows(
+                    &line_text,
+                    placement.width,
+                    clip.top.saturating_sub(line_top),
+                    clip.bottom.saturating_sub(clip.top),
+                )
+            };
+            let skip = rows
+                .and_then(|rows| rows.prefixes.get(index))
+                .copied()
+                .unwrap_or(0)
+                .min(usize::from(placement.width)) as u16;
             let y = placement.viewport.y.saturating_add(
                 u16::try_from(clip.top.saturating_sub(placement.top)).unwrap_or(u16::MAX),
             );
             let height = u16::try_from(clip.bottom.saturating_sub(clip.top)).unwrap_or(u16::MAX);
             let area = Rect::new(
-                placement.viewport.x.saturating_add(placement.x),
+                placement
+                    .viewport
+                    .x
+                    .saturating_add(placement.x)
+                    .saturating_add(skip),
                 y,
-                placement.width,
+                placement.width.saturating_sub(skip),
                 height,
             );
             if matches!(line.alignment.or(text.alignment), Some(Alignment::Right)) {
@@ -1293,6 +1348,7 @@ impl ArenaText {
             },
             card,
             buffer,
+            None,
         )
     }
 
@@ -1503,7 +1559,16 @@ impl NormalisedBlock {
             Self::Assistant {
                 markdown: source,
                 accounting,
-            } => assistant_text(&crate::theme::DARK, source, accounting.clone(), None),
+            } => {
+                assistant_text(
+                    &crate::theme::DARK,
+                    source,
+                    accounting.clone(),
+                    u16::MAX,
+                    None,
+                )
+                .text
+            }
             _ => Text::raw(self.plain_text()),
         };
         Paragraph::new(text).wrap(Wrap { trim: false })
@@ -1580,25 +1645,72 @@ impl RenderBlock {
         horizontal_padding: u16,
         vertical_padding: u16,
     ) -> Self {
-        let (left_padding, right_padding) = effective_padding(width, horizontal_padding);
-        let content_width = width.saturating_sub(left_padding.saturating_add(right_padding));
-        let content_height = if content_width > 0 {
-            Paragraph::new(text.clone())
-                .style(style)
-                .wrap(Wrap { trim: false })
-                .line_count(content_width)
-        } else {
-            0
-        };
-        Self::Card(CardRenderBlock {
+        Self::card_with_rows(
             text,
+            None,
+            style,
+            width,
+            horizontal_padding,
+            vertical_padding,
+        )
+    }
+
+    fn markdown_card(
+        layout: markdown::MarkdownLayout,
+        style: Style,
+        width: u16,
+        horizontal_padding: u16,
+        vertical_padding: u16,
+    ) -> Self {
+        let rows = MarkdownRows {
+            breaks: layout.breaks,
+            prefixes: layout.prefixes,
+        };
+        Self::card_with_rows(
+            layout.text,
+            Some(rows),
+            style,
+            width,
+            horizontal_padding,
+            vertical_padding,
+        )
+    }
+
+    fn card_with_rows(
+        text: Text<'static>,
+        rows: Option<MarkdownRows>,
+        style: Style,
+        width: u16,
+        horizontal_padding: u16,
+        vertical_padding: u16,
+    ) -> Self {
+        let (left_padding, right_padding) = effective_padding(width, horizontal_padding);
+        let content_width = effective_content_width(width, horizontal_padding);
+        let mut card = CardRenderBlock {
+            text,
+            rows: rows.map(Box::new),
             style,
             left_padding,
             right_padding,
             top_padding: vertical_padding,
             bottom_padding: vertical_padding,
-            height: content_height.saturating_add(usize::from(vertical_padding).saturating_mul(2)),
-        })
+            height: 0,
+        };
+        let content_height = if content_width == 0 {
+            0
+        } else if card.rows.is_some() {
+            (0..card.text.lines.len())
+                .map(|index| card.line_paragraph(index).line_count(content_width))
+                .fold(0usize, usize::saturating_add)
+        } else {
+            Paragraph::new(card.text.clone())
+                .style(style)
+                .wrap(Wrap { trim: false })
+                .line_count(content_width)
+        };
+        card.height =
+            content_height.saturating_add(usize::from(vertical_padding).saturating_mul(2));
+        Self::Card(card)
     }
 
     fn height(&self) -> usize {
@@ -1630,7 +1742,13 @@ impl RenderBlock {
     }
 }
 
+struct MarkdownRows {
+    breaks: Vec<markdown::LineBreak>,
+    prefixes: Vec<usize>,
+}
+
 struct CardRenderBlock {
+    rows: Option<Box<MarkdownRows>>,
     text: Text<'static>,
     style: Style,
     left_padding: u16,
@@ -1641,6 +1759,23 @@ struct CardRenderBlock {
 }
 
 impl CardRenderBlock {
+    fn line_paragraph(&self, index: usize) -> Paragraph<'static> {
+        let mut text = Text::from(self.text.lines[index].clone());
+        text.style = self.text.style;
+        text.alignment = self.text.alignment;
+        let paragraph = Paragraph::new(text).style(self.style);
+        if self
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.breaks.get(index))
+            .is_some_and(|kind| *kind != markdown::LineBreak::Original)
+        {
+            paragraph
+        } else {
+            paragraph.wrap(Wrap { trim: false })
+        }
+    }
+
     fn selectable_regions(
         &self,
         viewport: Rect,
@@ -1663,6 +1798,7 @@ impl CardRenderBlock {
             },
             card,
             buffer,
+            self.rows.as_deref(),
         )
     }
 
@@ -1694,6 +1830,36 @@ impl CardRenderBlock {
             .width
             .saturating_sub(self.left_padding.saturating_add(self.right_padding));
         if text_width == 0 {
+            return;
+        }
+        if self.rows.is_some() {
+            let mut line_top = text_top;
+            for index in 0..self.text.lines.len() {
+                let paragraph = self.line_paragraph(index);
+                let line_height = paragraph.line_count(text_width);
+                if let Some(clip) = vertical_clip(line_top, line_height, top, viewport.height) {
+                    let y = viewport.y.saturating_add(
+                        u16::try_from(clip.top.saturating_sub(top)).unwrap_or(u16::MAX),
+                    );
+                    let height =
+                        u16::try_from(clip.bottom.saturating_sub(clip.top)).unwrap_or(u16::MAX);
+                    paragraph
+                        .scroll((
+                            u16::try_from(clip.top.saturating_sub(line_top)).unwrap_or(u16::MAX),
+                            0,
+                        ))
+                        .render(
+                            Rect::new(
+                                viewport.x.saturating_add(self.left_padding),
+                                y,
+                                text_width,
+                                height,
+                            ),
+                            buffer,
+                        );
+                }
+                line_top = line_top.saturating_add(line_height);
+            }
             return;
         }
         Paragraph::new(self.text.clone())
@@ -3644,27 +3810,35 @@ fn build_render_block(
         NormalisedBlock::Compaction(card) => {
             let background = card.state.background(theme);
             let style = card_style(theme, background);
-            let mut text = if expand_arenas {
+            let mut layout = if expand_arenas {
                 match &card.expanded {
-                    CompactionContent::Markdown(source) => markdown(
+                    CompactionContent::Markdown(source) => markdown_layout(
                         source,
                         theme,
+                        effective_content_width(width, 1),
                         #[cfg(test)]
                         construction_counts,
                     ),
-                    CompactionContent::Plain(source) => literal_text(source, style),
+                    CompactionContent::Plain(source) => {
+                        markdown::MarkdownLayout::original(literal_text(source, style))
+                    }
                 }
             } else {
-                Text::raw(card.collapsed.clone())
+                markdown::MarkdownLayout::original(Text::raw(card.collapsed.clone()))
             };
-            text.lines.insert(0, Line::raw(card.heading.clone()));
-            if expand_arenas && let Some(accounting) = &card.accounting {
-                text.lines.push(accounting_line(
-                    accounting.clone(),
-                    muted_card_style(theme, background),
-                ));
+            layout.text.lines.insert(0, Line::raw(card.heading.clone()));
+            layout.breaks.insert(0, markdown::LineBreak::Original);
+            if !layout.prefixes.is_empty() {
+                layout.prefixes.insert(0, 0);
             }
-            RenderBlock::card(own_styled_text(text, style), style, width, 1, 1)
+            if expand_arenas && let Some(accounting) = &card.accounting {
+                append_markdown_line(
+                    &mut layout,
+                    accounting_line(accounting.clone(), muted_card_style(theme, background)),
+                );
+            }
+            layout.text = own_styled_text(layout.text, style);
+            RenderBlock::markdown_card(layout, style, width, 1, 1)
         }
         NormalisedBlock::SkillActivation(card) => {
             let style = card_style(theme, theme.tool_success_bg);
@@ -3687,23 +3861,24 @@ fn build_render_block(
             let style = card_style(theme, theme.card_bg)
                 .fg(theme.thinking_text)
                 .add_modifier(Modifier::ITALIC);
-            let text = if show_reasoning {
-                own_styled_text(
-                    markdown(
-                        source,
-                        theme,
-                        #[cfg(test)]
-                        construction_counts,
-                    ),
-                    style,
+            let mut layout = if show_reasoning {
+                markdown_layout(
+                    source,
+                    theme,
+                    effective_content_width(width, 2),
+                    #[cfg(test)]
+                    construction_counts,
                 )
             } else {
-                own_styled_text(
+                markdown::MarkdownLayout::original(own_styled_text(
                     Text::raw("thinking hidden · Ctrl-T to show"),
                     dim_card_style(theme, theme.card_bg).add_modifier(Modifier::ITALIC),
-                )
+                ))
             };
-            RenderBlock::card(text, style, width, 2, 1)
+            if show_reasoning {
+                layout.text = own_styled_text(layout.text, style);
+            }
+            RenderBlock::markdown_card(layout, style, width, 2, 1)
         }
         NormalisedBlock::Arena(arena) => RenderBlock::Arena(ArenaRenderBlock::new(
             theme,
@@ -3717,11 +3892,12 @@ fn build_render_block(
         NormalisedBlock::Assistant {
             markdown: source,
             accounting,
-        } => RenderBlock::card(
+        } => RenderBlock::markdown_card(
             assistant_text(
                 theme,
                 source,
                 accounting.clone(),
+                width,
                 #[cfg(test)]
                 construction_counts,
             ),
@@ -6764,6 +6940,178 @@ mod tests {
     }
 
     #[test]
+    fn responsive_markdown_tables_use_each_cards_usable_width() {
+        let source = "| H |\n| --- |\n| one two six ten |".to_owned();
+        let blocks = [
+            (
+                NormalisedBlock::Assistant {
+                    markdown: source.clone(),
+                    accounting: None,
+                },
+                false,
+            ),
+            (
+                NormalisedBlock::Reasoning {
+                    markdown: source.clone(),
+                },
+                true,
+            ),
+            (
+                NormalisedBlock::Compaction(super::CompactionCard {
+                    state: super::ArenaState::Complete,
+                    heading: "summary".into(),
+                    collapsed: "collapsed".into(),
+                    expanded: super::CompactionContent::Markdown(source),
+                    accounting: None,
+                }),
+                true,
+            ),
+        ];
+        let mut highlighter = PythonHighlighter::new();
+        for (source, expects_records) in blocks {
+            let block =
+                super::build_render_block(&DARK, &source, true, true, 11, &mut highlighter, None);
+            let super::RenderBlock::Card(card) = block else {
+                panic!("expected card")
+            };
+            assert_eq!(
+                card.text.to_string().contains("- H:"),
+                expects_records,
+                "{:?}",
+                card.text
+            );
+        }
+    }
+
+    #[test]
+    fn responsive_record_copy_rejoins_tokens_inside_quote_context() {
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+            markdown: "> | H |\n> | --- |\n> | [guide](https://example.com/a_long_path) |".into(),
+            accounting: None,
+        }]);
+        let layout = transcript.layout(&DARK, 18);
+        let copied = layout.extract_selection(Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(layout.total_height(), 0),
+        ));
+        assert_eq!(copied, "> - H: guide (https://example.com/a_long_path)");
+    }
+
+    #[test]
+    fn responsive_markdown_respects_tiny_padding_without_rewrapping_prepared_rows() {
+        let source = NormalisedBlock::Reasoning {
+            markdown: "| H |\n| --- |\n| one two six ten |".into(),
+        };
+        let mut highlighter = PythonHighlighter::new();
+        for width in 0..=12 {
+            let block = super::build_render_block(
+                &DARK,
+                &source,
+                true,
+                true,
+                width,
+                &mut highlighter,
+                None,
+            );
+            let super::RenderBlock::Card(card) = &block else {
+                panic!("expected card")
+            };
+            let (left, right) = super::effective_padding(width, 2);
+            assert_eq!((card.left_padding, card.right_padding), (left, right));
+            let area = Rect::new(0, 0, width, u16::try_from(block.height()).unwrap());
+            let mut buffer = Buffer::empty(area);
+            block.render(area, 0, 0, &mut buffer);
+            if width > 0 {
+                assert!(card.rows.is_some());
+                for (index, kind) in card.rows.as_ref().unwrap().breaks.iter().enumerate() {
+                    if *kind != super::markdown::LineBreak::Original {
+                        assert_eq!(
+                            card.line_paragraph(index)
+                                .line_count(super::effective_content_width(width, 2)),
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_record_copy_never_loses_an_overwide_protected_url_unit() {
+        for (value, expected) in [
+            (
+                "[guide](https://example.com/a)",
+                "- H: guide (https://example.com/a)",
+            ),
+            (
+                "[guide](https://%65xample.com/a)",
+                "- H: guide (https://%65xample.com/a)",
+            ),
+            ("%2F0123456789abcdef", "- H: \"%2F0123456789abcdef\""),
+            (
+                r"C:\some_long_folder\foo a: b",
+                r#"- H: "C:\\some_long_folder\\foo a: b""#,
+            ),
+        ] {
+            for width in [1, 2, 3, 8, 9, 10, 16] {
+                let mut transcript = Transcript::default();
+                transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                    markdown: format!("| H |\n| --- |\n| {value} |"),
+                    accounting: None,
+                }]);
+                let layout = transcript.layout(&DARK, width);
+                let copied = layout.extract_selection(Selection::new(
+                    DocumentPosition::new(0, 0),
+                    DocumentPosition::new(layout.total_height(), 0),
+                ));
+                assert_eq!(copied, expected, "{value} at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_markdown_leaves_literal_user_skill_and_fenced_tables_literal() {
+        let table = "| H |\n| --- |\n| value |";
+        let blocks = [
+            NormalisedBlock::User {
+                request: table.into(),
+            },
+            NormalisedBlock::SkillActivation(super::SkillActivationCard {
+                heading: "skill".into(),
+                source_text: table.into(),
+            }),
+        ];
+        let mut highlighter = PythonHighlighter::new();
+        for source in blocks {
+            let block =
+                super::build_render_block(&DARK, &source, true, true, 10, &mut highlighter, None);
+            let super::RenderBlock::Card(card) = block else {
+                panic!("expected card")
+            };
+            assert!(card.rows.is_none());
+            assert!(card.text.to_string().contains("| H |"));
+        }
+        let source = NormalisedBlock::Assistant {
+            markdown: format!("```text\n{table}\n```"),
+            accounting: None,
+        };
+        let block =
+            super::build_render_block(&DARK, &source, true, true, 10, &mut highlighter, None);
+        let super::RenderBlock::Card(card) = block else {
+            panic!("expected card")
+        };
+        assert!(card.text.to_string().contains("| H |"));
+        assert!(
+            card.rows
+                .unwrap()
+                .breaks
+                .iter()
+                .all(|kind| *kind == super::markdown::LineBreak::Original)
+        );
+    }
+
+    #[test]
     fn markdown_compatibility() {
         let heading = markdown("# Heading", &DARK, None);
         assert_eq!(heading.to_string(), "# Heading");
@@ -7139,7 +7487,9 @@ mod tests {
                 NormalisedBlock::Assistant {
                     markdown: source,
                     accounting,
-                } => assistant_text(&DARK, source, accounting.clone(), None).to_string(),
+                } => assistant_text(&DARK, source, accounting.clone(), u16::MAX, None)
+                    .text
+                    .to_string(),
                 block => block.plain_text(),
             })
             .collect::<Vec<_>>()
