@@ -1423,12 +1423,10 @@ impl App {
     }
 
     fn title(&self) -> String {
+        let folder = self.cwd_basename().unwrap_or_else(|| "kiki".to_owned());
         match &self.session_name {
-            Some(name) => format!("✷ - {name}"),
-            None => format!(
-                "✷ - {}",
-                self.cwd_basename().unwrap_or_else(|| "kiki".to_owned())
-            ),
+            Some(name) => format!("✷ {name} - {folder}"),
+            None => format!("✷ {folder}"),
         }
     }
 
@@ -4691,7 +4689,7 @@ mod tests {
         )
         .expect("loop");
 
-        assert_eq!(titles.titles, ["✷ - kiki", "✷ - Refactor auth"]);
+        assert_eq!(titles.titles, ["✷ kiki", "✷ Refactor auth - kiki"]);
     }
 
     #[test]
@@ -4734,7 +4732,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(restored.get());
-        assert_eq!(titles.titles, ["✷ - kiki"]);
+        assert_eq!(titles.titles, ["✷ kiki"]);
     }
 
     #[test]
@@ -4746,7 +4744,7 @@ mod tests {
             &workspace,
         ));
 
-        assert_eq!(app.title(), "✷ - kiki");
+        assert_eq!(app.title(), "✷ kiki");
 
         assert!(app.handle_paste("/name  Refactor\t auth").visible_changed);
         let update = app.handle_key_at(key(KeyCode::Enter), Instant::now());
@@ -4756,12 +4754,12 @@ mod tests {
         };
         assert_eq!(name, "Refactor auth");
         assert!(app.prompt.is_empty());
-        assert_eq!(app.title(), "✷ - kiki");
+        assert_eq!(app.title(), "✷ kiki");
         assert!(app.handle_event(RuntimeEvent::NameAccepted {
             revision: *revision,
             name: name.clone(),
         }));
-        assert_eq!(app.title(), "✷ - Refactor auth");
+        assert_eq!(app.title(), "✷ Refactor auth - kiki");
         assert!(rendered(&mut app, 80, 4).contains("~/…/kiki (Refactor auth)"));
     }
 
@@ -4778,18 +4776,18 @@ mod tests {
             panic!("expected name command");
         };
         assert_eq!(name, "Refactor auth");
-        assert_eq!(app.title(), "✷ - kiki");
+        assert_eq!(app.title(), "✷ kiki");
         assert!(app.handle_event(RuntimeEvent::NameAccepted {
             revision: *revision,
             name: name.clone(),
         }));
-        assert_eq!(app.title(), "✷ - Refactor auth");
+        assert_eq!(app.title(), "✷ Refactor auth - kiki");
 
         let mut titles = RecordingTitles::failing();
         assert!(super::publish_title(&mut app, &mut titles));
-        assert_eq!(app.title(), "✷ - Refactor auth");
+        assert_eq!(app.title(), "✷ Refactor auth - kiki");
         assert_eq!(app.notice(), Some("Could not change terminal title."));
-        assert_eq!(titles.titles, ["✷ - Refactor auth"]);
+        assert_eq!(titles.titles, ["✷ Refactor auth - kiki"]);
         assert!(rendered(&mut app, 80, 4).contains("~/kiki (Refactor auth)"));
 
         assert!(app.transcript.begin_submission());
@@ -4803,7 +4801,7 @@ mod tests {
             revision: *revision,
             name: name.clone(),
         }));
-        assert_eq!(app.title(), "✷ - Active name");
+        assert_eq!(app.title(), "✷ Active name - kiki");
     }
 
     #[test]
@@ -4834,12 +4832,12 @@ mod tests {
             revision: *first_revision,
             name: first_name.clone(),
         }));
-        assert_eq!(app.title(), "✷ - kiki");
+        assert_eq!(app.title(), "✷ kiki");
         assert!(app.handle_event(RuntimeEvent::NameAccepted {
             revision: *second_revision,
             name: second_name.clone(),
         }));
-        assert_eq!(app.title(), "✷ - Second");
+        assert_eq!(app.title(), "✷ Second - kiki");
     }
 
     #[test]
@@ -4881,7 +4879,13 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(initial.metadata.as_ref(), Some(&metadata));
-        assert_eq!(app.title(), "✷ - Saved name");
+        assert_eq!(
+            app.title(),
+            format!(
+                "✷ Saved name - {}",
+                workspace.path().file_name().unwrap().to_string_lossy()
+            )
+        );
         assert_eq!(&app.session_thinking, preferences.thinking());
         let (terra, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
         assert_eq!(terra.thinking(), "high");
@@ -4926,15 +4930,15 @@ mod tests {
         let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
             panic!("expected name command");
         };
-        assert_eq!(app.title(), "✷ - kiki");
+        assert_eq!(app.title(), "✷ kiki");
         assert!(app.handle_event(RuntimeEvent::NameAccepted {
             revision: *revision,
             name: name.clone(),
         }));
-        assert_eq!(app.title(), format!("✷ - {accepted}"));
+        assert_eq!(app.title(), format!("✷ {accepted} - kiki"));
         let rejected = "b".repeat(81);
         assert!(app.name_session(&rejected).visible_changed);
-        assert_eq!(app.title(), format!("✷ - {accepted}"));
+        assert_eq!(app.title(), format!("✷ {accepted} - kiki"));
         assert_eq!(
             app.notice(),
             Some("Session name must be at most 80 display cells.")
@@ -4949,26 +4953,35 @@ mod tests {
             revision: *revision,
             name: name.clone(),
         }));
-        assert_eq!(app.title(), format!("✷ - {wide}"));
+        assert_eq!(app.title(), format!("✷ {wide} - kiki"));
         assert!(app.name_session(&"界".repeat(41)).visible_changed);
-        assert_eq!(app.title(), format!("✷ - {wide}"));
+        assert_eq!(app.title(), format!("✷ {wide} - kiki"));
     }
 
     #[test]
     fn titles_sanitise_cwd_and_fall_back_when_unavailable() {
         let home = tempdir().expect("home");
         let workspace = home.path().join("kiki\nsettings");
-        let app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
             Some(home.path()),
             &workspace,
         ));
-        assert_eq!(app.title(), "✷ - kiki settings");
-        assert_eq!(App::default().title(), "✷ - kiki");
+        assert_eq!(app.title(), "✷ kiki settings");
+        let update = app.name_session("Refactor auth");
+        let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
+        app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *revision,
+            name: name.clone(),
+        });
+        assert_eq!(app.title(), "✷ Refactor auth - kiki settings");
+        assert_eq!(App::default().title(), "✷ kiki");
         let configured = App::configuration(crate::config::ready_snapshot_with_settings_for_test(
             Some(home.path()),
             &workspace,
         ));
-        assert_eq!(configured.title(), "✷ - kiki settings");
+        assert_eq!(configured.title(), "✷ kiki settings");
     }
 
     #[test]
