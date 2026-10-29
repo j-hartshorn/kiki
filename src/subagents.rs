@@ -32,6 +32,7 @@ use crate::session::{
     SessionError, SessionWriter, TaskAdmission, TaskSnapshot, TaskStepCommit, TaskTerminal,
 };
 use crate::telemetry::{ChildStopCause, CoordinatorOperation, Settlement, Trace, TraceEvent};
+use crate::todos::TodoPolicy;
 use crate::tools::{ToolError, ToolValue};
 
 const FAILURE_MESSAGE_LIMIT: usize = 4 * 1024;
@@ -197,6 +198,7 @@ pub(crate) struct ChildParameters {
     prompt: String,
     selection: ModelSelection,
     read_only: bool,
+    todo_policy: TodoPolicy,
 }
 
 impl ChildParameters {
@@ -205,6 +207,7 @@ impl ChildParameters {
             prompt,
             selection,
             read_only,
+            todo_policy: TodoPolicy::default(),
         }
     }
 
@@ -220,8 +223,22 @@ impl ChildParameters {
         self.read_only
     }
 
-    pub(crate) fn into_parts(self) -> (String, ModelSelection, bool) {
-        (self.prompt, self.selection, self.read_only)
+    pub(crate) fn todo_policy(&self) -> TodoPolicy {
+        self.todo_policy
+    }
+
+    pub(crate) fn with_todo_policy(mut self, policy: TodoPolicy) -> Self {
+        self.todo_policy = policy;
+        self
+    }
+
+    pub(crate) fn into_parts(self) -> (String, ModelSelection, bool, TodoPolicy) {
+        (
+            self.prompt,
+            self.selection,
+            self.read_only,
+            self.todo_policy,
+        )
     }
 }
 
@@ -1336,11 +1353,13 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
         let trace = child.trace();
         let (id, caller, _parent, depth, parameters, payload, reporter, coordinator) =
             child.into_parts();
-        let (request, selection, read_only) = parameters.into_parts();
+        let (request, selection, read_only, todo_policy) = parameters.into_parts();
         let accepted_thinking = payload.accepted_thinking.clone();
-        let tool_reference = payload
-            .source
-            .prompt_reference(read_only, coordinator.admits_children_of(depth));
+        let tool_reference = payload.source.prompt_reference(
+            read_only,
+            coordinator.admits_children_of(depth),
+            todo_policy,
+        );
         let child_prompt =
             child_prompt(&prompt_base, payload.source.skill_catalog(), tool_reference);
         let model = models.create(child_prompt);
@@ -1363,7 +1382,12 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                             "subagent {id} was cancelled before arena construction"
                         )));
                     }
-                    result = payload.source.child(&payload.checkpoint, read_only, &mut construction_progress) => result,
+                    result = async {
+                        let mut arena = payload.source.child(&payload.checkpoint, read_only, &mut construction_progress).await?;
+                        arena.reset_todos().await?;
+                        arena.apply_todo_policy(todo_policy).await?;
+                        Ok::<_, crate::arena::ArenaError>(arena)
+                    } => result,
                 }
             };
             let arena = match arena_result {
@@ -2228,6 +2252,7 @@ impl Drop for CoordinatorLockGuard<'_> {
 
 struct Inner {
     session: u64,
+    todos_enabled: bool,
     next_origin: u64,
     next_task: Option<u64>,
     next_sibling: BTreeMap<Option<TaskId>, Option<u64>>,
@@ -2474,6 +2499,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 session: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+                todos_enabled: true,
                 next_origin: 1,
                 next_task: Some(0),
                 next_sibling: BTreeMap::new(),
@@ -2798,6 +2824,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .as_ref()
                 .and_then(SessionWriter::active_execution_step);
             parameters.read_only |= inherited_read_only;
+            parameters.todo_policy = TodoPolicy::capture(inner.todos_enabled);
             let cancellation = self.storage_failure.child_token();
             let metrics = Arc::new(TaskMetrics::new(
                 id.clone(),
@@ -3099,6 +3126,16 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         }
         inner.active_slots = 0;
         inner.notify();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn set_todos_enabled(&self, enabled: bool) {
+        self.inner.lock().await.todos_enabled = enabled;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn todos_enabled(&self) -> bool {
+        self.inner.lock().await.todos_enabled
     }
 
     pub(crate) async fn subscribe(&self) -> watch::Receiver<u64> {
@@ -6707,7 +6744,7 @@ mod tests {
             assert_eq!(id.as_str(), "0");
             assert_eq!(parent, None);
             assert_eq!(depth, 1);
-            let (prompt, selection, read_only) = parameters.into_parts();
+            let (prompt, selection, read_only, _) = parameters.into_parts();
             assert_eq!(prompt, "inspect the lifecycle");
             assert_eq!(
                 selection,
@@ -8026,6 +8063,321 @@ mod tests {
         assert!(!prompt.contains("PRIVATE_SKILL_BODY"));
         for signature in ["async def write(", "async def edit(", "async def run("] {
             assert!(!prompt.contains(signature));
+        }
+    }
+
+    #[tokio::test]
+    async fn child_todos_are_fresh_for_siblings_and_nested_children() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let setup = parent.execute_model_code(
+            "todos.add('parent')\nother = 41\nretained_add = todos.add\ndef inherited(value: int) -> int:\n    return value + other",
+            &CancellationToken::new(), &mut |_| {}, None, &[],
+        ).await.unwrap();
+        assert!(matches!(setup.0.outcome, ExecutionOutcome::Complete { .. }));
+        let checkpoint = parent.checkpoint();
+        let nested = "assert todos.snapshot() == []\nassert retained_add('nested') == 1\nassert inherited(1) == 42";
+        let first = format!(
+            "assert todos.snapshot() == []\nassert retained_add('child') == 1\nassert inherited(1) == 42\nchild = await start_subagent({nested:?})\nresult = await child.wait()"
+        );
+        let script = |source: String| {
+            vec![
+                ScriptedAction::Code { source },
+                ScriptedAction::Message {
+                    text: "done".to_owned(),
+                },
+            ]
+        };
+        let factory = ScriptedChildFactory::new([
+            script(first), script(nested.to_owned()),
+            script("assert todos.snapshot() == []\nassert retained_add('sibling') == 1\nassert inherited(1) == 42".to_owned()),
+        ]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new("base".to_owned(), factory)),
+        );
+        let caller = coordinator.root_caller().await;
+        for _ in 0..2 {
+            let admitted = coordinator
+                .start(
+                    &caller,
+                    parameters(),
+                    super::ChildPayload::new(parent.child_source(), checkpoint.clone())
+                        .with_accepted_thinking(super::AcceptedThinking::new(
+                            parameters().selection(),
+                            crate::config::ready_snapshot_for_test().settings().clone(),
+                            None,
+                        )),
+                )
+                .await
+                .unwrap();
+            coordinator.wait(&caller, admitted.id()).await.unwrap();
+        }
+        let records = coordinator.records().await;
+        for record in &records {
+            assert_eq!(record.executions().len(), 1);
+            let execution = record.executions()[0].execution();
+            assert!(
+                matches!(execution.outcome, ExecutionOutcome::Complete { .. }),
+                "{:?}",
+                execution.outcome
+            );
+            let todos = execution.todos.as_ref().unwrap();
+            assert_eq!(todos.len(), 1);
+            assert_eq!(todos[0].id, 1);
+            assert_ne!(todos[0].text, "parent");
+        }
+        assert_eq!(records.len(), 3);
+        assert_eq!(parent.todos()[0].text, "parent");
+        let unchanged = parent
+            .execute_model_code(
+                "assert retained_add('parent second') == 2\nassert inherited(1) == 42",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            unchanged.0.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_todos_default_policy_does_not_inherit_disabled_parent_guidance() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        parent
+            .apply_todo_policy(crate::todos::TodoPolicy::capture(false))
+            .await
+            .unwrap();
+        let factory = ScriptedChildFactory::new([vec![
+            ScriptedAction::Code {
+                source: "assert todos.add('enabled child') == 1".to_owned(),
+            },
+            ScriptedAction::Message {
+                text: "done".to_owned(),
+            },
+        ]]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "base".to_owned(),
+                factory.clone(),
+            )),
+        );
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .unwrap();
+        coordinator.wait(&caller, child.id()).await.unwrap();
+        assert!(factory.prompts.lock().unwrap()[0].contains("## TODO list"));
+        let record = coordinator.record(child.id()).await.unwrap();
+        assert!(matches!(
+            record.executions()[0].execution().outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_todos_policy_is_captured_at_admission_before_construction() {
+        let workspace = tempfile::tempdir().unwrap();
+        let gate = ChildConstructionTestGate::new();
+        let mut parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap()
+        .with_child_construction_test_gate(gate.clone());
+        parent
+            .execute_model_code(
+                "retained_add = todos.add",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        let enabled = "assert todos.snapshot() == []\nassert retained_add('local') == 1\ntry:\n    await write('denied', 'no')\nexcept PermissionError:\n    denied = True\nelse:\n    denied = False\nassert denied";
+        let disabled = "try:\n    retained_add('denied')\nexcept RuntimeError:\n    disabled = True\nelse:\n    disabled = False\nassert disabled";
+        let factory = ScriptedChildFactory::new([enabled, disabled].map(|source| {
+            vec![
+                ScriptedAction::Code {
+                    source: source.to_owned(),
+                },
+                ScriptedAction::Message {
+                    text: "done".to_owned(),
+                },
+            ]
+        }));
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "base".to_owned(),
+                factory.clone(),
+            )),
+        );
+        assert!(coordinator.todos_enabled().await);
+        let caller = coordinator.root_caller().await;
+        for captured in [true, false] {
+            assert_eq!(coordinator.todos_enabled().await, captured);
+            let child = coordinator
+                .start(
+                    &caller,
+                    ChildParameters::new("check".to_owned(), parameters().selection(), true),
+                    super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+                )
+                .await
+                .unwrap();
+            gate.wait_until_construction_started().await;
+            coordinator.set_todos_enabled(!captured).await;
+            gate.resume_construction();
+            coordinator.wait(&caller, child.id()).await.unwrap();
+            let record = coordinator.record(child.id()).await.unwrap();
+            assert_eq!(record.parameters().todo_policy().enabled(), captured);
+            let execution = record.executions()[0].execution();
+            assert!(
+                matches!(execution.outcome, ExecutionOutcome::Complete { .. }),
+                "{:?}",
+                execution.outcome
+            );
+            assert_eq!(
+                execution.todos.as_ref().unwrap().len(),
+                usize::from(captured)
+            );
+            assert_eq!(
+                factory
+                    .prompts
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .contains("## TODO list"),
+                captured
+            );
+        }
+        assert!(!workspace.path().join("denied").exists());
+        assert!(parent.todos().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_todos_changed_and_terminal_records_retain_only_committed_state() {
+        for cancel in [true, false] {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("gate"), "ok").unwrap();
+            let gate = ReadTestGate::new();
+            let parent = Arena::new(
+                worker_path(),
+                ToolHost::new(workspace.path())
+                    .await
+                    .unwrap()
+                    .with_test_gate(gate.clone()),
+            )
+            .await
+            .unwrap();
+            let second = if cancel {
+                "todos.add('uncommitted')\ncontents = await read('gate')"
+            } else {
+                "todos.add('uncommitted')\nx = 'failure' * (1 << 60)"
+            };
+            let factory = ScriptedChildFactory::new([vec![
+                ScriptedAction::Code {
+                    source: "todos.add('committed')\nraise ValueError('ordinary committed error')"
+                        .to_owned(),
+                },
+                ScriptedAction::Code {
+                    source: second.to_owned(),
+                },
+            ]]);
+            let coordinator = SubagentCoordinator::new(
+                policy(),
+                Arc::new(super::CompleteChildRunner::new("base".to_owned(), factory)),
+            );
+            let mut events = coordinator.take_event_receiver().unwrap();
+            let caller = coordinator.root_caller().await;
+            let child = coordinator
+                .start(
+                    &caller,
+                    parameters(),
+                    super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+                )
+                .await
+                .unwrap();
+            let live = timeout(Duration::from_secs(15), async {
+                loop {
+                    if let CoordinatorEvent::Changed { id, revision } = events.recv().await.unwrap()
+                        && id == *child.id()
+                    {
+                        let record = coordinator.record(&id).await.unwrap();
+                        if !record.executions().is_empty() {
+                            assert!(record.revision() >= revision);
+                            break record;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                live.executions()[0].execution().todos.as_ref().unwrap()[0].text,
+                "committed"
+            );
+            if cancel {
+                gate.wait_until_read_started().await;
+                assert_eq!(
+                    coordinator
+                        .cancel(&caller, child.id())
+                        .await
+                        .unwrap()
+                        .state(),
+                    TaskState::Cancelled
+                );
+            } else {
+                assert!(coordinator.wait(&caller, child.id()).await.is_err());
+            }
+            let terminal = coordinator.record(child.id()).await.unwrap();
+            assert_eq!(
+                terminal.observation().state(),
+                if cancel {
+                    TaskState::Cancelled
+                } else {
+                    TaskState::Failed
+                }
+            );
+            assert_eq!(terminal.executions().len(), 1);
+            assert_eq!(
+                terminal.executions()[0].execution().todos,
+                live.executions()[0].execution().todos
+            );
+            assert_eq!(
+                terminal.executions()[0]
+                    .execution()
+                    .todos
+                    .as_ref()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(parent.todos().is_empty());
         }
     }
 

@@ -457,7 +457,7 @@ async fn todo_production_v3_and_foreign_checkpoints_rejected_even_disabled() {
     assert!(
         !arena
             .child_source()
-            .prompt_reference(false, true)
+            .prompt_reference(false, true, crate::todos::TodoPolicy::capture(false))
             .contains("todos.add")
     );
     apply_run_policy(&mut arena, true).await;
@@ -465,7 +465,7 @@ async fn todo_production_v3_and_foreign_checkpoints_rejected_even_disabled() {
     assert!(
         arena
             .child_source()
-            .prompt_reference(false, true)
+            .prompt_reference(false, true, crate::todos::TodoPolicy::capture(true))
             .contains("todos.add")
     );
     checked(

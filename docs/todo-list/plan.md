@@ -259,3 +259,18 @@ that cannot honor the agreed source contract.
   execution avoids independently observed pre-body worker-startup deadline flakes;
   no worker timing behavior changed. Root guidance/policy lifecycle remains an
   explicit task5/6 integration requirement, not a completed capability toggle.
+
+- Task 4: admission mutex captures latest preference into immutable ChildParameters
+  TodoPolicy, including new children of older-policy parents. Actual runner resets
+  inherited object in place and applies captured policy before first model use;
+  explicit child guidance policy matches it. Added durable policy/defaults and
+  reused committed Execution snapshots through existing revision/event/history paths.
+  Host hooks: coordinator.set_todos_enabled/todos_enabled (async), to be wired in6.
+- Task 4 verification: authoritative child red showed parent-list inheritance and
+  wrong guidance, then focused5green. Orchestrator reran5childTODO,30admission,
+  25codec tests, lint/fmt/diffcheck, all passed. Related branch1/read-only16/object6
+  regressions passed in implementer evidence. Independent task review CLEAN.
+- Task 5 execution decomposition: one task/commit remains. A bounded implementer
+  prepares typed generated-context transport and provider serialization tests;
+  orchestrator then owns run/compaction capture and budget/cache integration.
+  This avoids another oversized delegation and does not change source behavior.

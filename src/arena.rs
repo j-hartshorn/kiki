@@ -851,10 +851,15 @@ impl ArenaChildSource {
         })
     }
 
-    pub(crate) fn prompt_reference(&self, read_only: bool, can_delegate: bool) -> String {
+    pub(crate) fn prompt_reference(
+        &self,
+        read_only: bool,
+        can_delegate: bool,
+        todo_policy: TodoPolicy,
+    ) -> String {
         self.tool_host
             .for_child(read_only)
-            .prompt_reference_with_todo_policy(can_delegate, self.todo_policy)
+            .prompt_reference_with_todo_policy(can_delegate, todo_policy)
     }
 
     pub(crate) fn skill_catalog(&self) -> &SkillCatalog {

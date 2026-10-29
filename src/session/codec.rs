@@ -427,6 +427,8 @@ struct StoredTaskDetails {
     prompt: String,
     selection: StoredSelection,
     read_only: bool,
+    #[serde(default)]
+    todo_policy: crate::todos::TodoPolicy,
     depth: usize,
     admitted_at_ms: i64,
     terminal_at_ms: Option<i64>,
@@ -913,6 +915,7 @@ pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecEr
         prompt: parameters.prompt().to_owned(),
         selection: encode_selection(parameters.selection()),
         read_only: parameters.read_only(),
+        todo_policy: parameters.todo_policy(),
         depth: record.depth(),
         admitted_at_ms: record.admitted_at_ms(),
         terminal_at_ms: record.terminal_at_ms(),
@@ -985,7 +988,8 @@ pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetai
         details.prompt,
         decode_selection(&details.selection)?,
         details.read_only,
-    );
+    )
+    .with_todo_policy(details.todo_policy);
     let outcome = details.outcome.map(decode_task_outcome);
     Ok(DecodedTaskDetails {
         id: details.id,
@@ -3107,6 +3111,60 @@ mod tests {
 
         assert_eq!(decoded_request_selection(&decoded), Some(selection));
         assert_eq!(decode_request(&payload).expect("decode request text"), "hi");
+    }
+
+    #[test]
+    fn child_todos_codec_retains_snapshot_policy_and_backward_defaults() {
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let mut execution = task_execution();
+        execution.todos = Some(vec![crate::todos::TodoItem {
+            id: 1,
+            text: "retained".to_owned(),
+            status: crate::todos::TodoStatus::InProgress,
+        }]);
+        let record = crate::subagents::TaskRecord::for_test("0", 3, selection, None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 100,
+                terminal_at_ms: Some(200),
+                state: crate::subagents::TaskState::Failed,
+                step_count: 1,
+                elapsed: std::time::Duration::from_secs(1),
+                observed_at_ms: 200,
+                attempt_evidence: Vec::new(),
+                executions: vec![crate::subagents::TaskExecution::for_test(
+                    1,
+                    "todos.add('retained')".to_owned(),
+                    String::new(),
+                    execution.clone(),
+                    Vec::new(),
+                )],
+                outcome: Some(crate::subagents::TaskOutcome::Failed(
+                    crate::subagents::ChildFailure::new("failed"),
+                )),
+            });
+        let encoded = encode_task_details(&record).unwrap();
+        let restored = decode_task_record_details(&encoded).unwrap();
+        assert!(restored.parameters.todo_policy().enabled());
+        assert_eq!(
+            restored.details.executions[0].execution().todos,
+            execution.todos
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        value["todo_policy"]["enabled"] = serde_json::json!(false);
+        let disabled = decode_task_record_details(&value.to_string()).unwrap();
+        assert!(!disabled.parameters.todo_policy().enabled());
+        value.as_object_mut().unwrap().remove("todo_policy");
+        value["executions"][0]["execution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("todos");
+        let legacy = decode_task_record_details(&value.to_string()).unwrap();
+        assert!(legacy.parameters.todo_policy().enabled());
+        assert_eq!(legacy.details.executions[0].execution().todos, None);
     }
 
     #[test]

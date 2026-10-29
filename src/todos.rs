@@ -14,7 +14,7 @@ todos: TodoList
 "#;
 const GUIDANCE: &str = "## TODO list\n\nFor substantial multi-step work, track your own ordered list with synchronous `todos` methods (no await). Use `todos.add(text, status=\"pending\")` to get an integer ID; `todos.update(item_id, text=..., status=...)` preserves ID/order; `todos.remove(item_id)` removes it. `todos.replace(items)` starts a revised list with fresh IDs (snapshot IDs are ignored); `[]` clears without resetting IDs. `todos.snapshot()` returns independent dictionaries with id/text/status. Status is pending, in_progress, or completed; maximum 64 items and 512 Unicode code points of nonblank text per item. Invalid input raises ValueError; unknown IDs raise KeyError. Prefer methods over private-field mutation.\n";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoPolicy {
     enabled: bool,
 }
