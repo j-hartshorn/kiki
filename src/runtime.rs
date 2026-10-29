@@ -8362,6 +8362,7 @@ mod tests {
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent(_),
+                    ..
                 }
             )
         }));
@@ -9073,6 +9074,8 @@ mod tests {
             tool_call_label(ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Created,
+                subject: None,
+                duration: None,
             }),
             "write:created"
         );
@@ -9080,6 +9083,8 @@ mod tests {
             tool_call_label(ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Replaced,
+                subject: None,
+                duration: None,
             }),
             "write:replaced"
         );
@@ -9087,6 +9092,8 @@ mod tests {
             tool_call_label(ToolCall {
                 tool: ToolName::Edit,
                 summary: ToolCallSummary::Applied,
+                subject: None,
+                duration: None,
             }),
             "edit:applied"
         );
@@ -9102,6 +9109,8 @@ mod tests {
         ] {
             assert_eq!(
                 tool_call_label(ToolCall {
+                    subject: None,
+                    duration: None,
                     tool: ToolName::Run,
                     summary,
                 }),
@@ -9162,6 +9171,23 @@ mod tests {
                 _ => None,
             })
             .expect("completed execution record")
+    }
+
+    fn without_durations(calls: &[ToolCall]) -> Vec<ToolCall> {
+        calls
+            .iter()
+            .map(|call| {
+                assert_eq!(
+                    call.duration.is_some(),
+                    call.summary != ToolCallSummary::Pending,
+                    "{call:?}"
+                );
+                ToolCall {
+                    duration: None,
+                    ..call.clone()
+                }
+            })
+            .collect()
     }
 
     fn result_head(execution: &Execution) -> &str {
@@ -11615,6 +11641,7 @@ mod tests {
                         call: ToolCall {
                             tool: ToolName::Run,
                             summary: ToolCallSummary::Exit(0),
+                            ..
                         },
                         ..
                     }
@@ -11825,15 +11852,19 @@ mod tests {
 
         let execution = completed_execution(&records, RunId(1), ModelStepId(1));
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(8),
+                    subject: Some("input".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("missing".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -11845,14 +11876,18 @@ mod tests {
                     ..
                 },
                 ..
-            } if execution.tool_calls == [
+            } if without_durations(&execution.tool_calls) == [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(8),
+                    subject: Some("input".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("missing".to_owned()),
+                    duration: None,
                 },
             ]
         )));
@@ -13946,6 +13981,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: Some("Cargo.toml".to_owned()),
+                duration: None,
             }]
         );
         assert!(evidence.cancellation_warning.is_some());
@@ -14409,6 +14446,8 @@ mod tests {
                         && evidence.tool_calls == [ToolCall {
                             tool: ToolName::Read,
                             summary: ToolCallSummary::Pending,
+                            subject: Some("blocked".to_owned()),
+                            duration: None,
                         }]
                         && evidence.cancellation_warning.is_some()
                         && matches!(
@@ -16964,70 +17003,98 @@ mod tests {
 
         let first_execution = completed_execution(&records, RunId(1), ModelStepId(2));
         assert_eq!(
-            first_execution.tool_calls,
+            without_durations(&first_execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent("1".to_owned()),
+                    subject: Some("subagent:1".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
             ]
         );
         let clarification = completed_execution(&records, RunId(2), ModelStepId(4));
         assert_eq!(result_head(clarification), "'missing'");
         assert_eq!(
-            clarification.tool_calls,
+            without_durations(&clarification.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("1".to_owned()),
+                    subject: Some("subagent:1".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
                     summary: ToolCallSummary::Subagent("1".to_owned()),
+                    subject: Some("subagent:1".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
                     summary: ToolCallSummary::Subagent("2.0".to_owned()),
+                    subject: Some("subagent:2.0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
                     summary: ToolCallSummary::Subagent("2.0".to_owned()),
+                    subject: Some("subagent:2.0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::CancelSubagent,
                     summary: ToolCallSummary::Subagent("2".to_owned()),
+                    subject: Some("subagent:2".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
                     summary: ToolCallSummary::Subagent("2.0".to_owned()),
+                    subject: Some("subagent:2.0".to_owned()),
+                    duration: None,
                 },
             ]
         );

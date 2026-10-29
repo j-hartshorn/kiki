@@ -6696,6 +6696,7 @@ pub(crate) mod tests {
                         crate::arena::ToolCall {
                             tool: crate::arena::ToolName::Read,
                             summary: crate::arena::ToolCallSummary::Count(_),
+                            ..
                         },
                     ..
                 } => {

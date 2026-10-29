@@ -69,6 +69,7 @@ const BINDING_INVENTORY: &str = "{name: [_kiki_type(value).__name__, f'{_kiki_id
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
+const CALL_SUBJECT_BYTES: usize = 1024;
 const RUN_STDOUT_PREVIEW_BYTES: usize = 3 * 1024;
 const RUN_STDOUT_PREVIEW_LINES: usize = 8;
 const RUN_OUTPUT_CHANNEL_CAPACITY: usize = 256;
@@ -293,6 +294,8 @@ pub(crate) enum ToolCallSummary {
 pub(crate) struct ToolCall {
     pub(crate) tool: ToolName,
     pub(crate) summary: ToolCallSummary,
+    pub(crate) subject: Option<String>,
+    pub(crate) duration: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -313,16 +316,23 @@ struct ToolTraceState {
 }
 
 impl ToolTraceState {
-    fn admit(&mut self, tool: ToolName) -> ToolCallToken {
+    fn admit(&mut self, tool: ToolName, subject: Option<String>) -> ToolCallToken {
         let token = ToolCallToken(self.calls.len());
         self.calls.push(ToolCall {
             tool,
             summary: ToolCallSummary::Pending,
+            subject,
+            duration: None,
         });
         token
     }
 
-    fn settle(&mut self, token: ToolCallToken, summary: ToolCallSummary) -> ToolCall {
+    fn settle(
+        &mut self,
+        token: ToolCallToken,
+        summary: ToolCallSummary,
+        duration: Duration,
+    ) -> ToolCall {
         assert!(
             !matches!(summary, ToolCallSummary::Pending),
             "a tool call must settle to a terminal summary"
@@ -335,7 +345,11 @@ impl ToolTraceState {
             matches!(call.summary, ToolCallSummary::Pending),
             "a tool call must settle once"
         );
+        if let ToolCallSummary::Subagent(id) = &summary {
+            call.subject.get_or_insert_with(|| format!("subagent:{id}"));
+        }
         call.summary = summary;
+        call.duration = Some(duration);
         call.clone()
     }
 
@@ -2022,7 +2036,7 @@ async fn drive(
                                 continue;
                             }
                         };
-                        let token = tools.admit(tool);
+                        let token = tools.admit(tool, call_subject(tool, &arguments));
                         progress(ArenaProgress::ToolUpdated {
                             token,
                             call: tools.call(token),
@@ -2181,6 +2195,7 @@ async fn drive(
                         skill_ledger.active(),
                     ));
                     let mut filesystem_complete = false;
+                    let dispatched_at = budget.clock.now();
                     while !tokens.is_empty() {
                         update_budget_pause(budget, &call_modes);
                         let clock = budget.clock.clone();
@@ -2283,7 +2298,8 @@ async fn drive(
                             .remove(&call_id)
                             .expect("a host result must retain an admitted call mode");
                         let summary = tool_summary(tool, &result);
-                        let call = tools.settle(token, summary);
+                        let duration = budget.clock.now().saturating_duration_since(dispatched_at);
+                        let call = tools.settle(token, summary, duration);
                         tools.record_observed_file_operation(&result);
                         assert!(
                             results.insert(call_id, result).is_none(),
@@ -2337,6 +2353,59 @@ async fn drive(
             };
         }
     }
+}
+
+fn call_subject(tool: ToolName, arguments: &ToolValue) -> Option<String> {
+    let ToolValue::List(arguments) = arguments else {
+        return None;
+    };
+    if let (ToolName::Read | ToolName::Write | ToolName::Edit, [ToolValue::String(path), ..]) =
+        (tool, arguments.as_slice())
+    {
+        return Some(bound_call_subject(path));
+    }
+    let mut strings = Vec::new();
+    for argument in arguments {
+        match argument {
+            ToolValue::String(text) => strings.push(text.as_str()),
+            ToolValue::None => {}
+            _ => return None,
+        }
+    }
+    let subject = match (tool, strings.as_slice()) {
+        (ToolName::ListDir, []) => ".".to_owned(),
+        (ToolName::ListDir | ToolName::LoadSkill, [text])
+        | (ToolName::Run, [text] | [text, "."]) => (*text).to_owned(),
+        (ToolName::Run, [command, cwd]) => format!("{command} (in {cwd})"),
+        (ToolName::Glob | ToolName::Grep, [pattern, rest @ ..]) => {
+            std::iter::once(format!("\"{pattern}\""))
+                .chain(
+                    rest.iter()
+                        .filter(|text| **text != ".")
+                        .map(|text| (*text).to_owned()),
+                )
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        (
+            ToolName::GetSubagent
+            | ToolName::RefreshSubagent
+            | ToolName::WaitSubagent
+            | ToolName::CancelSubagent,
+            [id],
+        ) => format!("subagent:{id}"),
+        _ => return None,
+    };
+    Some(bound_call_subject(&subject))
+}
+
+pub(crate) fn bound_call_subject(subject: &str) -> String {
+    let mut subject = subject.replace(['\r', '\n'], " ");
+    if subject.len() > CALL_SUBJECT_BYTES {
+        subject.truncate(utf8_prefix_len(&subject, CALL_SUBJECT_BYTES));
+        subject.push('\u{2026}');
+    }
+    subject
 }
 
 fn run_command_argument(tool: ToolName, arguments: &ToolValue) -> Option<&str> {
@@ -3548,6 +3617,23 @@ mod tests {
         result.as_ref()
     }
 
+    fn without_durations(calls: &[ToolCall]) -> Vec<ToolCall> {
+        calls
+            .iter()
+            .map(|call| {
+                assert_eq!(
+                    call.duration.is_some(),
+                    call.summary != ToolCallSummary::Pending,
+                    "{call:?}"
+                );
+                ToolCall {
+                    duration: None,
+                    ..call.clone()
+                }
+            })
+            .collect()
+    }
+
     fn python_error(execution: &Execution) -> &PythonError {
         let ExecutionOutcome::PythonError(error) = &execution.outcome else {
             panic!("expected Python error, got {:?}", execution.outcome);
@@ -4071,6 +4157,133 @@ mod tests {
     }
 
     #[test]
+    fn call_subjects_name_what_each_tool_acts_on() {
+        let strings = |values: &[&str]| {
+            ToolValue::List(
+                values
+                    .iter()
+                    .map(|value| ToolValue::String((*value).to_owned()))
+                    .collect(),
+            )
+        };
+        let cases = [
+            (
+                ToolName::Read,
+                strings(&["src/main.rs"]),
+                Some("src/main.rs"),
+            ),
+            (
+                ToolName::Write,
+                strings(&["notes.md", "secret body"]),
+                Some("notes.md"),
+            ),
+            (
+                ToolName::Edit,
+                strings(&["a.rs", "old", "new"]),
+                Some("a.rs"),
+            ),
+            (ToolName::ListDir, strings(&[]), Some(".")),
+            (ToolName::ListDir, strings(&["src"]), Some("src")),
+            (ToolName::Glob, strings(&["*.rs"]), Some("\"*.rs\"")),
+            (
+                ToolName::Glob,
+                strings(&["*.rs", "src"]),
+                Some("\"*.rs\" src"),
+            ),
+            (
+                ToolName::Grep,
+                strings(&["fn main", "src", "*.rs"]),
+                Some("\"fn main\" src *.rs"),
+            ),
+            (
+                ToolName::Grep,
+                ToolValue::List(vec![
+                    ToolValue::String("todo".to_owned()),
+                    ToolValue::String("src".to_owned()),
+                    ToolValue::None,
+                ]),
+                Some("\"todo\" src"),
+            ),
+            (
+                ToolName::Run,
+                strings(&["just test\ncargo fmt"]),
+                Some("just test cargo fmt"),
+            ),
+            (
+                ToolName::Run,
+                strings(&["ls", "docs"]),
+                Some("ls (in docs)"),
+            ),
+            (ToolName::Run, strings(&["ls", "."]), Some("ls")),
+            (
+                ToolName::Grep,
+                strings(&["todo", ".", "*.md"]),
+                Some("\"todo\" *.md"),
+            ),
+            (ToolName::LoadSkill, strings(&["explore"]), Some("explore")),
+            (
+                ToolName::WaitSubagent,
+                strings(&["c1"]),
+                Some("subagent:c1"),
+            ),
+            (ToolName::StartSubagent, strings(&["review"]), None),
+            (
+                ToolName::Read,
+                ToolValue::List(vec![ToolValue::Integer(1)]),
+                None,
+            ),
+            (ToolName::Run, ToolValue::String("ls".to_owned()), None),
+        ];
+
+        for (tool, arguments, expected) in cases {
+            assert_eq!(
+                super::call_subject(tool, &arguments).as_deref(),
+                expected,
+                "{tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_subjects_are_bounded_on_a_character_boundary() {
+        let subject = super::bound_call_subject(&"é".repeat(600));
+
+        assert_eq!(subject, format!("{}\u{2026}", "é".repeat(512)));
+    }
+
+    #[test]
+    fn settling_a_call_records_its_duration_and_spawned_subagent() {
+        let mut trace = ToolTraceState::default();
+        let read = trace.admit(ToolName::Read, Some("a.txt".to_owned()));
+        let start = trace.admit(ToolName::StartSubagent, None);
+
+        trace.settle(read, ToolCallSummary::Count(3), Duration::from_millis(4));
+        trace.settle(
+            start,
+            ToolCallSummary::Subagent("c1".to_owned()),
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            trace.calls(),
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(3),
+                    subject: Some("a.txt".to_owned()),
+                    duration: Some(Duration::from_millis(4)),
+                },
+                ToolCall {
+                    tool: ToolName::StartSubagent,
+                    summary: ToolCallSummary::Subagent("c1".to_owned()),
+                    subject: Some("subagent:c1".to_owned()),
+                    duration: Some(Duration::from_millis(1)),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn tool_summary_rejects_mutation_successes_without_statuses() {
         let result = ToolResult::without_effect(ToolValue::None);
 
@@ -4143,8 +4356,8 @@ mod tests {
         let fixture_path = "secrets/fixture-path";
         let fixture_error = "fixture error must not be retained";
         let mut trace = ToolTraceState::default();
-        let first = trace.admit(ToolName::Read);
-        let second = trace.admit(ToolName::Read);
+        let first = trace.admit(ToolName::Read, Some(fixture_path.to_owned()));
+        let second = trace.admit(ToolName::Read, None);
 
         assert_eq!(
             trace.calls(),
@@ -4152,16 +4365,20 @@ mod tests {
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: Some(fixture_path.to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             ]
         );
 
-        trace.settle(second, ToolCallSummary::Failed);
-        trace.settle(first, ToolCallSummary::Count(2));
+        trace.settle(second, ToolCallSummary::Failed, Duration::from_millis(2));
+        trace.settle(first, ToolCallSummary::Count(2), Duration::from_millis(3));
 
         assert_eq!(
             trace.calls(),
@@ -4169,16 +4386,18 @@ mod tests {
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(2),
+                    subject: Some(fixture_path.to_owned()),
+                    duration: Some(Duration::from_millis(3)),
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: None,
+                    duration: Some(Duration::from_millis(2)),
                 },
             ]
         );
-        let retained = format!("{trace:?}");
-        assert!(!retained.contains(fixture_path));
-        assert!(!retained.contains(fixture_error));
+        assert!(!format!("{trace:?}").contains(fixture_error));
     }
 
     #[tokio::test]
@@ -4195,11 +4414,47 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(7),
+                subject: Some("exit 7".to_owned()),
+                duration: None,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_records_call_subjects_and_durations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("docs")).unwrap();
+        fs::write(workspace.path().join("docs/a.txt"), "a\n").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "await read('docs/a.txt')\n(await run('cat a.txt', 'docs')).stdout == 'a\\n'",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert!(
+            execution
+                .tool_calls
+                .iter()
+                .all(|call| call.duration.is_some())
+        );
+        assert_eq!(
+            execution
+                .tool_calls
+                .iter()
+                .map(|call| (call.tool, call.subject.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (ToolName::Read, Some("docs/a.txt")),
+                (ToolName::Run, Some("cat a.txt (in docs)")),
+            ]
         );
     }
 
@@ -4217,23 +4472,31 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: Some("printf stdout; printf stderr >&2".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(9),
+                    subject: Some("printf nonzero; printf failure >&2; exit 9".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Signal,
+                    subject: Some("kill -9 $$".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: Some("cat".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -4289,10 +4552,15 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Failed,
+                subject: Some(
+                    "printf side-effect > effect; dd if=/dev/zero bs=8388609 count=1 2>/dev/null"
+                        .to_owned()
+                ),
+                duration: None,
             }]
         );
         assert_eq!(
@@ -4343,15 +4611,19 @@ mod tests {
         let execution = execution.await.unwrap();
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: Some("printf first".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: Some("printf second".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -4379,15 +4651,19 @@ mod tests {
         let execution = execution.await.unwrap();
         assert!(python_error(&execution).text.contains("FileNotFoundError"));
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("printf ignored (in missing)".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: Some("printf sibling > sibling".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -4399,7 +4675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_evidence_stays_ordered_path_free_and_updates_pending_rows_in_place() {
+    async fn run_evidence_stays_ordered_output_free_and_updates_pending_rows_in_place() {
         let workspace = tempfile::tempdir().unwrap();
         let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
         let cancellation = CancellationToken::new();
@@ -4407,7 +4683,7 @@ mod tests {
         let execution = {
             let mut capture = |event| progress.push(event);
             let mut execution = Box::pin(arena.execute_with_progress(
-                "import asyncio\nawait asyncio.gather(run(\"COMMAND_SENTINEL; printf OUTPUT_SENTINEL; printf ERROR_SENTINEL >&2\"), run('printf SECOND_OUTPUT_SENTINEL; kill -9 $$'), run('printf ignored', 'CWD_SENTINEL'))",
+                "import asyncio\nawait asyncio.gather(run(\"COMMAND_SENTINEL; printf OUTPUT_%s SENTINEL; printf ERROR_%s SENTINEL >&2\"), run('printf SECOND_OUTPUT_%s SENTINEL; kill -9 $$'), run('printf ignored', 'CWD_SENTINEL'))",
                 &cancellation,
                 &mut capture,
             ));
@@ -4424,19 +4700,28 @@ mod tests {
 
         assert!(python_error(&execution).text.contains("FileNotFoundError"));
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: Some(
+                        "COMMAND_SENTINEL; printf OUTPUT_%s SENTINEL; printf ERROR_%s SENTINEL >&2"
+                            .to_owned()
+                    ),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Signal,
+                    subject: Some("printf SECOND_OUTPUT_%s SENTINEL; kill -9 $$".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("printf ignored (in CWD_SENTINEL)".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -4495,13 +4780,11 @@ mod tests {
                 token,
                 preview: super::RunPreview { command, stdout },
             } if *token == signalled_token
-                && command.contains("SECOND_OUTPUT_SENTINEL")
+                && command.contains("SECOND_OUTPUT_%s")
                 && stdout.contains("SECOND_OUTPUT_SENTINEL")
         )));
         let retained = format!("{:?}{updates:?}", execution.tool_calls);
         for sentinel in [
-            "COMMAND_SENTINEL",
-            "CWD_SENTINEL",
             "OUTPUT_SENTINEL",
             "SECOND_OUTPUT_SENTINEL",
             "ERROR_SENTINEL",
@@ -4839,10 +5122,12 @@ mod tests {
         assert_eq!(complete(&execution).unwrap().head, "'starting'");
         assert_eq!(execution.stdout.total_bytes, 0);
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::StartSubagent,
                 summary: ToolCallSummary::Subagent("0".to_owned()),
+                subject: Some("subagent:0".to_owned()),
+                duration: None,
             }]
         );
         let finish = started.recv().await.expect("child starts");
@@ -4859,10 +5144,12 @@ mod tests {
         assert_eq!(complete(&execution).unwrap().head, "('yes', 'running')");
         assert_eq!(execution.stdout.total_bytes, 0);
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::RefreshSubagent,
                 summary: ToolCallSummary::Subagent("0".to_owned()),
+                subject: Some("subagent:0".to_owned()),
+                duration: None,
             }]
         );
 
@@ -4887,10 +5174,12 @@ mod tests {
         );
         assert_eq!(execution.stdout.total_bytes, 0);
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::WaitSubagent,
                 summary: ToolCallSummary::Subagent("0".to_owned()),
+                subject: Some("subagent:0".to_owned()),
+                duration: None,
             }]
         );
     }
@@ -5162,23 +5451,31 @@ mod tests {
             "before!"
         );
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(6),
+                    subject: Some("file".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Write,
                     summary: ToolCallSummary::Replaced,
+                    subject: Some("file".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::CancelSubagent,
                     summary: ToolCallSummary::Subagent("0".to_owned()),
+                    subject: Some("subagent:0".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -6646,10 +6943,12 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "2");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::ListDir,
                 summary: ToolCallSummary::Count(2),
+                subject: Some(".".to_owned()),
+                duration: None,
             }]
         );
     }
@@ -6740,8 +7039,10 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "2");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
+                subject: Some("\"*.rs\"".to_owned()),
+                duration: None,
                 tool: ToolName::from_private_name("_kiki_glob")
                     .expect("glob must be an active host tool"),
                 summary: ToolCallSummary::Count(2),
@@ -6850,8 +7151,10 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "3");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
+                subject: Some("\"match\"".to_owned()),
+                duration: None,
                 tool: ToolName::from_private_name("_kiki_grep")
                     .expect("grep must be an active host tool"),
                 summary: ToolCallSummary::Count(3),
@@ -6918,23 +7221,31 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(5),
+                    subject: Some("file".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Write,
                     summary: ToolCallSummary::Replaced,
+                    subject: Some("file".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Edit,
                     summary: ToolCallSummary::Applied,
+                    subject: Some("file".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(5),
+                    subject: Some("file".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -6955,19 +7266,25 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "'second'");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Write,
                     summary: ToolCallSummary::Created,
+                    subject: Some("new".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Write,
                     summary: ToolCallSummary::Replaced,
+                    subject: Some("./new".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(6),
+                    subject: Some("new".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -7962,8 +8279,10 @@ mod tests {
         let mut interruption = InterruptedExecutionState::new();
         interruption.began = true;
         interruption.streams.stdout.push("before\n");
-        let token = interruption.tools.admit(ToolName::Read);
-        interruption.tools.settle(token, ToolCallSummary::Failed);
+        let token = interruption.tools.admit(ToolName::Read, None);
+        interruption
+            .tools
+            .settle(token, ToolCallSummary::Failed, Duration::ZERO);
 
         let mut progress = |_| {};
         let error = ArenaError::unsupported_suspension(unbounded)
@@ -7985,6 +8304,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Failed,
+                subject: None,
+                duration: Some(Duration::ZERO),
             }]
         );
     }
@@ -8181,7 +8502,7 @@ mod tests {
             progress.as_slice(),
             [
                 super::ArenaProgress::StdoutDelta { text },
-                super::ArenaProgress::ToolUpdated { call: ToolCall { tool: ToolName::Read, summary: ToolCallSummary::Pending }, .. },
+                super::ArenaProgress::ToolUpdated { call: ToolCall { tool: ToolName::Read, summary: ToolCallSummary::Pending, .. }, .. },
             ] if text == "before\n"
         ));
         let ArenaError::Cancelled { execution } = error else {
@@ -8206,15 +8527,19 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(5),
+                    subject: Some("first".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(6),
+                    subject: Some("second".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -8243,23 +8568,31 @@ mod tests {
         let execution = execution.await.unwrap();
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(6),
+                    subject: Some("file".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::ListDir,
                     summary: ToolCallSummary::Count(1),
+                    subject: Some(".".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Glob,
                     summary: ToolCallSummary::Count(1),
+                    subject: Some("\"*\"".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Grep,
                     summary: ToolCallSummary::Count(1),
+                    subject: Some("\"match\"".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -8280,15 +8613,19 @@ mod tests {
 
         assert!(python_error(&execution).text.contains("FileNotFoundError"));
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("missing".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(8),
+                    subject: Some("present".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -8360,15 +8697,19 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(5),
+                    subject: Some("first".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(6),
+                    subject: Some("second".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -8576,12 +8917,16 @@ mod tests {
 
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(execution.tool_calls.len(), 6);
-        assert!(execution.tool_calls.iter().all(|call| {
-            call == &ToolCall {
+        let calls = without_durations(&execution.tool_calls);
+        for subject in ["a", "b"] {
+            let expected = ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(1),
-            }
-        }));
+                subject: Some(subject.to_owned()),
+                duration: None,
+            };
+            assert_eq!(calls.iter().filter(|call| **call == expected).count(), 3);
+        }
     }
 
     #[cfg(unix)]
@@ -8662,6 +9007,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: Some("tail -f /dev/null".to_owned()),
+                duration: None,
             }]
         );
         assert_trusted_value(&mut arena).await;
@@ -8701,22 +9048,24 @@ mod tests {
         gate.wait_until_cleaned_up(second_pgid).await;
         assert_group_absent(second_pgid).await;
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: Some("printf effect > SIDE_EFFECT_SENTINEL".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
+                    subject: Some(
+                        "tail -f /dev/null # COMMAND_SENTINEL (in CWD_SENTINEL)".to_owned()
+                    ),
+                    duration: None,
                 },
             ]
         );
-        let retained = format!("{execution:?}");
-        for sentinel in ["COMMAND_SENTINEL", "CWD_SENTINEL", "SIDE_EFFECT_SENTINEL"] {
-            assert!(!retained.contains(sentinel), "retained {sentinel}");
-        }
         assert_eq!(
             fs::read_to_string(workspace.path().join("SIDE_EFFECT_SENTINEL")).unwrap(),
             "effect"
@@ -8755,6 +9104,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: Some("dd if=/dev/zero bs=8388609 count=1 2>/dev/null".to_owned()),
+                duration: None,
             }]
         );
         assert!(!gate.error_published());
@@ -8857,9 +9208,23 @@ mod tests {
             execution.modified_paths,
             [PathBuf::from("created-on-cancel")]
         );
-        assert!(!format!("{execution:?}").contains("created-on-cancel"));
-        assert!(!format!("{:?}", execution.tool_calls).contains("created-on-cancel"));
-        assert!(!format!("{:?}", execution.tool_calls).contains("still-pending"));
+        assert_eq!(
+            without_durations(&execution.tool_calls),
+            [
+                ToolCall {
+                    tool: ToolName::Write,
+                    summary: ToolCallSummary::Created,
+                    subject: Some("created-on-cancel".to_owned()),
+                    duration: None,
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                    subject: Some("still-pending".to_owned()),
+                    duration: None,
+                },
+            ]
+        );
         assert!(!has_authorisation(&arena, "created-on-cancel"));
         assert_eq!(
             fs::read_to_string(workspace.path().join("created-on-cancel")).unwrap(),
@@ -9018,7 +9383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_retains_normalised_file_operations_without_exposing_paths_in_tool_calls() {
+    async fn execution_retains_normalised_file_operations_and_raw_call_subjects() {
         let workspace = tempfile::tempdir().unwrap();
         fs::create_dir(workspace.path().join("nested")).unwrap();
         fs::write(workspace.path().join("nested/read-only"), "read").unwrap();
@@ -9045,8 +9410,20 @@ mod tests {
                 PathBuf::from("nested/second"),
             ]
         );
-        assert!(!format!("{execution:?}").contains("nested/mutated"));
-        assert!(!format!("{:?}", execution.tool_calls).contains("nested/mutated"));
+        assert_eq!(
+            execution
+                .tool_calls
+                .iter()
+                .map(|call| call.subject.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("./nested//mutated"),
+                Some("nested/./read-only"),
+                Some("./nested//mutated"),
+                Some("nested/mutated"),
+                Some("nested/./second"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -9126,15 +9503,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(8),
+                    subject: Some("lines".to_owned()),
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: Some("/outside".to_owned()),
+                    duration: None,
                 },
             ]
         );
@@ -9164,6 +9545,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: Some("pending".to_owned()),
+                duration: None,
             }]
         );
         assert!(execution.read_paths.is_empty());
@@ -9275,10 +9658,12 @@ mod tests {
             panic!("expected interrupted cancellation");
         };
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(5),
+                subject: Some("settled".to_owned()),
+                duration: None,
             }]
         );
         assert_eq!(execution.read_paths, [PathBuf::from("settled")]);
@@ -9299,11 +9684,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(execution.tool_calls.len(), 20);
-        assert!(execution.tool_calls.iter().all(|call| {
+        assert!(without_durations(&execution.tool_calls).iter().all(|call| {
             *call
                 == ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(5),
+                    subject: Some("lines".to_owned()),
+                    duration: None,
                 }
         }));
     }
@@ -9333,12 +9720,14 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: Some("pending".to_owned()),
+                duration: None,
             }]
         );
     }
 
     #[tokio::test]
-    async fn cancellation_does_not_retain_the_pending_read_path() {
+    async fn cancellation_retains_only_a_bounded_pending_read_path() {
         let workspace = tempfile::tempdir().unwrap();
         let (mut arena, gate) = arena_with_read_gate(&workspace).await;
         let cancellation = CancellationToken::new();
@@ -9361,6 +9750,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: Some(format!("{}\u{2026}", "é".repeat(512))),
+                duration: None,
             }]
         );
         assert!(!format!("{execution:?}").contains(&path));
@@ -9392,10 +9783,12 @@ mod tests {
         };
         assert_eq!(execution.stdout.head, "before\n");
         assert_eq!(
-            execution.tool_calls,
+            without_durations(&execution.tool_calls),
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(5),
+                subject: Some("settled".to_owned()),
+                duration: None,
             }]
         );
     }
@@ -9744,6 +10137,8 @@ mod tests {
             [ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: Some("pending".to_owned()),
+                duration: None,
             }]
         );
         assert!(matches!(

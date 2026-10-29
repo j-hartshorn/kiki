@@ -5394,10 +5394,14 @@ mod tests {
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(3),
+                subject: None,
+                duration: None,
             },
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Failed,
+                subject: None,
+                duration: None,
             },
         ];
         let error = ArenaError::RecoveryFailed {
@@ -5419,10 +5423,14 @@ mod tests {
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(3),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: None,
+                    duration: None,
                 },
             ]
         );

@@ -2605,6 +2605,8 @@ impl Transcript {
                 let activity = tool_call_label(&ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 });
                 let mut accepted = false;
                 let mut changed =
@@ -2629,6 +2631,8 @@ impl Transcript {
                                 ToolCall {
                                     tool: ToolName::Run,
                                     summary: ToolCallSummary::Pending,
+                                    subject: None,
+                                    duration: None,
                                 },
                                 Some(preview),
                             );
@@ -6048,6 +6052,8 @@ mod tests {
             tool_call_label(&ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Created,
+                subject: None,
+                duration: None,
             }),
             "write · created"
         );
@@ -6055,6 +6061,8 @@ mod tests {
             tool_call_label(&ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Replaced,
+                subject: None,
+                duration: None,
             }),
             "write · replaced"
         );
@@ -6062,6 +6070,8 @@ mod tests {
             tool_call_label(&ToolCall {
                 tool: ToolName::Edit,
                 summary: ToolCallSummary::Applied,
+                subject: None,
+                duration: None,
             }),
             "edit · applied"
         );
@@ -6621,6 +6631,8 @@ mod tests {
         ] {
             assert_eq!(
                 tool_call_label(&ToolCall {
+                    subject: None,
+                    duration: None,
                     tool: ToolName::Run,
                     summary,
                 }),
@@ -6636,6 +6648,8 @@ mod tests {
         ] {
             assert_eq!(
                 tool_call_label(&ToolCall {
+                    subject: None,
+                    duration: None,
                     tool,
                     summary: ToolCallSummary::Subagent("child1".to_owned()),
                 }),
@@ -7320,6 +7334,8 @@ mod tests {
                 step_id: ModelStepId(1),
                 token,
                 call: ToolCall {
+                    subject: None,
+                    duration: None,
                     tool: ToolName::Run,
                     summary,
                 },
@@ -8265,6 +8281,8 @@ Problems: none"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -10086,6 +10104,8 @@ truncated"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -10838,6 +10858,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -10946,6 +10968,8 @@ truncated"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -11087,14 +11111,20 @@ truncated"
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(1),
+                subject: None,
+                duration: None,
             },
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Failed,
+                subject: None,
+                duration: None,
             },
             ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             },
         ];
         transcript.apply(
@@ -11155,6 +11185,8 @@ truncated"
             .map(|count| ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(count),
+                subject: None,
+                duration: None,
             })
             .collect();
         transcript.apply(
@@ -11204,6 +11236,8 @@ truncated"
                 vec![ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(usize::MAX),
+                    subject: None,
+                    duration: None,
                 }],
             ),
             false,
@@ -11536,10 +11570,14 @@ truncated"
                     ToolCall {
                         tool: ToolName::Glob,
                         summary: ToolCallSummary::Count(12),
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Run,
                         summary: ToolCallSummary::Exit(0),
+                        subject: None,
+                        duration: None,
                     },
                 ],
             ),
@@ -11583,18 +11621,26 @@ truncated"
                     ToolCall {
                         tool: ToolName::Read,
                         summary: ToolCallSummary::Count(3),
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Write,
                         summary: ToolCallSummary::Failed,
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Run,
                         summary: ToolCallSummary::Exit(2),
+                        subject: None,
+                        duration: None,
                     },
                     ToolCall {
                         tool: ToolName::Run,
                         summary: ToolCallSummary::Signal,
+                        subject: None,
+                        duration: None,
                     },
                 ],
             ),
@@ -11741,6 +11787,8 @@ truncated"
             .map(|_| ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Count(1),
+                subject: None,
+                duration: None,
             })
             .collect();
         let mut transcript = Transcript::default();
@@ -11918,6 +11966,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
                 command: "first".to_owned(),
@@ -11942,6 +11992,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
                 command: "latest".to_owned(),
@@ -11959,6 +12011,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
                 command: "latest".to_owned(),
@@ -11976,6 +12030,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(0),
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
                 command: "latest".to_owned(),
@@ -12000,6 +12056,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(0),
+                subject: None,
+                duration: None,
             }],
             &[Some(RunPreview {
                 command: "latest".to_owned(),
@@ -12024,6 +12082,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(1),
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12036,6 +12096,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12047,10 +12109,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(1),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[None, None],
@@ -12073,6 +12139,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(7),
+                subject: None,
+                duration: None,
             }],
             &[None],
         );
@@ -12094,6 +12162,8 @@ truncated"
             &[ToolCall {
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(7),
+                subject: None,
+                duration: None,
             }],
             &[None],
         );
@@ -12163,6 +12233,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12173,10 +12245,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[None, None],
@@ -12207,10 +12283,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[
@@ -12253,10 +12333,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[
@@ -12288,10 +12372,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(1),
+                    subject: None,
+                    duration: None,
                 },
             ],
             &[
@@ -12329,6 +12417,8 @@ truncated"
                 vec![ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(0),
+                    subject: None,
+                    duration: None,
                 }],
             ),
             false,
@@ -12381,6 +12471,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12408,6 +12500,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(12),
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -12450,6 +12544,8 @@ truncated"
                     call: ToolCall {
                         tool: ToolName::Read,
                         summary: ToolCallSummary::Pending,
+                        subject: None,
+                        duration: None,
                     },
                 },
                 false,
@@ -12465,6 +12561,8 @@ truncated"
                     step_id: ModelStepId(1),
                     token,
                     call: ToolCall {
+                        subject: None,
+                        duration: None,
                         tool: ToolName::Read,
                         summary,
                     },
@@ -12483,10 +12581,14 @@ truncated"
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(5),
+                    subject: None,
+                    duration: None,
                 },
                 ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Failed,
+                    subject: None,
+                    duration: None,
                 },
             ]
         );
@@ -12841,6 +12943,8 @@ truncated"
                                     tool_calls: vec![ToolCall {
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
+                                        subject: None,
+                                        duration: None,
                                     }],
                                     read_paths: Vec::new(),
                                     modified_paths: Vec::new(),
@@ -13129,6 +13233,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
+                    subject: None,
+                    duration: None,
                 },
             },
             false,
@@ -13142,6 +13248,8 @@ truncated"
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(12),
+                    subject: None,
+                    duration: None,
                 },
             },
             false,

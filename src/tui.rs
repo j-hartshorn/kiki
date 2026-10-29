@@ -9792,6 +9792,8 @@ mod tests {
                         .map(|count| ToolCall {
                             tool: ToolName::Read,
                             summary: ToolCallSummary::Count(count),
+                            subject: None,
+                            duration: None,
                         })
                         .collect(),
                     read_paths: Vec::new(),
@@ -11262,6 +11264,8 @@ mod tests {
                             tool_calls: vec![ToolCall {
                                 tool: ToolName::Read,
                                 summary: ToolCallSummary::Failed,
+                                subject: None,
+                                duration: None,
                             }],
                             read_paths: Vec::new(),
                             modified_paths: Vec::new(),
@@ -13274,6 +13278,8 @@ mod tests {
                             .map(|count| ToolCall {
                                 tool: ToolName::Read,
                                 summary: ToolCallSummary::Count(count),
+                                subject: None,
+                                duration: None,
                             })
                             .collect(),
                         read_paths: Vec::new(),
@@ -13538,6 +13544,8 @@ mod tests {
             call: ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             },
         });
 
@@ -13567,6 +13575,8 @@ mod tests {
             call: ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
+                subject: None,
+                duration: None,
             },
         });
 
