@@ -3173,6 +3173,9 @@ fn is_line_boundary_after(previous: char, next: Option<char>) -> bool {
 }
 
 #[cfg(test)]
+mod todo_proof;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::env;
@@ -3227,7 +3230,7 @@ mod tests {
             .expect("MONTY_BIN must point to the monty-runtime 1.0.0 worker")
     }
 
-    async fn arena(workspace: &TempDir) -> Arena {
+    pub(super) async fn arena(workspace: &TempDir) -> Arena {
         Arena::new(
             worker_path(),
             ToolHost::new(workspace.path())
@@ -3483,7 +3486,7 @@ mod tests {
         .expect("create arena")
     }
 
-    async fn arena_with_read_gate(workspace: &TempDir) -> (Arena, ReadTestGate) {
+    pub(super) async fn arena_with_read_gate(workspace: &TempDir) -> (Arena, ReadTestGate) {
         let gate = ReadTestGate::new();
         let tool_host = ToolHost::new(workspace.path())
             .await
@@ -3585,7 +3588,7 @@ mod tests {
         arena.execute(code, &cancellation).await
     }
 
-    fn complete(execution: &Execution) -> Option<&Observation> {
+    pub(super) fn complete(execution: &Execution) -> Option<&Observation> {
         let ExecutionOutcome::Complete { result } = &execution.outcome else {
             panic!("expected completed execution, got {:?}", execution.outcome);
         };
@@ -3757,7 +3760,10 @@ mod tests {
         }
     }
 
-    async fn execute_checked(arena: &mut Arena, code: &str) -> Result<Execution, ArenaError> {
+    pub(super) async fn execute_checked(
+        arena: &mut Arena,
+        code: &str,
+    ) -> Result<Execution, ArenaError> {
         arena
             .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await

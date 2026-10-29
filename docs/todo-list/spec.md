@@ -5,7 +5,8 @@
 > launch-pinned availability; independent child lists and inline detail; Python
 > object methods and ID rules; read-only overflow inspection; 64-item/512-character
 > limits. Technical feasibility is not yet demonstrated. Implementation still
-> requires the implementation skill's initial approval.
+> approval was granted for autonomous implementation. Pre-feature executable
+> checkpoints follow the agreed history-only compatibility policy below.
 
 ## Goal
 
@@ -275,6 +276,19 @@ rules, never bypass checking or silently fabricate executable state.
 
 Keep the implementation narrow. This feature does not require delivering the
 general plugin framework or a generic Arena inspector.
+
+### Checkpoint compatibility (agreed)
+
+Follow Kiki's existing checkpoint-contract version policy. Adding the TODO
+bootstrap and checking declarations creates a new executable checkpoint contract
+(`type-check-v4`, replacing `type-check-v3`). Pre-feature checkpoints remain
+history-readable but cannot resume execution after this upgrade, even with TODOs
+disabled. Do not silently install new bootstrap/checker state into an old dump,
+construct replacement executable state from history, or migrate user bindings.
+Report the incompatibility through the existing disabled/read-only recovery path.
+Fresh sessions and checkpoints made under the new contract use the feature's
+normal availability policy. Existing legacy/foreign identity rejection stays in
+place. User explicitly selected this compatibility policy after the Monty proof.
 
 ### Independent agent lists and inline child display
 

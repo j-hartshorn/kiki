@@ -198,3 +198,43 @@ that cannot honor the agreed source contract.
 - Tool availability: Pi TODO capability and user-only reviewer prompt resources
   are unavailable in this session. Task tracking uses persistent Arena state;
   reviews use explicit bounded read-only briefs, not a claimed review-skill run.
+
+- Task 2, Monty subset: recovered after provider transport failure; no failed
+  child's code effects were present. Eight test-only checked-Monty proofs now
+  pass locally. Object/checkpoint/policy/clone behavior is demonstrated; complete
+  root/child runtime integration and provider request assertions are not yet
+  implemented or claimed verified.
+- Compatibility finding: restored pre-feature checkpoints retain old bootstrap
+  and checking state even when the runtime identity matches. Production must
+  explicitly choose safe handling before enabling/advertising TODOs for such
+  sessions; no migration or identity change has been made by this test-only proof.
+- Verification: proof suite 8 passed; `just lint`, formatting, and diff checks
+  passed. Default `just test` hit two existing worker deadline failures; both
+  passed in isolation. `RUST_TEST_THREADS=4 just test` passed 1789 unit tests,
+  5 credentials CLI tests, and 17 session CLI tests, with 8 expected ignores.
+  No unrelated timeout behavior was changed. Original passing evidence is saved
+  in orchestrator Arena variables; concurrency is part of its applicability.
+
+- Task 2 subset review: independent review PASS, no must-fix findings. Strengthened
+  the nonblocking legacy characterization with a trusted executable-namespace
+  assertion after restore; eight proof tests and lint/fmt passed again. Final
+  `RUST_TEST_THREADS=4 just test` passed after that assertion change. This remains
+  a partial feasibility proof, not completed production context/UI integration.
+- Paused before production bootstrap/identity changes pending a compatibility
+  decision: follow existing stub-version protection (older sessions remain
+  history-readable but not executable), or require an explicit tested migration
+  preserving executable older sessions. No migration, identity bump, source-contract
+  change, or production TODO feature has been made. Task 2 remains in progress;
+  reviewed proof changes are intentionally uncommitted until its gate is resolved.
+
+- Compatibility resolution: user selected existing checkpoint-contract policy.
+  Production TODO bootstrap/stubs advance `type-check-v3` to `type-check-v4`;
+  older saved sessions retain readable history but cannot resume execution.
+  No migration or executable-state reconstruction is in scope.
+- Task 2: bounded Monty proof accepted after independent PASS review and local
+  verification. Existing execution -> child task execution -> stored task record
+  paths and the model-history/provider projection paths were inspected as the
+  reuse seams. No external dependency blocker was found. Feature-specific child
+  publication/retention acceptance tests remain in task 4; actual generated
+  context, compaction, budgeting, and provider request tests remain in task 5.
+  Those are not claimed implemented or verified by the test-only fixture.
