@@ -625,10 +625,8 @@ fn root_settlement(record: &Record) -> Settlement {
 fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
     match progress {
         AgentProgress::ModelProgress(progress) => model_progress_payload_bytes(progress),
-        AgentProgress::ToolUpdated { .. } => 0,
-        AgentProgress::RunPreviewUpdated { preview, .. } => {
-            preview.command.len() + preview.stdout.len()
-        }
+        AgentProgress::ToolUpdated { call, .. } => call.subject.as_ref().map_or(0, String::len),
+        AgentProgress::RunPreviewUpdated { preview, .. } => preview.stdout.len(),
         AgentProgress::StdoutDelta { text } => text.len(),
         AgentProgress::StdoutTruncated => 0,
         AgentProgress::ExecutionStarted { commentary, .. } => {
@@ -641,10 +639,8 @@ fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
 fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
     match event {
         RuntimeEvent::ModelProgress { progress, .. } => model_progress_payload_bytes(progress),
-        RuntimeEvent::ToolUpdated { .. } => 0,
-        RuntimeEvent::RunPreviewUpdated { preview, .. } => {
-            preview.command.len() + preview.stdout.len()
-        }
+        RuntimeEvent::ToolUpdated { call, .. } => call.subject.as_ref().map_or(0, String::len),
+        RuntimeEvent::RunPreviewUpdated { preview, .. } => preview.stdout.len(),
         RuntimeEvent::StdoutDelta { text, .. } => text.len(),
         RuntimeEvent::StdoutTruncated { .. } => 0,
         RuntimeEvent::ExecutionStarted { commentary, .. } => {
@@ -1830,6 +1826,7 @@ impl<M: Model> RuntimeController<M> {
                         token,
                         call,
                     } => {
+                        let bytes = call.subject.as_ref().map_or(0, String::len);
                         progress_sender.publish(
                             WorkerProgress {
                                 run_id: RunId(run_id),
@@ -1838,7 +1835,7 @@ impl<M: Model> RuntimeController<M> {
                                 progress: AgentProgress::ToolUpdated { token, call },
                             },
                             false,
-                            0,
+                            bytes,
                         );
                     }
                     PersistedAgentEvent::RunPreviewUpdated {
@@ -1847,7 +1844,7 @@ impl<M: Model> RuntimeController<M> {
                         token,
                         preview,
                     } => {
-                        let bytes = preview.command.len() + preview.stdout.len();
+                        let bytes = preview.stdout.len();
                         progress_sender.publish(
                             WorkerProgress {
                                 run_id: RunId(run_id),
@@ -11674,8 +11671,7 @@ mod tests {
                 step_id: ModelStepId(1),
                 preview,
                 ..
-            } if preview.command == "printf 'preview stdout'"
-                && preview.stdout == "preview stdout"
+            } if preview.stdout == "preview stdout"
         )));
     }
 

@@ -68,7 +68,6 @@ const BINDING_ALIASES: &str =
 const BINDING_INVENTORY: &str = "{name: [_kiki_type(value).__name__, f'{_kiki_id(value)}'] for name, value in _kiki_locals().items() if not name.startswith('_kiki_') and name not in _kiki_host_names}";
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
-const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
 const CALL_SUBJECT_BYTES: usize = 1024;
 const RUN_STDOUT_PREVIEW_BYTES: usize = 3 * 1024;
 const RUN_STDOUT_PREVIEW_LINES: usize = 8;
@@ -209,36 +208,15 @@ pub(crate) enum ArenaProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunPreview {
-    pub(crate) command: String,
     pub(crate) stdout: String,
 }
 
+#[derive(Default)]
 struct RunPreviewState {
-    command: String,
     stdout: Vec<u8>,
 }
 
 impl RunPreviewState {
-    fn new(command: &str) -> Self {
-        let first_line = command
-            .split(['\r', '\n'])
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default();
-        let truncated =
-            first_line.len() < command.len() || first_line.len() > RUN_COMMAND_PREVIEW_BYTES;
-        let mut command = first_line.to_owned();
-        if command.len() > RUN_COMMAND_PREVIEW_BYTES {
-            command.truncate(utf8_prefix_len(&command, RUN_COMMAND_PREVIEW_BYTES));
-        }
-        if truncated {
-            command.push('…');
-        }
-        Self {
-            command,
-            stdout: Vec::new(),
-        }
-    }
-
     fn push_stdout(&mut self, stdout: &[u8]) {
         self.stdout.extend_from_slice(stdout);
         let logical_lines = self.stdout.iter().filter(|byte| **byte == b'\n').count()
@@ -270,10 +248,7 @@ impl RunPreviewState {
             }
             stdout.drain(..start);
         }
-        RunPreview {
-            command: self.command.clone(),
-            stdout,
-        }
+        RunPreview { stdout }
     }
 }
 
@@ -2041,8 +2016,8 @@ async fn drive(
                             token,
                             call: tools.call(token),
                         });
-                        let run_preview =
-                            run_command_argument(tool, &arguments).map(RunPreviewState::new);
+                        let run_preview = run_command_argument(tool, &arguments)
+                            .map(|_| RunPreviewState::default());
                         if let Some(run_preview) = &run_preview {
                             progress(ArenaProgress::RunPreviewUpdated {
                                 token,
@@ -4767,9 +4742,8 @@ mod tests {
             event,
             super::ArenaProgress::RunPreviewUpdated {
                 token,
-                preview: super::RunPreview { command, stdout },
+                preview: super::RunPreview { stdout },
             } if *token == successful_token
-                && command.contains("COMMAND_SENTINEL")
                 && stdout.contains("OUTPUT_SENTINEL")
                 && !stdout.contains("ERROR_SENTINEL")
         )));
@@ -4778,9 +4752,8 @@ mod tests {
             event,
             super::ArenaProgress::RunPreviewUpdated {
                 token,
-                preview: super::RunPreview { command, stdout },
+                preview: super::RunPreview { stdout },
             } if *token == signalled_token
-                && command.contains("SECOND_OUTPUT_%s")
                 && stdout.contains("SECOND_OUTPUT_SENTINEL")
         )));
         let retained = format!("{:?}{updates:?}", execution.tool_calls);
@@ -7659,8 +7632,8 @@ mod tests {
     }
 
     #[test]
-    fn run_preview_keeps_the_command_prefix_and_last_eight_stdout_lines() {
-        let mut preview = super::RunPreviewState::new(&format!("{}🦀tail", "x".repeat(200)));
+    fn run_preview_keeps_the_last_eight_stdout_lines() {
+        let mut preview = super::RunPreviewState::default();
         preview.push_stdout(
             &(1..=10)
                 .map(|line| format!("line {line}\n"))
@@ -7669,8 +7642,6 @@ mod tests {
         );
 
         let preview = preview.snapshot();
-        assert!(preview.command.ends_with('…'));
-        assert!(preview.command.len() <= super::RUN_COMMAND_PREVIEW_BYTES + '…'.len_utf8());
         assert_eq!(
             preview.stdout,
             (3..=10)
@@ -7678,19 +7649,15 @@ mod tests {
                 .collect::<String>()
         );
 
-        let mut invalid = super::RunPreviewState::new("invalid output");
+        let mut invalid = super::RunPreviewState::default();
         invalid.push_stdout(&vec![0xff; super::RUN_STDOUT_PREVIEW_BYTES]);
         let invalid = invalid.snapshot();
         assert!(invalid.stdout.len() <= super::RUN_STDOUT_PREVIEW_BYTES);
-        assert!(
-            invalid.command.len() + invalid.stdout.len()
-                <= super::RUN_COMMAND_PREVIEW_BYTES + super::RUN_STDOUT_PREVIEW_BYTES
-        );
     }
 
     #[test]
     fn run_preview_keeps_invalid_continuation_bytes_at_the_raw_tail_boundary() {
-        let mut preview = super::RunPreviewState::new("invalid output");
+        let mut preview = super::RunPreviewState::default();
         preview.push_stdout(&vec![0x80; super::RUN_STDOUT_PREVIEW_BYTES + 1]);
 
         let preview = preview.snapshot();
@@ -7698,13 +7665,6 @@ mod tests {
             preview.stdout,
             "\u{fffd}".repeat(super::RUN_STDOUT_PREVIEW_BYTES / '\u{fffd}'.len_utf8())
         );
-    }
-
-    #[test]
-    fn run_preview_skips_leading_blank_command_lines() {
-        let preview = super::RunPreviewState::new("\r\n\nprintf first\nprintf second").snapshot();
-
-        assert_eq!(preview.command, "printf first…");
     }
 
     #[test]
