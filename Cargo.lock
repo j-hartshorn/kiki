@@ -2106,6 +2106,7 @@ dependencies = [
  "monty-pool",
  "monty-proto",
  "monty-types",
+ "pulldown-cmark",
  "ratatui",
  "rattles",
  "reqwest",

@@ -39,6 +39,9 @@ use crate::skills::SkillOrigin;
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 use crate::theme::{DARK, LIGHT, Theme};
 
+#[cfg(test)]
+mod markdown;
+
 #[derive(Clone, Copy)]
 struct MarkdownStyleSheet {
     theme: &'static Theme,
