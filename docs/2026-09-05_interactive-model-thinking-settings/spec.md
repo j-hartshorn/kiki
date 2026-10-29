@@ -13,7 +13,7 @@ This change introduces qualified models with model-owned thinking capabilities, 
 - Provide Pi-style `/model` and `/thinking` selectors, direct command arguments, and explicit Ctrl+S persistence to user settings.
 - Allow model/thinking changes during an active run while keeping the in-flight model step unchanged; debounce Shift+Tab cycling for two seconds.
 - Replace the footer with a compact, width-aware display of cwd/name, usage, context, model, and thinking; colour prompt rules by thinking intensity.
-- Add session-only `/name`, exact `✷ - <dirname|name>` terminal titles, and consistent user-facing “thinking” terminology.
+- Add session-only `/name`, exact `✷ - <dirname|name>` terminal titles, and consistent user-facing “thinking” terminology. (Title format superseded; see [Session name, terminal title, and terminology](#session-name-terminal-title-and-terminology).)
 
 ## Non-goals
 
@@ -106,6 +106,8 @@ Under width pressure, first front-truncate cwd while retaining its basename and 
 Colour both prompt rules from a six-stop dark-theme scale, from dim grey through blue and violet to vivid magenta. Map the active model’s complete ordered values across that scale by ordinal position, so visual intensity remains meaningful without inventing capability levels. A future model with fewer values uses evenly spaced stops including both endpoints.
 
 ### Session name, terminal title, and terminology
+
+(Superseded for the title format by commit `65a4e56`: titles are now `✷ <cwd basename>`, or `✷ <name> - <cwd basename>` once named, with `kiki` standing in for an unavailable cwd. Zed terminal threads lift a leading non-letter into the tab icon, which left the old format reading `- kiki`; the name now joins the folder rather than replacing it, matching pi.)
 
 Initialise the terminal title as `✷ - <cwd basename>` in configured and configuration-only modes, sanitising the basename with the same single-line rule as a name. If cwd is unavailable, use `✷ - kiki`. After `/name <name>`, use exactly `✷ - <name>` and update the footer immediately. Trim the remaining command text, collapse every whitespace run to one ASCII space, reject an empty result through the existing no-argument behaviour, and reject names wider than 80 display cells with a constructive status rather than truncating them. Names are session-only and do not alter cwd or model history. Terminal-title publication is best effort: failure keeps the accepted name/footer and reports that the title could not be changed without terminating or weakening terminal cleanup.
 
