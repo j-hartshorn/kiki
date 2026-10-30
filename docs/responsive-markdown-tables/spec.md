@@ -63,10 +63,12 @@ Three lines is the approved starting limit based on the user's “2 or 3” pref
 
 - Emit one dash-led record per parsed body row, with a blank line between records. Emit every parsed column in source order and repeat the header for each row. Duplicate headers remain separate visible fields; never turn rows into dictionaries and overwrite values.
 - An empty header becomes `Column N`, using its one-based position. Represent an empty cell as `""`, not an omitted field or `null`.
-- Use YAML-compatible scalar quoting when a label or value would otherwise change meaning or structure: for example `true`, `null`, numeric-looking strings, or text containing `: ` or a comment introducer. Treat table values as text; do not infer YAML types.
+- Show ordinary decimal numbers and safe single-line strings without quotes, preserving their exact spelling (including signs, exponents, leading zeros, dates and times). Display numbers follow `[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?`. Classify only for display colours; stored source values remain text and no typed-YAML round trip is promised.
+- Keep quotes for empty/multiline/control-containing values, significant edge whitespace, literal double quotes, YAML-sensitive structure (such as `: ` or ` #`), case-insensitive boolean/null spellings (`true`, `false`, `null`, `~`, `yes`, `no`, `on`, `off`), and nondecimal/special typed forms such as `0x1F`, `0o17`, `.inf` and `.nan`. Plain words `NaN`, `Infinity` and `inf` remain strings. Safe dash-led flags may be plain; bare dash, dash followed by whitespace, document markers and nonnumeric plus-led text remain quoted. These are readability rules, not a complete YAML serializer.
 - Preserve rendered value text, inline code styling, emphasis, links, Unicode, and literal escaped pipes. Quotes/escapes are presentation syntax around that text, not a reason to discard its styles.
 - Every field starts on a new logical line. Prefer word-boundary wrapping; later fields still start separately. Move a whole word/token to the next line when it cannot fit in the remaining space, including after a field label. Only a token wider than a full usable record line may use the separator hierarchy below. Do not split a token just to fill the remaining part of a line.
-- Use existing bold header styling for labels and ordinary body styling for values. Do not add a code fence or YAML syntax highlighting.
+- Colour labels with the existing key colour, decimal values with the number colour, other values with the string colour, and structural punctuation with the punctuation colour. Do not add automatic bold to record labels or punctuation; preserve explicitly authored Markdown emphasis and distinctive inline colours (code, links and similar content). Quote delimiters use the field colour; escape text retains its source span styling, with the field colour as fallback. Do not add a code fence, dependency, or theme keys. Numeric labels are still keys. Header-only `(no rows)` keeps ordinary body styling.
+- In quotes and reasoning cards, record colours intentionally override the enclosing foreground for fields, while contextual prefixes, authored modifiers and backgrounds remain intact.
 - If a header-only table cannot satisfy the grid policy, show column labels vertically followed by `(no rows)`, without inventing a record.
 - Honor the existing parser's treatment of short/excess rows. This is not a Markdown repair pass.
 
@@ -100,13 +102,13 @@ Never split inside a grapheme. Protect escape sequences and URL scheme prefixes 
 
 ## Acceptance criteria
 
-1. A naturally fitting table is unchanged. Narrowing can produce an aligned wrapped grid before records are needed.
+1. A naturally fitting table retains its grid layout and semantic styles. Narrowing can produce an aligned wrapped grid before records are needed.
 2. Fixtures needing exactly two and three content lines per row stay grids; a fixture needing four lines in any one row switches the entire table to records. Test the same rule for the header, and exclude separators from the count.
 3. Column allocation is deterministic, keeps short columns compact, and includes border/padding/prefix costs. No completed grid line overflows, even at an exact-fit boundary.
 4. One message can contain tables in all three presentations. Live and settled wide → medium → narrow → wide reflow does not change stored Markdown.
 5. Reasoning and expanded compaction summaries use their padded content widths, including tiny-width padding reduction.
 6. Escaped pipes, styled values, reference links defined elsewhere, CJK, combining characters, and emoji work across presentations. Lists, quotes, references, footnotes, surrounding content, and literal code/prose remain intact.
-7. Duplicate/empty headers, empty cells, header-only tables, ragged rows, and incomplete streamed tables have regression coverage. Common scalar cases use safe YAML quoting without losing fields or inferring types.
+7. Duplicate/empty headers, empty cells, header-only tables, ragged rows, and incomplete streamed tables have regression coverage. Common scalar cases use safe display quoting and colour-only syntax classification without losing fields, spelling, or stored source text.
 8. Height, clipping, selection, copy, and cached/uncached layouts agree after switches. Unchanged settled content still reuses its width/theme raster.
 9. Both built-in themes remain readable without new theme keys.
 10. Normal grid/record wrapping preserves whole words/tokens, including across style spans. An overlong grid token forces column widening or records, not punctuation splitting to retain the grid.
@@ -127,10 +129,10 @@ Never split inside a grapheme. Protect escape sequences and URL scheme prefixes 
 - `src/transcript.rs:2998–3056`: settled rasters already invalidate by width and theme.
 - `src/tui.rs:2795–2798,2890–2893`: resize already clears layout-dependent selections.
 
-Add a private Markdown module behind the existing helper. It accepts source, usable content width, and existing styling options and returns owned text/layout information, including soft-break provenance where needed. Parsing, word wrapping, allocation, grid construction, and record formatting stay behind this seam. Drawing, height measurement, and selection must use the same wrapping result rather than allowing a later paragraph pass to choose unapproved token breaks. See [the implementation plan](plan.md).
+Add a private Markdown module behind the existing helper. It accepts source, usable content width, and the built-in theme (resolving cached renderer options internally) and returns owned text/layout information, including soft-break provenance where needed. Parsing, word wrapping, allocation, grid construction, and record formatting stay behind this seam. Drawing, height measurement, and selection must use the same wrapping result rather than allowing a later paragraph pass to choose unapproved token breaks. See [the implementation plan](plan.md).
 
 ## Agreement and remaining defaults
 
 - Agreed: allow modest wrapping before falling back; prefer whole-word wrapping, with character-separator breaks permitted for a token wider than the view; YAML-like readability is the goal, not strict serialization.
-- Approved defaults: three content lines maximum for any row, including the header; capped-even column allocation; YAML-friendly scalar quoting; the separator tiers and rightmost-within-tier rule.
+- Approved defaults: three content lines maximum for any row, including the header; capped-even column allocation; safe plain numeric/string display with colour-only record syntax styling; the separator tiers and rightmost-within-tier rule.
 - Approved exception: last-resort grapheme-safe breaking of a token wider than a full record line when no eligible separator can make progress.

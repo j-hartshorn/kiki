@@ -7,6 +7,7 @@ use pulldown_cmark::{Alignment, Event, Options as ParseOptions, Parser, Tag, Tag
 use ratatui::text::{Line, Span, Text};
 
 use super::{MarkdownOptions, from_str_with_options};
+use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LineBreak {
@@ -89,11 +90,8 @@ struct SourceTable {
     prefix_width: usize,
 }
 
-pub(super) fn render(
-    source: &str,
-    content_width: u16,
-    options: &MarkdownOptions,
-) -> MarkdownLayout {
+pub(super) fn render(source: &str, content_width: u16, theme: &'static Theme) -> MarkdownLayout {
+    let options = super::markdown_options(theme);
     render_with(source, content_width, options, |table, width| {
         let natural = natural_columns(table);
         let natural_width = natural.iter().sum::<usize>() + natural.len() * 3 + 1;
@@ -106,7 +104,7 @@ pub(super) fn render(
         } else {
             Some(
                 constrained_grid(table, width, options)
-                    .unwrap_or_else(|| records::render(table, width)),
+                    .unwrap_or_else(|| records::render(table, width, theme)),
             )
         }
     })
@@ -210,12 +208,8 @@ fn extract(source: &str) -> (Vec<SourceTable>, String, String) {
     (tables, references, marker_text)
 }
 
-fn render_cell(source: &str, header: bool, references: &str, options: &MarkdownOptions) -> Cell {
-    let cell_source = if header {
-        format!("| {source} |\n| --- |\n\n{references}")
-    } else {
-        format!("| Cell |\n| --- |\n| {source} |\n\n{references}")
-    };
+fn render_cell(source: &str, references: &str, options: &MarkdownOptions) -> Cell {
+    let cell_source = format!("| Cell |\n| --- |\n| {source} |\n\n{references}");
     let events = Parser::new_ext(&cell_source, parse_options())
         .into_offset_iter()
         .collect::<Vec<_>>();
@@ -247,7 +241,7 @@ fn render_cell(source: &str, header: bool, references: &str, options: &MarkdownO
     }
     rewritten.push_str(&cell_source[cursor..]);
     let text = owned(from_str_with_options(&rewritten, options));
-    let line = &text.lines[if header { 1 } else { 3 }];
+    let line = &text.lines[3];
     // The pinned renderer emits border, padding, inline spans, padding, border.
     let mut line = Line::from(line.spans[2..line.spans.len() - 2].to_vec());
     let mut offset = 0;
@@ -288,16 +282,14 @@ fn render_with(
             header: table
                 .header
                 .iter()
-                .map(|range| render_cell(&source[range.clone()], true, &references, options))
+                .map(|range| render_cell(&source[range.clone()], &references, options))
                 .collect(),
             rows: table
                 .rows
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|range| {
-                            render_cell(&source[range.clone()], false, &references, options)
-                        })
+                        .map(|range| render_cell(&source[range.clone()], &references, options))
                         .collect()
                 })
                 .collect(),
@@ -515,7 +507,9 @@ fn constrained_grid(
         }
         rows.push(cells);
     }
-    let border_style = from_str_with_options("| |\n| - |", options).lines[0].spans[0].style;
+    let template = from_str_with_options("| Cell |\n| --- |", options);
+    let border_style = template.lines[0].spans[0].style;
+    let header_style = template.lines[1].spans[2].style;
     let border = |left: char, middle: char, right: char| {
         let mut text = left.to_string();
         for (index, width) in widths.iter().enumerate() {
@@ -546,11 +540,16 @@ fn constrained_grid(
                     _ => 0,
                 };
                 spans.push(Span::raw(" ".repeat(left + 1)));
-                spans.extend(
-                    line.spans.iter().map(|span| {
-                        Span::styled(span.content.clone(), line.style.patch(span.style))
-                    }),
-                );
+                spans.extend(line.spans.iter().map(|span| {
+                    Span::styled(
+                        span.content.clone(),
+                        if row_index == 0 {
+                            line.style.patch(span.style).patch(header_style)
+                        } else {
+                            line.style.patch(span.style)
+                        },
+                    )
+                }));
                 spans.push(Span::raw(" ".repeat(padding - left + 1)));
                 spans.push(Span::styled("│", border_style));
             }
@@ -598,10 +597,9 @@ mod tests {
 
     #[test]
     fn constrained_grid_wraps_rows_at_two_and_three_word_lines() {
-        let options = super::super::markdown_options(&DARK);
         for (value, lines) in [("one two", 2), ("one two six", 3)] {
             let source = format!("| H |\n| --- |\n| {value} |");
-            let layout = render(&source, 7, options);
+            let layout = render(&source, 7, &DARK);
             assert!(
                 layout.text.lines.iter().all(|line| line.width() <= 7),
                 "{:?}",
@@ -651,9 +649,8 @@ mod tests {
     #[test]
     fn wrapped_grids_keep_inline_styles_unicode_and_container_widths() {
         for theme in [&DARK, &LIGHT] {
-            let options = super::super::markdown_options(theme);
             let source = "| Name |\n| --- |\n| **one** *two* `six` |";
-            let grid = render(source, 8, options);
+            let grid = render(source, 8, theme);
             assert!(grid.text.lines.iter().all(|line| line.width() <= 8));
             assert!(
                 style_at(&grid.text, "one")
@@ -669,11 +666,11 @@ mod tests {
             assert_eq!(style_at(&grid.text, "┌").fg, Some(theme.border_muted));
             for value in ["東京京都大阪", "cafe\u{301} 👩‍💻"] {
                 let source = format!("| H |\n| --- |\n| {value} |");
-                let grid = render(&source, 8, options);
+                let grid = render(&source, 8, theme);
                 assert!(grid.text.lines.iter().all(|line| line.width() <= 8));
             }
             let source = "> | H |\n> | --- |\n> | one two six |";
-            let grid = render(source, 9, options);
+            let grid = render(source, 9, theme);
             assert!(grid.text.lines.iter().all(|line| line.width() <= 9));
             assert!(
                 grid.text
@@ -686,9 +683,8 @@ mod tests {
 
     #[test]
     fn adapter_switches_four_line_rows_to_records_without_dropping_fields() {
-        let options = super::super::markdown_options(&DARK);
         let source = "| H |\n| --- |\n| one two six ten |";
-        let layout = render(source, 7, options);
+        let layout = render(source, 7, &DARK);
         assert_eq!(layout.text.to_string(), "- H:\none two\nsix ten");
         assert_eq!(
             layout.breaks,
@@ -699,7 +695,7 @@ mod tests {
     #[test]
     fn displayed_markdown_link_destinations_keep_the_scheme_whole_when_it_fits() {
         let source = "| H |\n| --- |\n| [guide](https://example.com/a) |";
-        let layout = render(source, 12, super::super::markdown_options(&DARK));
+        let layout = render(source, 12, &DARK);
         assert!(
             layout
                 .text
@@ -721,7 +717,7 @@ mod tests {
     #[test]
     fn one_document_can_show_natural_wrapped_and_record_tables() {
         let source = "| x |\n| --- |\n| a |\n\n| H |\n| --- |\n| one two six ten one two six ten |\n\n| H |\n| --- |\n| identifier_with_many_segments |";
-        let layout = render(source, 20, super::super::markdown_options(&DARK));
+        let layout = render(source, 20, &DARK);
         let display = layout.text.to_string();
         assert!(display.contains("┌───┐"));
         assert!(display.contains("┌──────────────────┐"));
@@ -735,7 +731,7 @@ mod tests {
     #[test]
     fn mixed_documents_keep_original_and_prepared_row_metadata() {
         let source = "before\n\n| x |\n| --- |\n| a |\n\nbetween grids\n\n| H |\n| --- |\n| one two six ten one two six ten |\n\nbetween records\n\n| H |\n| --- |\n| identifier_with_many_segments |\n\nafter";
-        let layout = render(source, 20, super::super::markdown_options(&DARK));
+        let layout = render(source, 20, &DARK);
         let rows = layout
             .text
             .lines
@@ -796,7 +792,7 @@ mod tests {
             for (source, first_prefix, continuation) in fixtures {
                 let source_prefix_bytes = source.lines().last().unwrap().find('|').unwrap();
                 let width = Line::raw(continuation).width();
-                let layout = render(source, (9 + width) as u16, options);
+                let layout = render(source, (9 + width) as u16, theme);
                 let rows = layout
                     .text
                     .lines
@@ -1036,6 +1032,121 @@ mod tests {
     }
 
     #[test]
+    fn record_field_colours_do_not_add_bold_or_erase_authored_emphasis() {
+        for theme in [&DARK, &LIGHT] {
+            let layout = render("| **Bold** Plain |\n| --- |\n| 123 |", 8, theme);
+            assert_eq!(
+                style_at(&layout.text, "Bold").fg,
+                Some(theme.syntax_variable)
+            );
+            assert!(
+                style_at(&layout.text, "Bold")
+                    .add_modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert_eq!(
+                style_at(&layout.text, "Plain").fg,
+                Some(theme.syntax_variable)
+            );
+            assert!(
+                !style_at(&layout.text, "Plain")
+                    .add_modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert_eq!(style_at(&layout.text, "123").fg, Some(theme.syntax_number));
+            for punctuation in ["-", ":"] {
+                let style = style_at(&layout.text, punctuation);
+                assert_eq!(style.fg, Some(theme.syntax_punctuation));
+                assert!(!style.add_modifier.contains(Modifier::BOLD));
+            }
+            let layout = render(
+                "| Value |\n| --- |\n| `code` [link](u) *word* ~~gone~~ |",
+                8,
+                theme,
+            );
+            assert_eq!(style_at(&layout.text, "code").fg, Some(theme.md_code));
+            assert_eq!(style_at(&layout.text, "link").fg, Some(theme.md_link));
+            let style = style_at(&layout.text, "word");
+            assert_eq!(style.fg, Some(theme.syntax_string));
+            assert!(style.add_modifier.contains(Modifier::ITALIC));
+            assert!(
+                style_at(&layout.text, "gone")
+                    .add_modifier
+                    .contains(Modifier::CROSSED_OUT)
+            );
+        }
+    }
+
+    #[test]
+    fn record_label_and_quoted_value_colours_follow_their_roles() {
+        for theme in [&DARK, &LIGHT] {
+            let layout = render("| `Code` [Link](u) |\n| --- |\n| a: b |", 7, theme);
+            assert_eq!(style_at(&layout.text, "Code").fg, Some(theme.md_code));
+            assert!(
+                !style_at(&layout.text, "Code")
+                    .add_modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert_eq!(style_at(&layout.text, "Link").fg, Some(theme.md_link));
+            assert_eq!(style_at(&layout.text, "\"").fg, Some(theme.syntax_string));
+            let escaped = render(
+                r#"| Value |
+| --- |
+| `a"b` say "hi" |"#,
+                8,
+                theme,
+            );
+            assert_eq!(style_at(&escaped.text, r#"a\"b"#).fg, Some(theme.md_code));
+            assert_eq!(
+                style_at(&escaped.text, r#"\"hi\""#).fg,
+                Some(theme.syntax_string)
+            );
+            assert_eq!(style_at(&escaped.text, "\"").fg, Some(theme.syntax_string));
+            let label = render(
+                r#"| `a"b` |
+| --- |
+| 12 |"#,
+                6,
+                theme,
+            );
+            assert_eq!(style_at(&label.text, r#"a\"b"#).fg, Some(theme.md_code));
+            assert_eq!(style_at(&label.text, "\"").fg, Some(theme.syntax_variable));
+            for (value, color) in [
+                ("-1.2e-3", theme.syntax_number),
+                ("NaN", theme.syntax_string),
+                ("Infinity", theme.syntax_string),
+                ("0x1F", theme.syntax_string),
+            ] {
+                let layout = render(&format!("| Value |\n| --- |\n| {value} |"), 8, theme);
+                assert_eq!(style_at(&layout.text, value).fg, Some(color), "{value}");
+            }
+            let layout = render("| 2024 |\n| --- |", 4, theme);
+            let style = style_at(&layout.text, "2024");
+            assert_eq!(style.fg, Some(theme.syntax_variable));
+            assert!(!style.add_modifier.contains(Modifier::BOLD));
+            assert_eq!(style_at(&layout.text, "no").fg, None);
+        }
+    }
+
+    #[test]
+    fn prepared_grid_header_styles_match_natural_headers() {
+        let source = "| **a** *i* ~~s~~ `c` [l](u) plain |\n| --- |\n| body |";
+        for theme in [&DARK, &LIGHT] {
+            let natural = render(source, 80, theme);
+            let wrapped = render(source, 14, theme);
+            assert!(natural.text.to_string().contains('┌'));
+            assert!(wrapped.text.to_string().contains('┌'));
+            for token in ["a", "i", "s", "c", "l", "plain"] {
+                assert_eq!(
+                    style_at(&natural.text, token),
+                    style_at(&wrapped.text, token),
+                    "{token}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unchanged_documents_and_fitting_tables_keep_exact_styles() {
         for theme in [&DARK, &LIGHT] {
             let options = super::super::markdown_options(theme);
@@ -1044,7 +1155,7 @@ mod tests {
                 "before\n\n| H |\n| --- |\n| `v` |\n\nafter",
                 "- | H |\n  | --- |\n  | v |\n- next",
             ] {
-                let actual = render(source, 120, options);
+                let actual = render(source, 120, theme);
                 assert_eq!(actual.text, from_str_with_options(source, options));
                 assert_eq!(
                     actual.breaks,
@@ -1062,7 +1173,7 @@ mod tests {
             "ordinary words that still need paragraph wrapping",
             r"`a|b` and a \| b",
         ] {
-            let layout = render(source, 4, options);
+            let layout = render(source, 4, &DARK);
             assert_eq!(layout.text, from_str_with_options(source, options));
             assert!(layout.prefixes.is_empty());
             assert_eq!(

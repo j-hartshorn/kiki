@@ -204,7 +204,7 @@ fn markdown_layout(
     if let Some(counts) = construction_counts {
         counts.markdown += 1;
     }
-    markdown::render(source, width, markdown_options(theme))
+    markdown::render(source, width, theme)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -7343,6 +7343,49 @@ mod tests {
     }
 
     #[test]
+    fn responsive_record_scalar_display_and_colours_survive_rendered_copy() {
+        for theme in [&DARK, &LIGHT] {
+            for (value, expected) in [
+                ("-1.25e-3", "-1.25e-3"),
+                ("007", "007"),
+                ("2026-10-29", "2026-10-29"),
+                ("NaN", "NaN"),
+                ("--flag", "--flag"),
+                ("a: b", "\"a: b\""),
+            ] {
+                for width in 1..=12 {
+                    let mut transcript = Transcript::default();
+                    transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                        markdown: format!("| NumberValue |\n| --- |\n| {value} |"),
+                        accounting: None,
+                    }]);
+                    let layout = transcript.layout(theme, width);
+                    let copied = layout.extract_selection(Selection::new(
+                        DocumentPosition::new(0, 0),
+                        DocumentPosition::new(layout.total_height(), 0),
+                    ));
+                    assert_eq!(
+                        copied,
+                        format!("- NumberValue: {expected}"),
+                        "{value} at {width}"
+                    );
+                    if value == "007" {
+                        let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                        let screen = layout_buffer(&layout, area, 0, None);
+                        let seven = screen
+                            .content()
+                            .iter()
+                            .find(|cell| cell.symbol() == "7")
+                            .expect("number drawn");
+                        assert_eq!(seven.fg, theme.syntax_number);
+                        assert!(!seven.modifier.contains(Modifier::BOLD));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn responsive_records_preserve_non_breaking_spaces_in_rendered_copy() {
         for space in ['\u{00a0}', '\u{2007}', '\u{202f}'] {
             let value = format!("10{space}MB");
@@ -7359,7 +7402,7 @@ mod tests {
                 ));
                 assert_eq!(
                     copied,
-                    format!("- H: \"{value}\""),
+                    format!("- H: {value}"),
                     "{space:?} at width {width}"
                 );
             }
