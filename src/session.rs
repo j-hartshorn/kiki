@@ -615,6 +615,7 @@ impl SessionWriteGate {
 struct LiveSessionContext {
     effective_entry: SessionEntryId,
     history: ModelHistory,
+    todo_context_anchor: Option<SessionEntryId>,
 }
 
 struct SessionState {
@@ -973,6 +974,7 @@ impl Session {
             .map_err(|_| SessionError::WriterUnavailable)? = Some(LiveSessionContext {
             effective_entry: restore.effective_entry,
             history: executable.history,
+            todo_context_anchor: None,
         });
         Ok(())
     }
@@ -1038,6 +1040,20 @@ impl SessionWriter {
             .ok_or(SessionError::ModelContextUnavailable)
     }
 
+    pub(crate) fn replace_todo_context(&self, text: Option<String>) -> Result<(), SessionError> {
+        let mut cache = self
+            .state
+            .model_context
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?;
+        let context = cache
+            .as_mut()
+            .ok_or(SessionError::ModelContextUnavailable)?;
+        context.todo_context_anchor = text.as_ref().map(|_| context.effective_entry);
+        context.history.replace_todo_context(text);
+        Ok(())
+    }
+
     pub(crate) async fn prepare_compaction(
         &self,
         policy: CompactionSettings,
@@ -1055,6 +1071,24 @@ impl SessionWriter {
             .lock()
             .map_err(|_| SessionError::WriterUnavailable)?
             .clone();
+        let generated_context = {
+            let cache = self
+                .state
+                .model_context
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
+            let context = cache
+                .as_ref()
+                .ok_or(SessionError::ModelContextUnavailable)?;
+            context.history.todo_context().map(|text| {
+                (
+                    context
+                        .todo_context_anchor
+                        .unwrap_or(context.effective_entry),
+                    text.to_owned(),
+                )
+            })
+        };
         let snapshot = self
             .read(move |connection| load_compaction_snapshot(connection, &skill_policy))
             .await?;
@@ -1065,6 +1099,9 @@ impl SessionWriter {
             reasoning,
             &focus,
             reason,
+            generated_context
+                .as_ref()
+                .map(|(anchor, text)| (*anchor, text.as_str())),
         )
         .map_err(|error| SessionError::Codec(error.to_string()))?
         else {
@@ -1177,6 +1214,7 @@ impl SessionWriter {
             *context = Some(LiveSessionContext {
                 effective_entry,
                 history,
+                todo_context_anchor: None,
             });
             Ok(())
         })
@@ -1947,6 +1985,7 @@ fn append_model_context_entry(
         ModelContextEntry::CompactionSummary { summary } => {
             history.append_compaction_summary(summary)
         }
+        ModelContextEntry::TodoContext { text } => history.replace_todo_context(Some(text)),
         ModelContextEntry::SkillActivation(activation) => {
             history
                 .activate_skill(activation)
@@ -2293,6 +2332,7 @@ fn initialise(
             model_context: Mutex::new(Some(LiveSessionContext {
                 effective_entry: session_entry_id(root_entry_id)?,
                 history: ModelHistory::new(),
+                todo_context_anchor: None,
             })),
             skill_policy: Mutex::new(SkillProjectionPolicy::default()),
             active_execution_step: Mutex::new(None),

@@ -5186,7 +5186,11 @@ mod tests {
         let mut child = parent.child(&checkpoint, false).await.unwrap();
         assert_eq!(
             child.tool_host.prompt_reference(true),
-            crate::tools::prompt_reference(&SkillCatalog::default())
+            format!(
+                "{}{}",
+                crate::tools::prompt_reference(&SkillCatalog::default()),
+                crate::todos::TodoPolicy::default().reference()
+            )
         );
         assert!(
             python_error(

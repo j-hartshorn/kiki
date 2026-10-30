@@ -632,6 +632,13 @@ impl<M: Model> Agent<M> {
         self.invocation_context = Some(context);
     }
 
+    fn capture_todo_context(&self, include_reference: bool) -> Option<String> {
+        self.arena
+            .todo_policy()
+            .enabled()
+            .then(|| crate::todos::render_context(self.arena.todos(), include_reference))
+    }
+
     pub(crate) async fn collect_child_result_values(
         &mut self,
         cancellation: &CancellationToken,
@@ -730,6 +737,9 @@ impl<M: Model> Agent<M> {
             }
         };
         let committed = writer.settle_compaction(preparation, settlement).await?;
+        if matches!(committed.outcome, CompactionOutcome::Applied { .. }) {
+            writer.replace_todo_context(self.capture_todo_context(true))?;
+        }
         Ok(CompactionResult::Settled(committed))
     }
 
@@ -762,6 +772,7 @@ impl<M: Model> Agent<M> {
             .await?;
         let run_id = admission.run_id;
         let activation_written = admission.effective_entry != admission.request_entry;
+        writer.replace_todo_context(self.capture_todo_context(true))?;
         event(PersistedAgentEvent::RequestCommitted {
             run_id,
             request_entry: admission.request_entry,
@@ -1324,6 +1335,7 @@ impl<M: Model> Agent<M> {
         }
         let mut history = ModelHistory::new();
         history.append_user_request(request);
+        history.replace_todo_context(self.capture_todo_context(false));
         let mut attempts = Vec::new();
         let mut generation = GenerationEvidenceBuilder::default();
 
@@ -2063,7 +2075,10 @@ mod tests {
                 let entries = history.entries().to_vec();
                 self.contexts.push(entries.clone());
                 let action = match entries.as_slice() {
-                    [ModelContextEntry::UserRequest { .. }] => CompletedModelAction::Code {
+                    [
+                        ModelContextEntry::UserRequest { .. },
+                        ModelContextEntry::TodoContext { .. },
+                    ] => CompletedModelAction::Code {
                         source: if self.contexts.len() == 1 {
                             "value: int = 1"
                         } else {
@@ -2075,6 +2090,7 @@ mod tests {
                     },
                     [
                         ModelContextEntry::UserRequest { .. },
+                        ModelContextEntry::TodoContext { .. },
                         ModelContextEntry::CompletedCode(_),
                     ] => CompletedModelAction::Message {
                         text: "done".to_owned(),
@@ -2592,6 +2608,7 @@ mod tests {
                 ModelContextEntry::UserRequest {
                     text: large_request.clone(),
                 },
+                empty_todo_capture(true),
             ]
         );
         assert!(matches!(
@@ -2782,13 +2799,17 @@ mod tests {
         let contexts = agent.model.contexts();
         assert_eq!(
             contexts[0],
-            [ModelContextEntry::UserRequest {
-                text: "inspect".to_owned(),
-            }]
+            [
+                ModelContextEntry::UserRequest {
+                    text: "inspect".to_owned()
+                },
+                empty_todo_capture(true)
+            ]
         );
         let [
             ModelContextEntry::CompactionSummary { summary },
             ModelContextEntry::CompletedCode(code),
+            ModelContextEntry::TodoContext { .. },
         ] = contexts[1].as_slice()
         else {
             panic!("next step receives summary and the whole retained code entry");
@@ -3046,9 +3067,10 @@ mod tests {
             Some(ModelContextEntry::UserRequest { text }) if text == "discarded request"
         ));
         assert!(matches!(
-            context.last(),
+            context.iter().rev().find(|entry| matches!(entry, ModelContextEntry::UserRequest { .. })),
             Some(ModelContextEntry::UserRequest { text }) if text == &request
         ));
+        assert!(todo_capture_text(context).is_some());
         assert_eq!(
             run_entry_kinds(&session, outcome.run_id),
             ["user_request", "compaction", "final_reply"]
@@ -3361,7 +3383,7 @@ mod tests {
         assert_eq!(session_counts(&session), (runs_before + 1, steps_before));
         assert!(matches!(
             writer.model_history().expect("read compacted context").entries(),
-            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }, ModelContextEntry::TodoContext { .. }]
                 if summary == "applied summary"
         ));
 
@@ -3427,7 +3449,7 @@ mod tests {
         assert_eq!(session_counts(&session), (runs_before + 1, steps_before));
         assert!(matches!(
             writer.model_history().expect("read compacted context").entries(),
-            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }, ModelContextEntry::TodoContext { .. }]
                 if summary == "applied summary"
         ));
 
@@ -3815,9 +3837,10 @@ mod tests {
                 ModelContextEntry::UserRequest {
                     text: request.clone(),
                 },
+                empty_todo_capture(true),
             ]
         );
-        assert_eq!(model.contexts[2][..2], model.contexts[1][..]);
+        assert_eq!(model.contexts[2][..3], model.contexts[1][..]);
         assert_eq!(
             run_entry_kinds(&session, outcome.run_id),
             ["user_request", "compaction", "execution", "final_reply"]
@@ -4343,7 +4366,7 @@ mod tests {
         assert_eq!(agent.model.contexts.len(), 1);
         assert!(matches!(
             writer.model_history().expect("read compacted context").entries(),
-            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }, ModelContextEntry::TodoContext { .. }]
                 if summary == "overflow summary"
         ));
         assert_eq!(
@@ -4421,7 +4444,7 @@ mod tests {
             assert!(
                 matches!(
                     writer.model_history().expect("read compacted context").entries(),
-                    [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+                    [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }, ModelContextEntry::TodoContext { .. }]
                         if summary == "overflow summary"
                 ),
                 "{trigger}"
@@ -4615,19 +4638,19 @@ mod tests {
         assert_eq!(agent.model.contexts.len(), 4);
         assert!(matches!(
             agent.model.contexts[0].as_slice(),
-            [ModelContextEntry::UserRequest { text }] if text == "first"
+            [ModelContextEntry::UserRequest { text }, ModelContextEntry::TodoContext { .. }] if text == "first"
         ));
         assert!(matches!(
             agent.model.contexts[1].as_slice(),
-            [ModelContextEntry::UserRequest { text }, ModelContextEntry::CompletedCode(_)] if text == "first"
+            [ModelContextEntry::UserRequest { text }, ModelContextEntry::TodoContext { .. }, ModelContextEntry::CompletedCode(_)] if text == "first"
         ));
         assert!(matches!(
             agent.model.contexts[2].as_slice(),
-            [ModelContextEntry::UserRequest { text }] if text == "second"
+            [ModelContextEntry::UserRequest { text }, ModelContextEntry::TodoContext { .. }] if text == "second"
         ));
         assert!(matches!(
             agent.model.contexts[3].as_slice(),
-            [ModelContextEntry::UserRequest { text }, ModelContextEntry::CompletedCode(_)] if text == "second"
+            [ModelContextEntry::UserRequest { text }, ModelContextEntry::TodoContext { .. }, ModelContextEntry::CompletedCode(_)] if text == "second"
         ));
         let execution = agent
             .arena
@@ -4767,9 +4790,12 @@ mod tests {
         assert_eq!(agent.model.contexts().len(), 2);
         assert_eq!(
             agent.model.contexts()[0],
-            [ModelContextEntry::UserRequest {
-                text: "inspect".to_owned(),
-            }]
+            [
+                ModelContextEntry::UserRequest {
+                    text: "inspect".to_owned()
+                },
+                empty_todo_capture(false)
+            ]
         );
         let completed = agent.model.contexts()[1]
             .last()
@@ -5526,6 +5552,7 @@ mod tests {
             agent.model.contexts()[1].as_slice(),
             [
                 ModelContextEntry::UserRequest { .. },
+                ModelContextEntry::TodoContext { .. },
                 ModelContextEntry::CompletedCode(_)
             ]
         ));
@@ -5684,9 +5711,12 @@ mod tests {
         assert_eq!(agent.model.position(), 0);
         assert_eq!(
             agent.model.contexts()[0],
-            [ModelContextEntry::UserRequest {
-                text: "inspect".to_owned(),
-            }]
+            [
+                ModelContextEntry::UserRequest {
+                    text: "inspect".to_owned()
+                },
+                empty_todo_capture(false)
+            ]
         );
     }
 
@@ -6374,6 +6404,448 @@ mod tests {
                 "Python error truncated; truncation does not change Arena values.\n",
                 "</kiki_warning>"
             )
+        );
+    }
+    fn empty_todo_capture(include_reference: bool) -> ModelContextEntry {
+        ModelContextEntry::TodoContext {
+            text: crate::todos::render_context(&Vec::new(), include_reference),
+        }
+    }
+
+    fn todo_capture_text(entries: &[ModelContextEntry]) -> Option<&str> {
+        entries.iter().find_map(|entry| match entry {
+            ModelContextEntry::TodoContext { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn todo_capture_run_start_is_full_stable_and_replaced_next_run() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "todos.update(2, status='in_progress')\ntodos.add('during run')"
+                        .to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ])
+            .with_subsequent_first_action(ModelAction::Message {
+                text: "next".to_owned(),
+            }),
+        )
+        .await;
+        let setup = agent.arena.execute_model_code(
+            "todos.add('done item', 'completed')\ntodos.add('pending item')\ntodos.add('current item', 'in_progress')",
+            &CancellationToken::new(), &mut |_| {}, None, &[],
+        ).await.unwrap();
+        assert!(matches!(
+            setup.0.outcome,
+            crate::arena::ExecutionOutcome::Complete { .. }
+        ));
+        let first = crate::todos::render_context(agent.arena.todos(), true);
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        agent
+            .run_persisted(
+                default_selection(),
+                CompactionSettings::new(16_384, 20_000),
+                CrossProviderReasoning::Inline,
+                "first".to_owned(),
+                None,
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent.arena.todos().len(), 4);
+        for history in &agent.model.contexts()[..2] {
+            assert_eq!(todo_capture_text(history), Some(first.as_str()));
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+                    .count(),
+                1
+            );
+        }
+        assert!(matches!(
+            agent.model.contexts()[1].last(),
+            Some(ModelContextEntry::CompletedCode(_))
+        ));
+        let next = crate::todos::render_context(agent.arena.todos(), true);
+        agent
+            .run_persisted(
+                default_selection(),
+                CompactionSettings::new(16_384, 20_000),
+                CrossProviderReasoning::Inline,
+                "second".to_owned(),
+                None,
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            todo_capture_text(&agent.model.contexts()[2]),
+            Some(next.as_str())
+        );
+        assert_ne!(first, next);
+        assert_eq!(
+            agent.model.contexts()[2]
+                .iter()
+                .filter(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_capture_disabled_run_removes_generated_state_and_default_guidance() {
+        assert!(
+            !crate::tools::prompt_reference(&crate::skills::SkillCatalog::default())
+                .contains("## TODO list")
+        );
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }]),
+        )
+        .await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        for enabled in [true, false] {
+            agent
+                .arena
+                .apply_todo_policy(crate::todos::TodoPolicy::capture(enabled))
+                .await
+                .unwrap();
+            agent
+                .run_persisted(
+                    default_selection(),
+                    CompactionSettings::new(16_384, 20_000),
+                    CrossProviderReasoning::Inline,
+                    format!("enabled {enabled}"),
+                    None,
+                    &CancellationToken::new(),
+                    &writer,
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                todo_capture_text(agent.model.contexts().last().unwrap()).is_some(),
+                enabled
+            );
+            assert_eq!(
+                writer.model_history().unwrap().todo_context().is_some(),
+                enabled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_capture_child_initial_is_empty_and_not_refreshed_per_step() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "todos.add('child private')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ]),
+        )
+        .await;
+        let expected = crate::todos::render_context(agent.arena.todos(), false);
+        agent
+            .run_with_progress(
+                default_selection(),
+                "child".to_owned(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent.arena.todos().len(), 1);
+        for history in agent.model.contexts() {
+            assert_eq!(todo_capture_text(history), Some(expected.as_str()));
+            assert!(
+                !todo_capture_text(history)
+                    .unwrap()
+                    .contains("child private")
+            );
+            assert!(
+                todo_capture_text(history)
+                    .unwrap()
+                    .contains("No current TODO items.")
+            );
+            assert!(!todo_capture_text(history).unwrap().contains("## TODO list"));
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_capture_only_applied_compaction_refreshes_live_state() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "todos.add('after capture')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ])
+            .with_summary_responses(vec![
+                "stale TODO list in summary".to_owned(),
+                "stale TODO detail".to_owned(),
+            ]),
+        )
+        .await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let policy = CompactionSettings::new(16_384, 20_000);
+        agent
+            .run_persisted(
+                default_selection(),
+                policy,
+                CrossProviderReasoning::Inline,
+                "current".to_owned(),
+                None,
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let old = writer
+            .model_history()
+            .unwrap()
+            .todo_context()
+            .unwrap()
+            .to_owned();
+        let fresh = crate::todos::render_context(agent.arena.todos(), true);
+        assert_ne!(old, fresh);
+        let no_op = agent
+            .compact(
+                CompactionReason::AutomaticThreshold,
+                policy,
+                default_selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                &CancellationToken::new(),
+                &writer,
+                &mut || {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(no_op, CompactionResult::NoOp));
+        assert_eq!(
+            writer.model_history().unwrap().todo_context(),
+            Some(old.as_str())
+        );
+        let applied = agent
+            .compact(
+                CompactionReason::Manual,
+                policy,
+                default_selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                &CancellationToken::new(),
+                &writer,
+                &mut || {},
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(applied, CompactionResult::Settled(ref committed) if matches!(committed.outcome, CompactionOutcome::Applied { .. }))
+        );
+        assert_eq!(
+            writer.model_history().unwrap().todo_context(),
+            Some(fresh.as_str())
+        );
+    }
+    #[tokio::test]
+    async fn todo_capture_budget_includes_generated_context() {
+        let mut estimates = Vec::new();
+        for generated in [None, Some("generated TODO context ".repeat(500))] {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let mut agent = agent_with_model(
+                &workspace,
+                ScriptedModel::new(vec![])
+                    .with_summary_responses(vec!["budget summary".to_owned(); 4]),
+            )
+            .await;
+            let session = Session::create(
+                home.path(),
+                workspace.path(),
+                default_selection(),
+                agent.checkpoint(),
+            )
+            .unwrap();
+            let writer = session.writer();
+            seed_compactable_history(&writer).await;
+            writer.replace_todo_context(generated).unwrap();
+            let result = agent
+                .compact(
+                    CompactionReason::Manual,
+                    CompactionSettings::new(16_384, 20_000),
+                    default_selection(),
+                    CrossProviderReasoning::Inline,
+                    String::new(),
+                    &CancellationToken::new(),
+                    &writer,
+                    &mut || {},
+                )
+                .await
+                .unwrap();
+            let CompactionResult::Settled(committed) = result else {
+                panic!("no compaction");
+            };
+            let CompactionOutcome::Applied { context_tokens, .. } = committed.outcome else {
+                panic!("summary failed");
+            };
+            estimates.push(context_tokens);
+        }
+        assert!(
+            estimates[1] > estimates[0],
+            "generated context not counted: {estimates:?}"
+        );
+    }
+    #[tokio::test]
+    async fn todo_capture_failed_summary_keeps_initial_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            FailingSummaryModel {
+                steps: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "todos.add('after failed summary')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ]),
+            },
+        )
+        .await;
+        let expected = crate::todos::render_context(agent.arena.todos(), true);
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        agent
+            .run_persisted(
+                default_selection(),
+                threshold_policy(1),
+                CrossProviderReasoning::Inline,
+                large_request(),
+                None,
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent.arena.todos().len(), 1);
+        assert_eq!(agent.model.steps.contexts().len(), 2);
+        for history in agent.model.steps.contexts() {
+            assert_eq!(todo_capture_text(history), Some(expected.as_str()));
+        }
+        assert_eq!(
+            writer.model_history().unwrap().todo_context(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_capture_threshold_coalesces_before_first_normal_step() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }])
+            .with_summary_responses(vec!["threshold summary".to_owned(); 4]),
+        )
+        .await;
+        let expected = crate::todos::render_context(agent.arena.todos(), true);
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        agent
+            .run_persisted(
+                default_selection(),
+                threshold_policy(1),
+                CrossProviderReasoning::Inline,
+                large_request(),
+                None,
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!agent.model.summary_requests().is_empty());
+        assert_eq!(agent.model.contexts().len(), 1);
+        let context = &agent.model.contexts()[0];
+        assert!(matches!(
+            context.first(),
+            Some(ModelContextEntry::CompactionSummary { .. })
+        ));
+        assert_eq!(todo_capture_text(context), Some(expected.as_str()));
+        assert_eq!(
+            context
+                .iter()
+                .filter(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+                .count(),
+            1
         );
     }
 }

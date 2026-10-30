@@ -3074,6 +3074,19 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
+                assert!(matches!(
+                    history.entries(),
+                    [ModelContextEntry::UserRequest { .. }, ModelContextEntry::TodoContext { text }, ..]
+                        if text == &crate::todos::render_context(&Vec::new(), false)
+                ));
+                assert_eq!(
+                    history
+                        .entries()
+                        .iter()
+                        .filter(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+                        .count(),
+                    1
+                );
                 if let Self::Unselected(factory) = self {
                     *self = factory.model_for(selection);
                 }
@@ -5895,6 +5908,9 @@ mod tests {
                 ModelContextEntry::UserRequest {
                     text: "next request".to_owned(),
                 },
+                ModelContextEntry::TodoContext {
+                    text: crate::todos::render_context(&Vec::new(), true),
+                },
             ]
         );
 
@@ -5997,10 +6013,27 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(active, [body]);
+            assert_eq!(
+                latest.last(),
+                Some(&ModelContextEntry::TodoContext {
+                    text: crate::todos::render_context(&Vec::new(), true),
+                })
+            );
+            assert_eq!(
+                latest
+                    .iter()
+                    .filter(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+                    .count(),
+                1
+            );
             if index == 0 {
                 assert!(matches!(
-                    latest.last(),
-                    Some(ModelContextEntry::SkillActivation(_))
+                    latest.as_slice(),
+                    [
+                        ..,
+                        ModelContextEntry::SkillActivation(_),
+                        ModelContextEntry::TodoContext { .. }
+                    ]
                 ));
             }
         }
@@ -6525,7 +6558,10 @@ mod tests {
                 .model_history()
                 .expect("read uncommitted context")
                 .entries(),
-            [ModelContextEntry::UserRequest { .. }]
+            [
+                ModelContextEntry::UserRequest { .. },
+                ModelContextEntry::TodoContext { .. }
+            ]
         ));
 
         gate.release();
@@ -6539,7 +6575,7 @@ mod tests {
                 .model_history()
                 .expect("read committed context")
                 .entries()
-                .get(1),
+                .get(2),
             Some(ModelContextEntry::CompletedCode(_))
         ));
         events_until_settled(&mut events).await;
@@ -6601,7 +6637,10 @@ mod tests {
                 .model_history()
                 .expect("read uncommitted context")
                 .entries(),
-            [ModelContextEntry::UserRequest { .. }]
+            [
+                ModelContextEntry::UserRequest { .. },
+                ModelContextEntry::TodoContext { .. }
+            ]
         ));
         commands
             .send(RuntimeCommand::Cancel { correction: false })
@@ -10628,9 +10667,14 @@ mod tests {
         assert_eq!(*observed.lock().unwrap(), [selection_c]);
         assert_eq!(
             *contexts.lock().unwrap(),
-            [vec![ModelContextEntry::UserRequest {
-                text: "inspect".to_owned(),
-            }]]
+            [vec![
+                ModelContextEntry::UserRequest {
+                    text: "inspect".to_owned(),
+                },
+                ModelContextEntry::TodoContext {
+                    text: crate::todos::render_context(&Vec::new(), true),
+                },
+            ]]
         );
         assert!(
             settled
@@ -15755,6 +15799,13 @@ mod tests {
             "{records:?}"
         );
         assert_eq!(openai.request_count(), 2);
+        assert_eq!(
+            openai.requests.lock().unwrap()[0].body["input"],
+            serde_json::json!([
+                {"role": "user", "content": "add 40 and 2"},
+                {"role": "user", "content": crate::todos::render_context(&Vec::new(), true)}
+            ])
+        );
 
         let session = Session::open(home.path(), &session_id).expect("reopen OpenAI session");
         let saved_history = session
@@ -15853,11 +15904,14 @@ mod tests {
                 },
                 {
                     "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": "double-check",
-                        "cache_control": {"type": "ephemeral"}
-                    }]
+                    "content": [
+                        {"type": "text", "text": "double-check"},
+                        {
+                            "type": "text",
+                            "text": crate::todos::render_context(&Vec::new(), true),
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
                 }
             ])
         );
@@ -15996,6 +16050,13 @@ mod tests {
             "{records:?}"
         );
         assert_eq!(openai.request_count(), 2);
+        assert_eq!(
+            openai.requests.lock().unwrap()[0].body["input"],
+            serde_json::json!([
+                {"role": "user", "content": "add 40 and 2"},
+                {"role": "user", "content": crate::todos::render_context(&Vec::new(), true)}
+            ])
+        );
 
         let session = Session::open(home.path(), &session_id).expect("reopen OpenAI session");
         let saved_history = session
@@ -16087,7 +16148,8 @@ mod tests {
                 },
                 {"type": "model_output", "content": [{"type": "text", "text": "Reporting the sum"}]},
                 {"type": "model_output", "content": [{"type": "text", "text": "The sum is 42."}]},
-                {"type": "user_input", "content": [{"type": "text", "text": "double-check"}]}
+                {"type": "user_input", "content": [{"type": "text", "text": "double-check"}]},
+                {"type": "user_input", "content": [{"type": "text", "text": crate::todos::render_context(&Vec::new(), true)}]}
             ])
         );
         let body = body.to_string();
@@ -16243,7 +16305,8 @@ mod tests {
         assert_eq!(
             requests[0].body["input"],
             serde_json::json!([
-                {"type": "user_input", "content": [{"type": "text", "text": "compute 17 * 23"}]}
+                {"type": "user_input", "content": [{"type": "text", "text": "compute 17 * 23"}]},
+                {"type": "user_input", "content": [{"type": "text", "text": crate::todos::render_context(&Vec::new(), true)}]}
             ])
         );
         assert!(requests[1].body.get("tools").is_none());
@@ -16274,7 +16337,8 @@ mod tests {
                     "call_id": "call_1",
                     "name": "execute_python",
                     "result": "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"4\">\n391\n</kiki_output>"
-                }
+                },
+                {"type": "user_input", "content": [{"type": "text", "text": crate::todos::render_context(&Vec::new(), true)}]}
             ])
         );
         session.close().expect("close session");
@@ -17108,6 +17172,27 @@ mod tests {
 
         let contexts = contexts.lock().unwrap();
         assert_eq!(contexts.len(), 5);
+        assert_eq!(
+            contexts[0],
+            [
+                ModelContextEntry::UserRequest {
+                    text: "delegate the first request".to_owned(),
+                },
+                ModelContextEntry::TodoContext {
+                    text: crate::todos::render_context(&Vec::new(), true),
+                },
+            ]
+        );
+        for context in &contexts[..3] {
+            assert_eq!(&context[..2], contexts[0].as_slice());
+            assert_eq!(
+                context
+                    .iter()
+                    .filter(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+                    .count(),
+                1
+            );
+        }
         assert!(matches!(
             contexts[3].as_slice(),
             [
@@ -17116,7 +17201,9 @@ mod tests {
                 ModelContextEntry::CompletedCode(_),
                 ModelContextEntry::FinalMessage { text: final_message, .. },
                 ModelContextEntry::UserRequest { text: clarification },
-            ] if first == "delegate the first request"
+                ModelContextEntry::TodoContext { text: todos },
+            ] if todos == &crate::todos::render_context(&Vec::new(), true)
+                && first == "delegate the first request"
                 && final_message == "first foreground final"
                 && clarification == "clarify the delegated work"
         ));
@@ -17131,6 +17218,7 @@ mod tests {
             ModelContextEntry::UserRequest {
                 text: clarification,
             },
+            ModelContextEntry::TodoContext { text: todos },
             ModelContextEntry::CompletedCode(clarification_result),
         ] = contexts[4].as_slice()
         else {
@@ -17139,6 +17227,7 @@ mod tests {
         assert_eq!(first, "delegate the first request");
         assert_eq!(final_message, "first foreground final");
         assert_eq!(clarification, "clarify the delegated work");
+        assert_eq!(todos, &crate::todos::render_context(&Vec::new(), true));
         let CodeResult::Execution { feedback } = clarification_result.result() else {
             panic!("expected clarification execution feedback");
         };
@@ -18060,7 +18149,10 @@ mod tests {
             .executable
             .expect("executable restore")
             .history;
+        assert_eq!(expected_history.todo_context(), None);
         expected_history.append_user_request("continue");
+        expected_history
+            .replace_todo_context(Some(crate::todos::render_context(&Vec::new(), true)));
         let expected_context = expected_history.entries().to_vec();
         let arena = Arena::new(
             worker_path(),
@@ -18372,7 +18464,9 @@ mod tests {
             .executable
             .expect("sibling branch is executable")
             .history;
+        assert_eq!(sibling_context.todo_context(), None);
         sibling_context.append_user_request("continue sibling");
+        sibling_context.replace_todo_context(Some(crate::todos::render_context(&Vec::new(), true)));
         let mut original_context = session
             .writer()
             .restore_at(fixture.selected_leaf)
@@ -18381,7 +18475,10 @@ mod tests {
             .executable
             .expect("original branch is executable")
             .history;
+        assert_eq!(original_context.todo_context(), None);
         original_context.append_user_request("probe original");
+        original_context
+            .replace_todo_context(Some(crate::todos::render_context(&Vec::new(), true)));
         let root = SessionEntryId(
             u64::try_from(
                 session
@@ -18993,7 +19090,10 @@ mod tests {
         shutdown_controller(commands, controller).await;
 
         let mut expected_context = target_history;
+        assert_eq!(expected_context.todo_context(), None);
         expected_context.append_user_request("continue");
+        expected_context
+            .replace_todo_context(Some(crate::todos::render_context(&Vec::new(), true)));
         assert_eq!(contexts.lock().unwrap()[0], expected_context.entries());
         assert!(continued.iter().any(|event| matches!(
             event,

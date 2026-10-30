@@ -139,6 +139,7 @@ pub(crate) fn prepare(
     reasoning: CrossProviderReasoning,
     focus: &str,
     reason: CompactionReason,
+    generated_context: Option<(SessionEntryId, &str)>,
 ) -> Result<Option<CompactionPreparation>, CompactionError> {
     if reason != CompactionReason::Manual && !policy.enabled() {
         return Ok(None);
@@ -155,6 +156,7 @@ pub(crate) fn prepare(
         destination,
         selection.model().id,
         &active_skills,
+        generated_context,
     );
     if reason == CompactionReason::AutomaticThreshold
         && !exceeds_threshold(
@@ -360,6 +362,7 @@ fn measure_context(
     destination: Destination,
     model_id: &str,
     current_skills: &ActiveSkills,
+    generated_context: Option<(SessionEntryId, &str)>,
 ) -> u64 {
     let projected_entry =
         |index: usize| context_entry(&facts[index]).expect("projected entries are context entries");
@@ -370,6 +373,11 @@ fn measure_context(
         for &later in &projected[position + 1..] {
             bytes = bytes.saturating_add(context_bytes(projected_entry(later), destination));
         }
+        bytes = bytes.saturating_add(
+            generated_context
+                .filter(|(anchor, _)| facts[projected[position]].entry_id <= *anchor)
+                .map_or(0, |(_, text)| byte_len(text)),
+        );
         let previous_bytes = active_text_bytes(&active_skills(&facts[..=projected[position]]));
         let current_bytes = active_text_bytes(current_skills);
         let adjusted = if current_bytes >= previous_bytes {
@@ -386,7 +394,11 @@ fn measure_context(
     for &index in projected {
         bytes = bytes.saturating_add(context_bytes(projected_entry(index), destination));
     }
-    estimate_tokens(bytes.saturating_add(active_text_bytes(current_skills)))
+    estimate_tokens(
+        bytes
+            .saturating_add(active_text_bytes(current_skills))
+            .saturating_add(generated_context.map_or(0, |(_, text)| byte_len(text))),
+    )
 }
 
 fn exceeds_threshold(context_tokens: u64, context_window: u64, reserve_tokens: u64) -> bool {
@@ -884,8 +896,8 @@ mod tests {
 
     use super::{
         CompactionError, Destination, SPLIT_SEPARATOR, SelectedAncestryFact, SelectedAncestryKind,
-        estimate_tokens, exceeds_threshold, output_budget, prepare, serialise_entry,
-        strip_reserved_blocks, truncate_feedback,
+        estimate_tokens, exceeds_threshold, output_budget, serialise_entry, strip_reserved_blocks,
+        truncate_feedback,
     };
     use crate::config::ModelSelection;
     use crate::config::models::{OPUS_5_5, SOL, TERRA};
@@ -902,6 +914,17 @@ mod tests {
     const THRESHOLD: CompactionReason = CompactionReason::AutomaticThreshold;
     const OVERFLOW: CompactionReason = CompactionReason::ContextOverflow;
     const NATIVE: &str = "openai";
+
+    fn prepare(
+        facts: &[super::SelectedAncestryFact],
+        policy: crate::config::CompactionSettings,
+        selection: crate::config::ModelSelection,
+        reasoning: CrossProviderReasoning,
+        focus: &str,
+        reason: CompactionReason,
+    ) -> Result<Option<super::CompactionPreparation>, super::CompactionError> {
+        super::prepare(facts, policy, selection, reasoning, focus, reason, None)
+    }
 
     fn selection() -> ModelSelection {
         ModelSelection::new(&SOL, SOL.default_thinking).unwrap()
@@ -2269,5 +2292,37 @@ mod tests {
             .iter()
             .map(|path| path.as_ref().to_path_buf())
             .collect();
+    }
+    #[test]
+    fn todo_context_budget_is_not_double_counted_after_measured_call() {
+        let facts = vec![
+            user(1, "initial"),
+            code(
+                2,
+                "pass",
+                None,
+                "",
+                b"",
+                "",
+                vec![usage(Some(2000), Some(1900), Some(100))],
+            ),
+            user(3, "tail"),
+        ];
+        let generated = "x".repeat(4000);
+        let measured_context = |capture| {
+            super::prepare(&facts, policy(1), selection(), INLINE, "", MANUAL, capture)
+                .unwrap()
+                .unwrap()
+                .context_tokens()
+        };
+        let baseline = measured_context(None);
+        assert_eq!(
+            measured_context(Some((SessionEntryId(1), generated.as_str()))),
+            baseline
+        );
+        assert_eq!(
+            measured_context(Some((SessionEntryId(2), generated.as_str()))),
+            baseline + 1000
+        );
     }
 }

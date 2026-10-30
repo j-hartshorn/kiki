@@ -355,6 +355,9 @@ pub enum ModelContextEntry {
     CompactionSummary {
         summary: String,
     },
+    TodoContext {
+        text: String,
+    },
     SkillActivation(SkillActivation),
     CompletedCode(CompletedCode),
     FinalMessage {
@@ -425,6 +428,7 @@ impl ModelContextEntry {
             ),
             Self::UserRequest { .. }
             | Self::CompactionSummary { .. }
+            | Self::TodoContext { .. }
             | Self::SkillActivation(_) => return None,
         };
         if replay.provider() == provider {
@@ -480,6 +484,21 @@ impl ModelHistory {
 
     pub fn entries(&self) -> &[ModelContextEntry] {
         &self.entries
+    }
+
+    pub fn replace_todo_context(&mut self, text: Option<String>) {
+        self.entries
+            .retain(|entry| !matches!(entry, ModelContextEntry::TodoContext { .. }));
+        if let Some(text) = text {
+            self.entries.push(ModelContextEntry::TodoContext { text });
+        }
+    }
+
+    pub fn todo_context(&self) -> Option<&str> {
+        self.entries.iter().find_map(|entry| match entry {
+            ModelContextEntry::TodoContext { text } => Some(text.as_str()),
+            _ => None,
+        })
     }
 
     pub fn active_skills(&self) -> impl Iterator<Item = &SkillActivation> + Clone {
@@ -990,6 +1009,79 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn todo_context_replaces_without_accumulating_and_removes_only_generated_entries() {
+        let mut history = history_with_request("original request");
+        history.append_compaction_summary("old TODO state in summary");
+        let ordinary = history.clone();
+        assert_eq!(history.todo_context(), None);
+        history.replace_todo_context(Some("first capture".to_owned()));
+        assert_eq!(history.todo_context(), Some("first capture"));
+        history.append_user_request("next request");
+        history.replace_todo_context(Some("replacement capture".to_owned()));
+        assert_eq!(history.todo_context(), Some("replacement capture"));
+        assert_eq!(history.entries().len(), 4);
+        assert_eq!(&history.entries()[..2], ordinary.entries());
+        assert!(
+            matches!(history.entries().last(), Some(ModelContextEntry::TodoContext { text }) if text == "replacement capture")
+        );
+        history.replace_todo_context(None);
+        assert_eq!(history.todo_context(), None);
+        assert_eq!(history.entries().len(), 3);
+        assert_eq!(&history.entries()[..2], ordinary.entries());
+        assert_eq!(history.entries()[2].user_request(), Some("next request"));
+        history.replace_todo_context(None);
+        assert_eq!(history.entries().len(), 3);
+    }
+
+    #[test]
+    fn todo_context_preserves_capture_chronology_across_code_final_and_skill_appends() {
+        let mut history = ModelHistory::new();
+        assert!(history.entries().is_empty());
+        history.replace_todo_context(Some("capture".to_owned()));
+        let captured = history.clone();
+        history
+            .append_completed_code(
+                "todos.add('newer')".to_owned(),
+                ModelCallId::new("todo-call"),
+                None,
+                "reasoning".to_owned(),
+                replay("opaque-call"),
+                CodeResult::execution("1".to_owned()),
+            )
+            .unwrap();
+        history.append_final_message(
+            "done".to_owned(),
+            "thought".to_owned(),
+            replay("opaque-final"),
+        );
+        history
+            .activate_skill(activation("one", "/user/one", "body".to_owned()))
+            .unwrap();
+        history.append_user_request("continue");
+        history.append_compaction_summary("summary");
+        assert_eq!(history.todo_context(), Some("capture"));
+        assert_eq!(&history.entries()[..1], captured.entries());
+        let ordinary = history.entries()[1..].to_vec();
+        history.replace_todo_context(Some("fresh capture".to_owned()));
+        assert_eq!(&history.entries()[..ordinary.len()], &ordinary);
+        assert_eq!(history.todo_context(), Some("fresh capture"));
+        assert_eq!(history.clone(), history);
+    }
+
+    #[test]
+    fn todo_context_is_not_a_user_request_or_foreign_replay() {
+        let entry = ModelContextEntry::TodoContext {
+            text: "capture".to_owned(),
+        };
+        assert_eq!(entry.user_request(), None);
+        for provider in ["openai", "anthropic", "google"] {
+            for reasoning in [CrossProviderReasoning::Inline, CrossProviderReasoning::Drop] {
+                assert_eq!(entry.foreign_parts(provider, reasoning), None);
+            }
+        }
     }
 
     #[test]

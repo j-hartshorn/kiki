@@ -679,7 +679,7 @@ fn prompt_reference_with_visibility(
         load_skill_visible,
         read_only,
         subagents_visible,
-        crate::todos::TodoPolicy::default(),
+        crate::todos::TodoPolicy::capture(false),
     )
 }
 
@@ -7983,7 +7983,14 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("file"), "before").unwrap();
         let root = tool_host(&workspace).await;
-        let root_reference = prompt_reference(&SkillCatalog::default());
+        let root_reference = super::prompt_reference_with_todo_policy(
+            false,
+            false,
+            true,
+            crate::todos::TodoPolicy::default(),
+        );
+        assert!(root_reference.contains("## TODO list"));
+        assert!(!prompt_reference(&SkillCatalog::default()).contains("## TODO list"));
         assert_eq!(root.prompt_reference(true), root_reference);
         assert_eq!(root.for_child(false).prompt_reference(true), root_reference);
 

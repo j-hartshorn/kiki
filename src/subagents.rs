@@ -8454,14 +8454,20 @@ mod tests {
             assert_eq!(histories.len(), 2);
             assert_eq!(
                 histories[0],
-                [ModelContextEntry::UserRequest {
-                    text: "do the child work".to_owned(),
-                }]
+                [
+                    ModelContextEntry::UserRequest {
+                        text: "do the child work".to_owned(),
+                    },
+                    ModelContextEntry::TodoContext {
+                        text: crate::todos::render_context(&Vec::new(), false),
+                    }
+                ]
             );
             assert!(matches!(
                 histories[1].as_slice(),
                 [
                     ModelContextEntry::UserRequest { .. },
+                    ModelContextEntry::TodoContext { .. },
                     ModelContextEntry::CompletedCode(_)
                 ]
             ));

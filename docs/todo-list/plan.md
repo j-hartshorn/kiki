@@ -274,3 +274,32 @@ that cannot honor the agreed source contract.
   prepares typed generated-context transport and provider serialization tests;
   orchestrator then owns run/compaction capture and budget/cache integration.
   This avoids another oversized delegation and does not change source behavior.
+
+- Task 5: typed generated TodoContext is stored only in the projected ModelHistory
+  cache. Root Run start captures full list+guidance; children capture own data only
+  because their admitted base guide is immutable. Later steps retain that capture;
+  applied compaction refreshes after retained history; failed/no-op/retries do not.
+  Root static guide is omitted so disabled Runs have no generated advertisement.
+  No new durable per-step records or parent/child context merges were introduced.
+- Task 5 budgeting: cache stores capture anchor; generated text is counted when
+  estimated usage predates it, and not double-counted after an eligible measured
+  call. Older opaque baselines can conservatively overestimate until new usage.
+- Task 5 TDD: transport missing-behavior red7fail ->8green; capture timing red4fail
+  ->green; budget red equal[50009,50009] ->counted. Added failed-summary, initial
+  coalescing, and measured-baseline non-double-count tests. 35TODO-related and
+  65Agent tests passed; older context fixtures now explicitly require the new frame.
+- Task 5 verification recovery: direct long calls lost results to Arena timeout.
+  User authorized detached one-shot verification. New-session Python Popen + tee,
+  source snapshot, PID, and exit-code files under ignored target survive tool calls;
+  nohup alone was reaped. No harness timeout change is in this branch. Aborted
+  intermediate suite143 exposed test-gate assertions, which were corrected without
+  changing gates/timeouts. A review worker hit memory; obsolete Arena source/output
+  buffers were pruned and the narrow review succeeded.
+- Task 5 review: production context review CLEAN. Runtime/provider fixture review
+  preserved privacy/replay/cache/cancellation assertions; accepted its enabled-child
+  coverage finding and retained actual enabled reference with expected static guide.
+  No defaults were disabled or generated entries filtered from observed histories.
+- Task 5 final evidence: target/todo-verification/full-context-final.1c8fjz/ has exit0,
+  output.log and matching source.diff. RUST_TEST_THREADS=2 just test passed1816unit
+  +5credentialsCLI+17sessionsCLI,8ignored; justlint/fmtcheck/diffcheck passed. Source
+  snapshot matched before this documentation-only record was appended.
