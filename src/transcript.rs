@@ -1651,13 +1651,21 @@ impl RenderBlock {
         horizontal_padding: u16,
         vertical_padding: u16,
     ) -> Self {
-        let rows = MarkdownRows {
-            breaks: layout.breaks,
-            prefixes: layout.prefixes,
+        let rows = if layout
+            .breaks
+            .iter()
+            .any(|kind| *kind != markdown::LineBreak::Original)
+        {
+            Some(MarkdownRows {
+                breaks: layout.breaks,
+                prefixes: layout.prefixes,
+            })
+        } else {
+            None
         };
         Self::card_with_rows(
             layout.text,
-            Some(rows),
+            rows,
             style,
             width,
             horizontal_padding,
@@ -7087,13 +7095,7 @@ mod tests {
             panic!("expected card")
         };
         assert!(card.text.to_string().contains("| H |"));
-        assert!(
-            card.rows
-                .unwrap()
-                .breaks
-                .iter()
-                .all(|kind| *kind == super::markdown::LineBreak::Original)
-        );
+        assert!(card.rows.is_none());
     }
 
     #[test]
@@ -7224,6 +7226,71 @@ mod tests {
                 layout_buffer(&fresh, area, top, Some(selection))
             );
         }
+    }
+
+    #[test]
+    fn responsive_original_only_markdown_uses_the_ordinary_card_path() {
+        let table = "| H |\n| --- |\n| value |".to_owned();
+        let plain = super::CompactionCard {
+            state: super::ArenaState::Complete,
+            heading: "summary".into(),
+            collapsed: "collapsed".into(),
+            expanded: super::CompactionContent::Plain("plain text".into()),
+            accounting: None,
+        };
+        let cases = [
+            (
+                NormalisedBlock::Assistant {
+                    markdown: "ordinary prose".into(),
+                    accounting: None,
+                },
+                true,
+                true,
+            ),
+            (
+                NormalisedBlock::Assistant {
+                    markdown: table.clone(),
+                    accounting: None,
+                },
+                true,
+                true,
+            ),
+            (
+                NormalisedBlock::Reasoning {
+                    markdown: table.clone(),
+                },
+                false,
+                true,
+            ),
+            (NormalisedBlock::Compaction(plain.clone()), true, true),
+            (NormalisedBlock::Compaction(plain), true, false),
+        ];
+        let mut highlighter = PythonHighlighter::new();
+        for (source, reasoning, expand) in cases {
+            let block = super::build_render_block(
+                &DARK,
+                &source,
+                reasoning,
+                expand,
+                80,
+                &mut highlighter,
+                None,
+            );
+            let super::RenderBlock::Card(card) = block else {
+                panic!("expected card")
+            };
+            assert!(card.rows.is_none(), "{:?}", card.text);
+        }
+        let mixed = NormalisedBlock::Assistant {
+            markdown: "before\n\n| H |\n| --- |\n| one two six ten |".into(),
+            accounting: None,
+        };
+        let block =
+            super::build_render_block(&DARK, &mixed, true, true, 11, &mut highlighter, None);
+        let super::RenderBlock::Card(card) = block else {
+            panic!("expected card")
+        };
+        assert!(card.rows.is_some());
     }
 
     #[test]
