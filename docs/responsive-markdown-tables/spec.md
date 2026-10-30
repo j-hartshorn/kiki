@@ -100,9 +100,13 @@ Never split inside a grapheme. Protect escape sequences and URL scheme prefixes 
 - Preserve the existing rule that resizing invalidates screen-coordinate selections.
 - Zero-width views render no text. Tiny views remain safe without panics, subtraction underflow, or lost stored content. Ordinary word wrapping must not silently become character wrapping; overlong record tokens use only the explicitly agreed exception policy.
 
+## Normal response foreground
+
+Ordinary assistant prose uses the terminal's default foreground, like Pi, rather than the theme's fixed body foreground. This applies to live and settled replies and unstyled text surrounding tables. Preserve semantic Markdown and record colours, authored emphasis, table borders and muted accounting. Grid headers retain their existing explicit theme header colour and bold styling, including in assistant replies. Do not change the global palette, font, fixed-card foregrounds/backgrounds, reasoning, compaction, user/tool/literal surfaces or settings. Terminal foreground can vary with the user's palette; visual validation is still required.
+
 ## Acceptance criteria
 
-1. A naturally fitting table retains its grid layout and semantic styles. Narrowing can produce an aligned wrapped grid before records are needed.
+1. A naturally fitting table retains its grid layout and semantic styles; ordinary assistant text follows the approved terminal-default foreground. Narrowing can produce an aligned wrapped grid before records are needed.
 2. Fixtures needing exactly two and three content lines per row stay grids; a fixture needing four lines in any one row switches the entire table to records. Test the same rule for the header, and exclude separators from the count.
 3. Column allocation is deterministic, keeps short columns compact, and includes border/padding/prefix costs. No completed grid line overflows, even at an exact-fit boundary.
 4. One message can contain tables in all three presentations. Live and settled wide → medium → narrow → wide reflow does not change stored Markdown.

@@ -1049,7 +1049,7 @@ fn assistant_text(
         #[cfg(test)]
         construction_counts,
     );
-    layout.text = own_styled_text(layout.text, page_style(theme));
+    layout.text = own_styled_text(layout.text, page_style(theme).fg(Color::Reset));
     if let Some(accounting) = accounting {
         if !markdown_source.is_empty() {
             layout.push_original(Line::raw(""));
@@ -7340,6 +7340,146 @@ mod tests {
             panic!("expected card")
         };
         assert!(card.rows.is_some());
+    }
+
+    fn drawn_ascii_word_cell<'a>(buffer: &'a Buffer, word: &str) -> &'a ratatui::buffer::Cell {
+        assert!(!word.is_empty() && word.is_ascii());
+        let cells = buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .flat_map(|row| row.windows(word.len()))
+            .find(|cells| {
+                cells
+                    .iter()
+                    .zip(word.bytes())
+                    .all(|(cell, byte)| cell.symbol().as_bytes() == [byte])
+            })
+            .unwrap_or_else(|| panic!("rendered word {word}"));
+        &cells[0]
+    }
+
+    #[test]
+    fn assistant_prose_uses_terminal_foreground_in_live_and_settled_buffers() {
+        let source =
+            "prose **bold** *italics* `code` [link](u)\n\n| Header |\n| --- |\n| one two six ten |";
+        for theme in [&DARK, &LIGHT] {
+            for live in [false, true] {
+                let mut transcript = Transcript::default();
+                if live {
+                    transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+                    assert!(transcript.apply(
+                        RuntimeEvent::ModelProgress {
+                            run_id: RunId(1),
+                            step_id: ModelStepId(1),
+                            epoch: 0,
+                            progress: ModelProgress::AssistantTextChunk {
+                                text: source.into()
+                            }
+                        },
+                        false
+                    ));
+                } else {
+                    transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                        markdown: source.into(),
+                        accounting: None,
+                    }]);
+                }
+                for width in [120, 11, 7] {
+                    let layout = transcript.layout(theme, width);
+                    let fresh = transcript.layout_fresh(theme, width);
+                    let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                    let screen = layout_buffer(&layout, area, 0, None);
+                    assert_eq!(screen, layout_buffer(&fresh, area, 0, None));
+                    let prose = drawn_ascii_word_cell(&screen, "prose");
+                    assert_eq!(prose.fg, Color::Reset, "live={live} width={width}");
+                    assert!(!prose.modifier.contains(Modifier::BOLD));
+                    let bold = drawn_ascii_word_cell(&screen, "bold");
+                    assert_eq!(bold.fg, Color::Reset);
+                    assert!(bold.modifier.contains(Modifier::BOLD));
+                    let italic = drawn_ascii_word_cell(&screen, "italics");
+                    assert_eq!(italic.fg, Color::Reset);
+                    assert!(italic.modifier.contains(Modifier::ITALIC));
+                    assert_eq!(drawn_ascii_word_cell(&screen, "code").fg, theme.md_code);
+                    assert_eq!(drawn_ascii_word_cell(&screen, "link").fg, theme.md_link);
+                    let header = drawn_ascii_word_cell(&screen, "Header");
+                    if screen.content().iter().any(|cell| cell.symbol() == "┌") {
+                        assert_eq!(header.fg, theme.text);
+                        assert!(header.modifier.contains(Modifier::BOLD));
+                        assert_eq!(drawn_ascii_word_cell(&screen, "one").fg, Color::Reset);
+                    } else {
+                        assert_eq!(header.fg, theme.syntax_variable);
+                        assert!(!header.modifier.contains(Modifier::BOLD));
+                        assert_eq!(
+                            drawn_ascii_word_cell(&screen, "one").fg,
+                            theme.syntax_string
+                        );
+                    }
+                    let selection = Selection::new(
+                        DocumentPosition::new(0, 0),
+                        DocumentPosition::new(layout.total_height(), 0),
+                    );
+                    assert_eq!(
+                        layout.extract_selection(selection),
+                        fresh.extract_selection(selection)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_foreground_keeps_fixed_card_and_accounting_styles() {
+        for theme in [&DARK, &LIGHT] {
+            let mut highlighter = PythonHighlighter::new();
+            let sources = [
+                (
+                    NormalisedBlock::Reasoning {
+                        markdown: "steady".into(),
+                    },
+                    theme.thinking_text,
+                    true,
+                ),
+                (
+                    NormalisedBlock::Compaction(super::CompactionCard {
+                        state: super::ArenaState::Complete,
+                        heading: "summary".into(),
+                        collapsed: "hidden".into(),
+                        expanded: super::CompactionContent::Markdown("steady".into()),
+                        accounting: None,
+                    }),
+                    theme.text,
+                    false,
+                ),
+            ];
+            for (source, foreground, italic) in sources {
+                let block = super::build_render_block(
+                    theme,
+                    &source,
+                    true,
+                    true,
+                    80,
+                    &mut highlighter,
+                    None,
+                );
+                let area = Rect::new(0, 0, 80, block.height() as u16);
+                let mut screen = Buffer::empty(area);
+                block.render(area, 0, 0, &mut screen);
+                let cell = drawn_ascii_word_cell(&screen, "steady");
+                assert_eq!(cell.fg, foreground);
+                assert_eq!(cell.modifier.contains(Modifier::ITALIC), italic);
+                assert_ne!(cell.bg, Color::Reset);
+            }
+            let source = NormalisedBlock::Assistant {
+                markdown: "prose".into(),
+                accounting: Some("accounting".into()),
+            };
+            let block =
+                super::build_render_block(theme, &source, true, true, 80, &mut highlighter, None);
+            let area = Rect::new(0, 0, 80, block.height() as u16);
+            let mut screen = Buffer::empty(area);
+            block.render(area, 0, 0, &mut screen);
+            assert_eq!(drawn_ascii_word_cell(&screen, "accounting").fg, theme.muted);
+        }
     }
 
     #[test]

@@ -116,7 +116,7 @@ From the implementation worktree:
 - `cargo fmt --all -- --check`.
 - Manual: resize a table through natural grid, two-/three-line wrapped grid, and records in both directions and both themes. Include another compact table in the message. Repeat with reasoning and expanded compaction; scroll and copy both wrapped grids and records.
 
-Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdown-tables` for implementation. No session codec, model prompt, or unrelated renderer changes. Implementation verification is recorded below; interactive real-terminal validation remains a user check.
+Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdown-tables` for implementation. No session codec, model prompt, or unrelated renderer changes. Implementation verification is recorded below; the user accepted the terminal appearance after the feedback iterations. No detailed per-case manual transcript is claimed.
 
 ## Evidence
 
@@ -144,12 +144,12 @@ Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdow
 
 ## Verification evidence
 
-- `just test`: exit 0, 1857 unit tests passed, 8 pre-existing ignored; 5 credentials and 17 sessions integration tests passed.
+- `just test`: exit 0, 1859 unit tests passed, 8 pre-existing ignored; 5 credentials and 17 sessions integration tests passed.
 - `just lint`: exit 0.
 - `cargo fmt --all -- --check`: exit 0.
 - `git diff --check`: exit 0.
 - Reviewed rendered previews at natural-grid, wrapped-grid, record, and restored-wide widths. Automated TUI coverage includes both themes, bottom-follow/manual scroll, resize selection invalidation, and mouse-copy of wrapped URLs.
-- Still requires user validation: actual-terminal appearance and interactive resize/copy with real assistant output, visible reasoning, and expanded compaction. No live provider request or rollout was performed.
+- User accepted the final terminal result after visual feedback. Automated tests cover resize/copy/themes and reasoning/compaction integration; no detailed per-case manual transcript is claimed. No live provider request or rollout was performed.
 
 ## Final review status
 
@@ -157,7 +157,7 @@ Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdow
 - Independent simplification findings are resolved: layout-owned original-line mutations, ordinary-card rendering for all-original layouts, and indexed slicing in both wrapping paths. No Borderline decision remains.
 - Optional nit declined: keep the small no-break-space predicates local rather than introduce coupling between selection and Markdown solely to share three characters.
 - Feature changes were reviewed from merge-base `88986ee`; `main` independently advanced to `eea23ae` with unrelated scrolling/completion work. No rebase or merge was performed; recorded tests apply to the feature worktree, not a combined integration with newer `main`.
-- Final-review fixes await user approval before atomic commits. The user reported uneven border weight during terminal validation; investigation reproduced differing horizontal/vertical colours after card styling. Horizontal grid borders now carry explicit span styles like vertical borders, fixing the minimal and broader rendered cases. The shared ownership helper and all non-table Markdown styling remain unchanged; user retesting remains pending. Record quoting/highlighting is implemented and verified; the approved normal-response foreground task remains pending.
+- The user accepted the final result and approved atomic final-review fix commits. The user reported uneven border weight during terminal validation; investigation reproduced differing horizontal/vertical colours after card styling. Horizontal grid borders now carry explicit span styles like vertical borders, fixing the minimal and broader rendered cases. The shared ownership helper and all non-table Markdown styling remain unchanged; user retesting was accepted by their final confirmation. Record quoting/highlighting and normal-response foreground revisions are implemented, verified and accepted by the user.
 
 ## Approved feedback revision
 
@@ -185,7 +185,7 @@ The user approved plain numeric/safe string display, colour-only record highligh
 
 **Verify:** focused scalar/style/border/rendered-copy/reflow tests, `just test`, `just lint`, `cargo fmt --all -- --check`, `git diff --check`; then targeted correctness and simplification review. User checks both themes with resize/copy, reasoning and expanded compaction. Task-sized signed-off commits remain deferred to final approval; existing final-review fixes retain separate atomic commits. No merge or rebase.
 
-- Feedback review evidence: table-only border fix recheck SHIP. Record proposal review findings were addressed; the final special-number wording was mechanically corrected against pinned `yaml-rust2 0.13.0` (`src/yaml.rs:63–72,690–717`). The user subsequently approved the revision, with colour rather than generated bold; implementation is verified; final user terminal validation remains pending.
+- Feedback review evidence: table-only border fix recheck SHIP. Record proposal review findings were addressed; the final special-number wording was mechanically corrected against pinned `yaml-rust2 0.13.0` (`src/yaml.rs:63–72,690–717`). The user subsequently approved the revision, with colour rather than generated bold; implementation is verified and the final terminal result was accepted by the user.
 
 ### 7. Match Pi's normal-response foreground
 
@@ -201,4 +201,22 @@ The user approved plain numeric/safe string display, colour-only record highligh
 
 - Header extraction is neutral; constrained-grid header styles are taken from a pinned-renderer template and applied last, matching natural grids even when inline code/links are present. Authored inline styles remain intact in records, without generated header or colon bold.
 - Decimal display classification uses ASCII syntax filtering plus standard float parsing, preserving the source spelling. Scalar formatting reads span contents directly because Span display truncates at newlines; escaping occurs before physical wrapping.
-- Red: 123/42 were quoted and record keys used the old foreground. Green: focused Markdown (66 tests), responsive transcript (15 tests), `just test` (1857 unit passed,8 pre-existing ignored;22 integration passed), lint/fmt/diff checks. Task review found missing escape/special-string colour assertions; these were added through real Markdown in both themes and pass. Production code had no review finding; commits remain deferred.
+- Red: 123/42 were quoted and record keys used the old foreground. Green: focused Markdown (66 tests), responsive transcript (15 tests), `just test` (1857 unit passed,8 pre-existing ignored;22 integration passed), lint/fmt/diff checks. Task review found missing escape/special-string colour assertions; these were added through real Markdown in both themes and pass. Production code had no review finding; final acceptance authorized the task-sized commits.
+
+### Task 7 implementation evidence
+
+- Only `assistant_text` base ownership changes to `page_style(theme).fg(Color::Reset)`. Shared ownership, global palette and fixed-card styles are unchanged. Grid headers retain the explicit theme header style; ordinary grid cells inherit terminal foreground and record fields retain role colours.
+- Red: actual settled prose drew RGB(222,224,225) instead of terminal-default foreground. Green: live/settled, cached/fresh, both-theme rendered-buffer checks at natural/wrapped/record widths, code/link/emphasis and header/field styles, plus unchanged reasoning/compaction/accounting checks.
+- Current full validation: `just test` exit0 (1859 unit passed,8 pre-existing ignored;5 credentials+17 sessions integration), `just lint` exit0, formatting and diff checks exit0. The initial broad `foreground_` filter also matched worker-dependent runtime tests; exact transcript filters and the configured `just test` suite were used for valid verification.
+- All final-feedback work remains uncommitted pending final approval. Actual-terminal appearance/resize/copy must still be checked by the user or explicitly waived; no rollout, rebase or merge performed.
+
+### Final feedback review gate
+
+- Final whole-branch review: SHIP, including Tasks6/7 and closure of the escape/special-string colour coverage finding. No Must-fix or Should findings remain.
+- Final simplification recheck: CLEAN; no Clear now or Borderline opportunities remain.
+- Documentation-only review nits corrected. Latest code verification remains the passing 1859-unit/22-integration full run, lint, formatting and diff checks; no code/dependency/config changes followed it.
+- The user accepted the terminal result and approved final task-sized commits. Root main remains unmerged; tests apply to the feature worktree rather than integration with independently advanced main.
+
+### User acceptance
+
+The user confirmed the terminal result: “Looks great, happy with that.” This accepts the final visual result and authorizes the final task-sized commits. Automated resize, copy, theme and cache checks remain recorded above; no detailed per-case manual transcript is claimed. No rollout, merge or rebase is authorized or performed.
