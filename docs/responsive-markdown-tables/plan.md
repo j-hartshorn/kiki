@@ -151,3 +151,5 @@ Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdow
 - Final performance/correctness fix: cached grapheme-prefix widths, styled-span indexing and protection masks bound narrow wrapping work; all widths/padding match the graphemes drawn by Paragraph. Deterministic large-token/many-span regressions and actual Unicode copy/grid checks cover this path.
 
 - Final copy fix: non-breaking spaces (U+00A0/U+2007/U+202F) remain inside word groups and are preserved during extraction, including emergency-token continuation rows. Both wrapper and actual rendered-copy regressions cover the policy.
+
+- Border feedback fix: horizontal grid borders now carry explicit span-level border colour, matching vertical borders after card ownership. The shared ownership helper and other Markdown styling stay unchanged. Actual-buffer regressions cover both themes and required grid cases.

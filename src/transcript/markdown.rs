@@ -525,7 +525,7 @@ fn constrained_grid(
             text.push_str(&"─".repeat(width + 2));
         }
         text.push(right);
-        Line::styled(text, border_style)
+        Line::from(Span::styled(text, border_style))
     };
     let mut lines = vec![border('┌', '┬', '┐')];
     for (row_index, cells) in rows.iter().enumerate() {

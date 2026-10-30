@@ -7229,6 +7229,55 @@ mod tests {
     }
 
     #[test]
+    fn feedback_table_borders_have_uniform_weight_in_rendered_buffers() {
+        for theme in [&DARK, &LIGHT] {
+            for source in [
+                "| |\n|-|\n|a b|",
+                "| H |\n| --- |\n| one two six |",
+                "| **A** | B |\n| :--- | ---: |\n| **one** *two* `six` | 東京 |\n| plain words | 12 |",
+                "> | H |\n> | --- |\n> | **one** *two* `six` |",
+                "- | H |\n  | --- |\n  | **one** *two* `six` |",
+            ] {
+                for width in [80, 24, 20, 11, 8, 5] {
+                    let mut transcript = Transcript::default();
+                    transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                        markdown: source.into(),
+                        accounting: None,
+                    }]);
+                    let layout = transcript.layout(theme, width);
+                    let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                    let buffer = layout_buffer(&layout, area, 0, None);
+                    let borders = buffer
+                        .content()
+                        .iter()
+                        .filter(|cell| {
+                            cell.symbol()
+                                .chars()
+                                .all(|ch| ('\u{2500}'..='\u{257f}').contains(&ch))
+                        })
+                        .collect::<Vec<_>>();
+                    if width == 80 || source == "| |\n|-|\n|a b|" {
+                        assert!(
+                            !borders.is_empty(),
+                            "expected a grid at width {width}: {source}"
+                        );
+                    }
+                    if let Some(first) = borders.first() {
+                        assert_eq!(
+                            first.fg, theme.border_muted,
+                            "border colour at width {width}: {source}"
+                        );
+                        assert!(
+                            borders.iter().all(|cell| cell.style() == first.style()),
+                            "border styles differ at width {width} for {source}: {borders:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn responsive_original_only_markdown_uses_the_ordinary_card_path() {
         let table = "| H |\n| --- |\n| value |".to_owned();
         let plain = super::CompactionCard {
