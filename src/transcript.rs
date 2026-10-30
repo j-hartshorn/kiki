@@ -207,14 +207,6 @@ fn markdown_layout(
     markdown::render(source, width, markdown_options(theme))
 }
 
-fn append_markdown_line(layout: &mut markdown::MarkdownLayout, line: Line<'static>) {
-    layout.text.lines.push(line);
-    layout.breaks.push(markdown::LineBreak::Original);
-    if !layout.prefixes.is_empty() {
-        layout.prefixes.push(0);
-    }
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 enum RunState {
     #[default]
@@ -1060,12 +1052,9 @@ fn assistant_text(
     layout.text = own_styled_text(layout.text, page_style(theme));
     if let Some(accounting) = accounting {
         if !markdown_source.is_empty() {
-            append_markdown_line(&mut layout, Line::raw(""));
+            layout.push_original(Line::raw(""));
         }
-        append_markdown_line(
-            &mut layout,
-            accounting_line(accounting, muted_page_style(theme)),
-        );
+        layout.push_original(accounting_line(accounting, muted_page_style(theme)));
     }
     layout
 }
@@ -3826,16 +3815,12 @@ fn build_render_block(
             } else {
                 markdown::MarkdownLayout::original(Text::raw(card.collapsed.clone()))
             };
-            layout.text.lines.insert(0, Line::raw(card.heading.clone()));
-            layout.breaks.insert(0, markdown::LineBreak::Original);
-            if !layout.prefixes.is_empty() {
-                layout.prefixes.insert(0, 0);
-            }
+            layout.prepend_original(Line::raw(card.heading.clone()));
             if expand_arenas && let Some(accounting) = &card.accounting {
-                append_markdown_line(
-                    &mut layout,
-                    accounting_line(accounting.clone(), muted_card_style(theme, background)),
-                );
+                layout.push_original(accounting_line(
+                    accounting.clone(),
+                    muted_card_style(theme, background),
+                ));
             }
             layout.text = own_styled_text(layout.text, style);
             RenderBlock::markdown_card(layout, style, width, 1, 1)

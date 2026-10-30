@@ -24,6 +24,22 @@ pub(super) struct MarkdownLayout {
 }
 
 impl MarkdownLayout {
+    pub(super) fn push_original(&mut self, line: Line<'static>) {
+        self.text.lines.push(line);
+        self.breaks.push(LineBreak::Original);
+        if !self.prefixes.is_empty() {
+            self.prefixes.push(0);
+        }
+    }
+
+    pub(super) fn prepend_original(&mut self, line: Line<'static>) {
+        self.text.lines.insert(0, line);
+        self.breaks.insert(0, LineBreak::Original);
+        if !self.prefixes.is_empty() {
+            self.prefixes.insert(0, 0);
+        }
+    }
+
     pub(super) fn original(text: Text<'static>) -> Self {
         let breaks = vec![LineBreak::Original; text.lines.len()];
         Self {
@@ -983,6 +999,36 @@ mod tests {
             Line::from(Span::styled("FIRST", Style::new().bold())),
             Line::from(Span::styled("SECOND", Style::new().italic())),
         ]))
+    }
+
+    #[test]
+    fn original_line_mutations_keep_break_and_prefix_alignment() {
+        let mut original = MarkdownLayout::original(Text::from("body"));
+        original.push_original(Line::from("footer"));
+        original.prepend_original(Line::from("header"));
+        assert_eq!(original.text.to_string(), "header\nbody\nfooter");
+        assert_eq!(original.breaks, vec![LineBreak::Original; 3]);
+        assert!(original.prefixes.is_empty());
+
+        let mut prepared = MarkdownLayout::hard(Text::from("first\ncontinuation"));
+        prepared.breaks[1] = LineBreak::Token;
+        prepared.prefixes = vec![0, 2];
+        prepared.push_original(Line::from("footer"));
+        prepared.prepend_original(Line::from("header"));
+        assert_eq!(
+            prepared.text.to_string(),
+            "header\nfirst\ncontinuation\nfooter"
+        );
+        assert_eq!(
+            prepared.breaks,
+            [
+                LineBreak::Original,
+                LineBreak::Hard,
+                LineBreak::Token,
+                LineBreak::Original
+            ]
+        );
+        assert_eq!(prepared.prefixes, [0, 0, 2, 0]);
     }
 
     #[test]

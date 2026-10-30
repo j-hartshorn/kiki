@@ -144,3 +144,4 @@ Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdow
 - `git diff --check`: exit 0.
 - Reviewed rendered previews at natural-grid, wrapped-grid, record, and restored-wide widths. Automated TUI coverage includes both themes, bottom-follow/manual scroll, resize selection invalidation, and mouse-copy of wrapped URLs.
 - Still requires user validation: actual-terminal appearance and interactive resize/copy with real assistant output, visible reasoning, and expanded compaction. No live provider request or rollout was performed.
+- Final simplification: `MarkdownLayout::push_original` and `prepend_original` own line/break/prefix synchronization for accounting and compaction headings; parent rendering no longer edits those parallel collections directly.
