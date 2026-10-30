@@ -1,14 +1,32 @@
 use std::ops::Range;
 
+use ratatui::buffer::CellWidth;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{LineBreak, MarkdownLayout};
 
+fn grapheme_width(symbol: &str) -> usize {
+    if symbol.chars().any(char::is_control) {
+        0
+    } else {
+        usize::from(symbol.cell_width())
+    }
+}
+
+pub(super) fn display_width(line: &Line<'_>) -> usize {
+    line.styled_graphemes(Style::default())
+        .map(|grapheme| grapheme_width(grapheme.symbol))
+        .sum()
+}
+
 pub(super) fn minimum_width(line: &Line<'_>, protected: &[Range<usize>]) -> usize {
-    word_ranges(&line.to_string(), protected)
+    let content = line.to_string();
+    let widths = RecordWidths::new(line, &content);
+    word_ranges(&content, protected)
         .into_iter()
-        .map(|range| slice(line, range).width())
+        .map(|range| widths.width(range))
         .max()
         .unwrap_or(0)
 }
@@ -22,20 +40,21 @@ pub(super) fn wrap_words(
     if width == 0 && !content.is_empty() {
         return None;
     }
+    let widths = RecordWidths::new(line, &content);
     let mut lines = Vec::new();
     let mut breaks = vec![LineBreak::Hard];
     let mut start = None;
     let mut end = 0;
     for token in word_ranges(&content, protected) {
-        if slice(line, token.clone()).width() > width {
+        if widths.width(token.clone()) > width {
             return None;
         }
         if let Some(first) = start {
-            if slice(line, first..token.end).width() <= width {
+            if widths.width(first..token.end) <= width {
                 end = token.end;
                 continue;
             }
-            lines.push(slice(line, first..end));
+            lines.push(widths.slice(first..end));
             breaks.push(if end < token.start {
                 LineBreak::Word
             } else {
@@ -45,7 +64,7 @@ pub(super) fn wrap_words(
         start = Some(token.start);
         end = token.end;
     }
-    lines.push(slice(line, start.unwrap_or(0)..end));
+    lines.push(widths.slice(start.unwrap_or(0)..end));
     Some(MarkdownLayout {
         text: Text::from(lines),
         breaks,
@@ -74,18 +93,28 @@ pub(super) fn wrap_records(
     } else if !content.is_empty() {
         tokens.push(0..content.len());
     }
-    let units = record_units(&content, &tokens);
+    let widths = RecordWidths::new(line, &content);
+    let mut protected_breaks = vec![false; content.len() + 1];
+    let mut protected_separators = vec![false; content.len()];
+    for unit in record_units(&content, &tokens) {
+        #[cfg(test)]
+        UNIT_VISITS.with(|visits| visits.set(visits.get() + unit.len()));
+        protected_separators[unit.clone()].fill(true);
+        if widths.width(unit.clone()) <= width {
+            protected_breaks[unit.start + 1..unit.end].fill(true);
+        }
+    }
     let mut lines = Vec::new();
     let mut breaks = Vec::new();
     let mut current: Option<Range<usize>> = None;
     let mut next_break = LineBreak::Hard;
     for mut token in tokens {
         if let Some(range) = current.take() {
-            if slice(line, range.start..token.end).width() <= width {
+            if widths.width(range.start..token.end) <= width {
                 current = Some(range.start..token.end);
                 continue;
             }
-            lines.push(slice(line, range.clone()));
+            lines.push(widths.slice(range.clone()));
             breaks.push(next_break);
             next_break = if range.end < token.start {
                 LineBreak::Word
@@ -93,19 +122,26 @@ pub(super) fn wrap_records(
                 LineBreak::Token
             };
         }
-        while slice(line, token.clone()).width() > width {
-            let end = record_break(line, &content, token.clone(), width, &units);
+        while widths.width(token.clone()) > width {
+            let end = record_break(
+                &widths,
+                &content,
+                token.clone(),
+                width,
+                &protected_breaks,
+                &protected_separators,
+            );
             if end == token.end {
                 break;
             }
-            lines.push(slice(line, token.start..end));
+            lines.push(widths.slice(token.start..end));
             breaks.push(next_break);
             next_break = LineBreak::Token;
             token.start = end;
         }
         current = Some(token);
     }
-    lines.push(slice(line, current.unwrap_or(0..0)));
+    lines.push(widths.slice(current.unwrap_or(0..0)));
     breaks.push(next_break);
     MarkdownLayout {
         text: Text::from(lines),
@@ -149,6 +185,7 @@ fn record_units(content: &str, tokens: &[Range<usize>]) -> Vec<Range<usize>> {
             offset += content[offset..].chars().next().unwrap().len_utf8();
         }
     }
+    let mut schemes = Vec::new();
     for token in tokens {
         let text = &content[token.clone()];
         let prefix = text.trim_start_matches(['"', '(']);
@@ -162,24 +199,118 @@ fn record_units(content: &str, tokens: &[Range<usize>]) -> Vec<Range<usize>> {
             let end = token.start + text.len() - prefix.len() + scheme + 3;
             let host = content[end..token.end].graphemes(true).next().unwrap_or("");
             let mut host_end = end + host.len();
-            for unit in &units {
-                if unit.start < host_end && host_end < unit.end {
-                    host_end = unit.end;
-                }
+            let index = units.partition_point(|unit| {
+                #[cfg(test)]
+                UNIT_VISITS.with(|visits| visits.set(visits.get() + 1));
+                unit.end <= host_end
+            });
+            if let Some(unit) = units.get(index)
+                && unit.start < host_end
+            {
+                host_end = unit.end;
             }
             // Keep the first host unit whole, including an overlapping escape.
-            units.push(token.start..host_end);
+            schemes.push(token.start..host_end);
         }
     }
+    units.extend(schemes);
     units
 }
 
+struct RecordWidths<'a> {
+    line: &'a Line<'a>,
+    span_ends: Vec<usize>,
+    prefixes: Vec<(usize, usize)>,
+}
+
+impl<'a> RecordWidths<'a> {
+    fn new(line: &'a Line<'a>, content: &str) -> Self {
+        let mut offset = 0;
+        let span_ends = line
+            .spans
+            .iter()
+            .map(|span| {
+                offset += span.content.len();
+                offset
+            })
+            .collect();
+        let mut widths = Self {
+            line,
+            span_ends,
+            prefixes: vec![(0, 0)],
+        };
+        let mut total = 0;
+        for (start, grapheme) in content.grapheme_indices(true) {
+            let end = start + grapheme.len();
+            total += widths.exact(start..end);
+            widths.prefixes.push((end, total));
+        }
+        widths
+    }
+
+    fn summed(&self, range: Range<usize>) -> Option<usize> {
+        let first = self
+            .prefixes
+            .binary_search_by_key(&range.start, |(offset, _)| *offset)
+            .ok()?;
+        let last = self
+            .prefixes
+            .binary_search_by_key(&range.end, |(offset, _)| *offset)
+            .ok()?;
+        Some(self.prefixes[last].1 - self.prefixes[first].1)
+    }
+
+    fn width(&self, range: Range<usize>) -> usize {
+        self.summed(range.clone())
+            .unwrap_or_else(|| self.exact(range))
+    }
+
+    fn slice(&self, range: Range<usize>) -> Line<'static> {
+        let first_span = self.span_ends.partition_point(|end| *end <= range.start);
+        let offset = if first_span == 0 {
+            0
+        } else {
+            self.span_ends[first_span - 1]
+        };
+        slice_from(self.line, range, first_span, offset)
+    }
+
+    fn exact(&self, range: Range<usize>) -> usize {
+        #[cfg(test)]
+        MEASURED_BYTES.with(|bytes| bytes.set(bytes.get() + range.len()));
+        let first_span = self.span_ends.partition_point(|end| *end <= range.start);
+        let mut offset = if first_span == 0 {
+            0
+        } else {
+            self.span_ends[first_span - 1]
+        };
+        let mut width = 0;
+        for span in &self.line.spans[first_span..] {
+            let end = offset + span.content.len();
+            let first = range.start.max(offset);
+            let last = range.end.min(end);
+            if first < last {
+                width += span.content[first - offset..last - offset]
+                    .graphemes(true)
+                    .map(grapheme_width)
+                    .sum::<usize>();
+            }
+            offset = end;
+            if offset >= range.end {
+                break;
+            }
+        }
+        width
+    }
+}
+
 fn record_break(
-    line: &Line<'_>,
+    widths: &RecordWidths<'_>,
     content: &str,
     token: Range<usize>,
     width: usize,
-    units: &[Range<usize>],
+    protected_breaks: &[bool],
+    protected_separators: &[bool],
 ) -> usize {
     let mut separators = [None; 4];
     let mut fallback = None;
@@ -187,20 +318,17 @@ fn record_break(
     for (offset, grapheme) in content[token.clone()].grapheme_indices(true) {
         let start = token.start + offset;
         let end = start + grapheme.len();
-        if units.iter().any(|unit| {
-            unit.start < end && end < unit.end && slice(line, unit.start..unit.end).width() <= width
-        }) {
+        #[cfg(test)]
+        UNIT_VISITS.with(|visits| visits.set(visits.get() + 1));
+        if protected_breaks[end] {
             continue;
         }
         first = end;
-        if slice(line, token.start..end).width() > width {
+        if widths.width(token.start..end) > width {
             break;
         }
         fallback = Some(end);
-        if units
-            .iter()
-            .any(|unit| unit.start <= start && start < unit.end)
-        {
+        if protected_separators[start] {
             continue;
         }
         let tier = match grapheme {
@@ -255,14 +383,30 @@ fn word_ranges(content: &str, protected: &[Range<usize>]) -> Vec<Range<usize>> {
     words
 }
 
-fn slice(line: &Line<'_>, range: Range<usize>) -> Line<'static> {
-    let mut offset = 0;
+#[cfg(test)]
+thread_local! {
+    static SPAN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SLICED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MEASURED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UNIT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn slice_from(
+    line: &Line<'_>,
+    range: Range<usize>,
+    first_span: usize,
+    mut offset: usize,
+) -> Line<'static> {
     let mut spans = Vec::new();
-    for span in &line.spans {
+    for span in &line.spans[first_span..] {
+        #[cfg(test)]
+        SPAN_VISITS.with(|visits| visits.set(visits.get() + 1));
         let end = offset + span.content.len();
         let first = range.start.max(offset);
         let last = range.end.min(end);
         if first < last {
+            #[cfg(test)]
+            SLICED_BYTES.with(|bytes| bytes.set(bytes.get() + last - first));
             spans.push(Span::styled(
                 span.content[first - offset..last - offset].to_owned(),
                 span.style,
@@ -530,6 +674,163 @@ mod tests {
             text.push_str(&line.to_string());
         }
         text
+    }
+
+    #[test]
+    fn records_measure_the_graphemes_the_renderer_draws() {
+        let layout = assert_records(
+            &Line::from("abⵏ⵿ⴾ"),
+            1,
+            &[],
+            &["a", "b", "ⵏ⵿", "ⴾ"],
+            &[
+                LineBreak::Hard,
+                LineBreak::Token,
+                LineBreak::Token,
+                LineBreak::Token,
+            ],
+        );
+        assert_eq!(copied(&layout), "abⵏ⵿ⴾ");
+    }
+
+    #[test]
+    fn records_keep_non_additive_token_measurement_bounded() {
+        let token = "ⵏ⵿ⴾa".repeat(2_000);
+        let protected = std::iter::once(0..token.len()).collect::<Vec<_>>();
+        MEASURED_BYTES.with(|bytes| bytes.set(0));
+        let layout = wrap_records(&Line::from(token.as_str()), 2, &protected);
+        let measured = MEASURED_BYTES.with(std::cell::Cell::get);
+        assert_eq!(copied(&layout), token);
+        assert!(layout.text.lines.iter().all(|row| row.width() <= 2));
+        assert!(measured <= token.len() * 16, "{measured} measured bytes");
+    }
+
+    #[test]
+    fn grids_do_not_rescan_preceding_styled_spans_for_each_row() {
+        let spans = (0..3000)
+            .map(|index| {
+                Span::styled(
+                    "x ",
+                    if index % 2 == 0 {
+                        Style::new().bold()
+                    } else {
+                        Style::new().italic()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let line = Line::from(spans);
+        SPAN_VISITS.with(|visits| visits.set(0));
+        let layout = wrap_words(&line, 1).expect("one-column words fit");
+        let visits = SPAN_VISITS.with(std::cell::Cell::get);
+        assert_eq!(layout.text.lines.len(), line.spans.len());
+        assert_eq!(copied(&layout), line.to_string().trim_end());
+        for (row, span) in layout.text.lines.iter().zip(&line.spans) {
+            assert_eq!(row.spans, [Span::styled("x", span.style)]);
+        }
+        assert!(
+            visits <= line.spans.len() * 2,
+            "{visits} source-span visits"
+        );
+    }
+
+    #[test]
+    fn records_do_not_rescan_preceding_styled_spans_for_each_row() {
+        let line = Line::from(
+            (0..3_000)
+                .map(|index| {
+                    Span::styled(
+                        "a",
+                        if index % 2 == 0 {
+                            Style::new().bold()
+                        } else {
+                            Style::new().italic()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        SPAN_VISITS.with(|visits| visits.set(0));
+        let layout = wrap_records(&line, 1, &[]);
+        let visits = SPAN_VISITS.with(std::cell::Cell::get);
+        assert_eq!(copied(&layout), "a".repeat(3_000));
+        for (row, original) in layout.text.lines.iter().zip(&line.spans) {
+            assert_eq!(row.spans[0].style, original.style);
+        }
+        assert!(
+            visits <= line.spans.len() * 4,
+            "{visits} source-span visits"
+        );
+    }
+
+    #[test]
+    fn records_copy_large_separator_free_tokens_with_linear_work() {
+        let token = "a".repeat(50_000);
+        for width in [1, 80] {
+            SLICED_BYTES.with(|bytes| bytes.set(0));
+            MEASURED_BYTES.with(|bytes| bytes.set(0));
+            let layout = wrap_records(&Line::from(token.as_str()), width, &[]);
+            let sliced_bytes = SLICED_BYTES.with(std::cell::Cell::get);
+            let measured_bytes = MEASURED_BYTES.with(std::cell::Cell::get);
+            assert!(
+                measured_bytes <= token.len() * 8,
+                "{measured_bytes} measured bytes at width {width}"
+            );
+            assert_eq!(copied(&layout), token);
+            assert_eq!(layout.text.lines.len(), token.len().div_ceil(width));
+            for (index, row) in layout.text.lines.iter().enumerate() {
+                let start = index * width;
+                assert_eq!(
+                    row.to_string(),
+                    token[start..(start + width).min(token.len())]
+                );
+                assert_eq!(
+                    layout.breaks[index],
+                    if index == 0 {
+                        LineBreak::Hard
+                    } else {
+                        LineBreak::Token
+                    }
+                );
+            }
+            assert!(layout.prefixes.is_empty());
+            assert!(
+                sliced_bytes <= token.len() * 4,
+                "{sliced_bytes} copied bytes at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn records_scan_large_escape_tokens_with_linear_work() {
+        for token in [
+            "%2F".repeat(2_000),
+            format!("\"{}\"", r"\u0000".repeat(1_000)),
+        ] {
+            for width in [1, 80] {
+                SLICED_BYTES.with(|bytes| bytes.set(0));
+                MEASURED_BYTES.with(|bytes| bytes.set(0));
+                UNIT_VISITS.with(|visits| visits.set(0));
+                let layout = wrap_records(&Line::from(token.as_str()), width, &[]);
+                let sliced_bytes = SLICED_BYTES.with(std::cell::Cell::get);
+                let measured_bytes = MEASURED_BYTES.with(std::cell::Cell::get);
+                let unit_visits = UNIT_VISITS.with(std::cell::Cell::get);
+                assert_eq!(copied(&layout), token);
+                assert!(layout.text.lines.iter().all(|row| row.width() <= width));
+                assert!(
+                    measured_bytes <= token.len() * 8,
+                    "{measured_bytes} measured bytes at width {width}"
+                );
+                assert!(
+                    unit_visits <= token.len() * 16,
+                    "{unit_visits} unit visits at width {width}"
+                );
+                assert!(
+                    sliced_bytes <= token.len() * 4,
+                    "{sliced_bytes} copied bytes at width {width}"
+                );
+            }
+        }
     }
 
     #[test]

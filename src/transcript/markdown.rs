@@ -97,7 +97,11 @@ pub(super) fn render(
     render_with(source, content_width, options, |table, width| {
         let natural = natural_columns(table);
         let natural_width = natural.iter().sum::<usize>() + natural.len() * 3 + 1;
-        if natural_width <= usize::from(width) {
+        let renderer_widths_match = std::iter::once(&table.header)
+            .chain(&table.rows)
+            .flatten()
+            .all(|cell| cell.line.width() == wrapping::display_width(&cell.line));
+        if natural_width <= usize::from(width) && renderer_widths_match {
             None
         } else {
             Some(
@@ -437,7 +441,7 @@ fn natural_columns(table: &Table) -> Vec<usize> {
     let mut widths = vec![1; table.alignments.len()];
     for row in std::iter::once(&table.header).chain(&table.rows) {
         for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.line.width());
+            *width = (*width).max(wrapping::display_width(&cell.line));
         }
     }
     widths
@@ -535,7 +539,7 @@ fn constrained_grid(
             for (column, (&width, cell)) in widths.iter().zip(cells).enumerate() {
                 let empty = Line::default();
                 let line = cell.text.lines.get(y).unwrap_or(&empty);
-                let padding = width.saturating_sub(line.width());
+                let padding = width.saturating_sub(wrapping::display_width(line));
                 let left = match table.alignments[column] {
                     Alignment::Right => padding,
                     Alignment::Center => padding / 2,

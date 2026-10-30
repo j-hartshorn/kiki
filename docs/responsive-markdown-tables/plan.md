@@ -147,3 +147,5 @@ Use `work/responsive-markdown-tables` and matching `worktrees/responsive-markdow
 - Final simplification: `MarkdownLayout::push_original` and `prepend_original` own line/break/prefix synchronization for accounting and compaction headings; parent rendering no longer edits those parallel collections directly.
 
 - Final simplification: all-Original Markdown layouts retain the ordinary-card rendering path; mixed/prepared layouts keep row metadata. Regression coverage includes prose, fitting tables, reasoning and compaction.
+
+- Final performance/correctness fix: cached grapheme-prefix widths, styled-span indexing and protection masks bound narrow wrapping work; all widths/padding match the graphemes drawn by Paragraph. Deterministic large-token/many-span regressions and actual Unicode copy/grid checks cover this path.

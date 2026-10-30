@@ -7294,6 +7294,36 @@ mod tests {
     }
 
     #[test]
+    fn responsive_unicode_records_measure_the_graphemes_the_terminal_draws() {
+        let value = "abⵏ⵿ⴾ";
+        for width in [2, 8, 40] {
+            let mut transcript = Transcript::default();
+            transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                markdown: format!("| H |\n| --- |\n| `{value}` |"),
+                accounting: None,
+            }]);
+            let layout = transcript.layout(&DARK, width);
+            let copied = layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            ));
+            if width < 40 {
+                assert_eq!(copied, format!("- H: {value}"));
+            } else {
+                assert!(copied.contains(value));
+                let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                let screen = layout_buffer(&layout, area, 0, None);
+                for row in 0..area.height {
+                    let right = (0..width)
+                        .rev()
+                        .find(|column| !screen[(*column, row)].symbol().trim().is_empty());
+                    assert_eq!(right, Some(8));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn markdown_compatibility() {
         let heading = markdown("# Heading", &DARK, None);
         assert_eq!(heading.to_string(), "# Heading");
