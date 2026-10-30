@@ -7294,6 +7294,30 @@ mod tests {
     }
 
     #[test]
+    fn responsive_records_preserve_non_breaking_spaces_in_rendered_copy() {
+        for space in ['\u{00a0}', '\u{2007}', '\u{202f}'] {
+            let value = format!("10{space}MB");
+            for width in 1..=8 {
+                let mut transcript = Transcript::default();
+                transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                    markdown: format!("| H |\n| --- |\n| {value} |"),
+                    accounting: None,
+                }]);
+                let layout = transcript.layout(&DARK, width);
+                let copied = layout.extract_selection(Selection::new(
+                    DocumentPosition::new(0, 0),
+                    DocumentPosition::new(layout.total_height(), 0),
+                ));
+                assert_eq!(
+                    copied,
+                    format!("- H: \"{value}\""),
+                    "{space:?} at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn responsive_unicode_records_measure_the_graphemes_the_terminal_draws() {
         let value = "abⵏ⵿ⴾ";
         for width in [2, 8, 40] {

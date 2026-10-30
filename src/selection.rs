@@ -453,7 +453,13 @@ fn extract_row(buffer: &Buffer, area: Rect, y: u16, columns: Range<u16>) -> Stri
         }
         x = end;
     }
-    text.truncate(text.trim_end().len());
+    // Non-breaking spaces are source content, including on emergency token wraps.
+    text.truncate(
+        text.trim_end_matches(|ch: char| {
+            ch.is_whitespace() && !matches!(ch, '\u{00a0}' | '\u{2007}' | '\u{202f}')
+        })
+        .len(),
+    );
     text
 }
 

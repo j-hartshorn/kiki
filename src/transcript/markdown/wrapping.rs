@@ -349,10 +349,11 @@ fn record_break(
 }
 
 fn word_ranges(content: &str, protected: &[Range<usize>]) -> Vec<Range<usize>> {
+    let non_breaking_space = |ch| matches!(ch, '\u{00a0}' | '\u{2007}' | '\u{202f}');
     let mut chunks = Vec::new();
     let mut start = None;
     for (offset, grapheme) in content.grapheme_indices(true) {
-        if grapheme.chars().all(char::is_whitespace) {
+        if grapheme.chars().all(char::is_whitespace) && !grapheme.chars().any(non_breaking_space) {
             if let Some(first) = start.take() {
                 chunks.push(first..offset);
             }
@@ -367,7 +368,9 @@ fn word_ranges(content: &str, protected: &[Range<usize>]) -> Vec<Range<usize>> {
     for chunk in chunks {
         let text = &content[chunk.clone()];
         // Unicode word boundaries must not split URLs or punctuation-bearing identifiers.
-        if text.chars().any(|ch| ch.is_ascii_punctuation())
+        if text
+            .chars()
+            .any(|ch| ch.is_ascii_punctuation() || non_breaking_space(ch))
             || protected
                 .iter()
                 .any(|range| range.start < chunk.end && chunk.start < range.end)
@@ -471,6 +474,29 @@ mod tests {
             &[LineBreak::Hard, LineBreak::Word, LineBreak::Word],
         );
         assert_wrap(&Line::from("one two"), 7, &["one two"], &[LineBreak::Hard]);
+    }
+
+    #[test]
+    fn non_breaking_spaces_keep_word_groups_whole() {
+        for space in ['\u{00a0}', '\u{2007}', '\u{202f}'] {
+            let value = format!("10{space}MB");
+            assert_eq!(minimum_width(&Line::from(value.clone())), 5);
+            assert_wrap(
+                &Line::from(format!("ab {value}")),
+                7,
+                &["ab", &value],
+                &[LineBreak::Hard, LineBreak::Word],
+            );
+            let source = format!("- K: {value}");
+            let layout = assert_records(
+                &Line::from(source.clone()),
+                7,
+                &[],
+                &["- K:", &value],
+                &[LineBreak::Hard, LineBreak::Word],
+            );
+            assert_eq!(copied(&layout), source);
+        }
     }
 
     #[test]
