@@ -5,6 +5,7 @@ use crate::pricing::RunCostEstimate;
 use crate::runtime::{Record, RestoredTimelineItem, RuntimeEvent};
 use crate::subagents::{TaskId, TaskObservation, TaskRecord, TaskState};
 use crate::theme::Theme;
+use crate::todos::TodoPolicy;
 use crate::transcript::{
     format_subagent_cost, format_subagent_elapsed, format_subagent_steps, muted_page_style,
     normalise_terminal_text, subagent_glyph, subagent_retry_count, subagent_state_label,
@@ -40,6 +41,7 @@ struct Entry {
     prompt: String,
     model: String,
     retry_count: u64,
+    todo_policy: TodoPolicy,
     record_revision: u64,
     observation_revision: u64,
     observation: Observation,
@@ -53,6 +55,7 @@ impl Entry {
             prompt: record.parameters().prompt().to_owned(),
             model: record.parameters().selection().model().id.to_owned(),
             retry_count: subagent_retry_count(record),
+            todo_policy: record.parameters().todo_policy(),
             record_revision: record.revision(),
             observation_revision: record.revision(),
             observation: Observation::from(record.observation()),
@@ -276,6 +279,12 @@ impl SubagentMonitor {
         MonitorLayout { lines }
     }
 
+    pub(super) fn has_active_todo_policy(&self, policy: TodoPolicy) -> bool {
+        self.entries.iter().any(|(id, entry)| {
+            self.is_operationally_active(id, entry) && entry.todo_policy == policy
+        })
+    }
+
     pub(super) fn has_active_entries(&self) -> bool {
         self.entries
             .iter()
@@ -308,6 +317,7 @@ impl SubagentMonitor {
                 prompt: "test child".to_owned(),
                 model: "openai/gpt-5.6-sol".to_owned(),
                 retry_count: 0,
+                todo_policy: TodoPolicy::ENABLED,
                 record_revision: 1,
                 observation_revision: 1,
                 observation: Observation {
@@ -854,6 +864,7 @@ mod tests {
             prompt: "Review the cancellation paths and identify every missing edge case".to_owned(),
             model: "openai/gpt-5.6-luna".to_owned(),
             retry_count: 0,
+            todo_policy: crate::todos::TodoPolicy::ENABLED,
             record_revision: 1,
             observation_revision: 1,
             observation: Observation {

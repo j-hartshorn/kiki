@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use crate::theme::ThemeSetting;
+use crate::todos::{TodoDisplay, TodoSettings};
 
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
@@ -208,6 +209,9 @@ pub(crate) struct SettingsContext {
     cross_provider_reasoning: CrossProviderReasoning,
     theme: ThemeSetting,
     theme_set_by_project: bool,
+    todos: TodoSettings,
+    todo_enabled_set_by_project: bool,
+    todo_display_set_by_project: bool,
 }
 
 impl fmt::Debug for SettingsContext {
@@ -237,6 +241,15 @@ impl fmt::Debug for SettingsContext {
             .field("cross_provider_reasoning", &self.cross_provider_reasoning)
             .field("theme", &self.theme)
             .field("theme_set_by_project", &self.theme_set_by_project)
+            .field("todos", &self.todos)
+            .field(
+                "todo_enabled_set_by_project",
+                &self.todo_enabled_set_by_project,
+            )
+            .field(
+                "todo_display_set_by_project",
+                &self.todo_display_set_by_project,
+            )
             .finish()
     }
 }
@@ -270,6 +283,56 @@ impl SettingsContext {
 
     pub(crate) fn anthropic_cache_ttl(&self) -> CacheTtl {
         self.anthropic_cache_ttl
+    }
+
+    pub(crate) fn todos(&self) -> TodoSettings {
+        self.todos
+    }
+
+    pub(crate) fn save_todo_enabled(&self, enabled: bool) -> Result<SaveOutcome, SaveError> {
+        self.save_todo_field(
+            "enabled",
+            Value::from(enabled),
+            self.todo_enabled_set_by_project,
+        )
+    }
+
+    pub(crate) fn save_todo_display(&self, display: TodoDisplay) -> Result<SaveOutcome, SaveError> {
+        self.save_todo_field(
+            "display",
+            Value::from(display.as_str()),
+            self.todo_display_set_by_project,
+        )
+    }
+
+    fn save_todo_field(
+        &self,
+        key: &str,
+        mut replacement: Value,
+        set_by_project: bool,
+    ) -> Result<SaveOutcome, SaveError> {
+        update_user_document(self.user_path(), |document| {
+            if document.as_table().get("todos").is_none() {
+                document
+                    .as_table_mut()
+                    .insert("todos", Item::Table(Table::new()));
+            }
+            let table = document["todos"]
+                .as_table_mut()
+                .ok_or(SaveError::InvalidExistingUserSettings)?;
+            if let Some(existing) = table.get(key).and_then(Item::as_value) {
+                *replacement.decor_mut() = existing.decor().clone();
+            }
+            table.insert(key, Item::Value(replacement));
+            Ok(())
+        })?;
+        Ok(if set_by_project {
+            SaveOutcome::SavedButMasked {
+                by: SettingsOrigin::Project,
+            }
+        } else {
+            SaveOutcome::Saved
+        })
     }
 
     pub(crate) fn theme(&self) -> ThemeSetting {
@@ -551,6 +614,24 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         .into_iter()
         .find_map(|layer| layer.as_ref()?.theme)
         .unwrap_or_default();
+    let todos = TodoSettings {
+        enabled: [&project, &user]
+            .into_iter()
+            .find_map(|layer| layer.as_ref()?.todos.enabled)
+            .unwrap_or(true),
+        display: [&project, &user]
+            .into_iter()
+            .find_map(|layer| layer.as_ref()?.todos.display)
+            .unwrap_or_default(),
+    };
+    let todo_enabled_set_by_project = project
+        .as_ref()
+        .and_then(|layer| layer.todos.enabled)
+        .is_some();
+    let todo_display_set_by_project = project
+        .as_ref()
+        .and_then(|layer| layer.todos.display)
+        .is_some();
     let theme_set_by_project = project.as_ref().and_then(|layer| layer.theme).is_some();
     if let Some(session_preferences) = input.session_preferences {
         model = session_preferences.selection().model();
@@ -652,6 +733,9 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             cross_provider_reasoning,
             theme,
             theme_set_by_project,
+            todos,
+            todo_enabled_set_by_project,
+            todo_display_set_by_project,
         },
         problems,
     }
@@ -790,6 +874,7 @@ fn validate_document(
             "anthropic" => {
                 validate_anthropic_table(item, &mut settings.anthropic_cache_ttl, &mut problems);
             }
+            "todos" => validate_todos_table(item, &mut settings.todos, &mut problems),
             "theme" => match item.as_str().and_then(ThemeSetting::parse) {
                 Some(theme) => settings.theme = Some(theme),
                 None => problems.push(
@@ -813,7 +898,7 @@ fn validate_document(
                 ),
             },
             _ => problems.push(
-                "contains an unknown field; only `model`, `favourites`, `cross_provider_reasoning`, `theme`, `[thinking]`, `[subagents]`, `[compaction]`, and `[anthropic]` are allowed",
+                "contains an unknown field; only `model`, `favourites`, `cross_provider_reasoning`, `theme`, `[thinking]`, `[subagents]`, `[compaction]`, `[todos]`, and `[anthropic]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -996,6 +1081,42 @@ fn validate_compaction_table(
     }
 }
 
+fn validate_todos_table(
+    item: &Item,
+    todos: &mut FileTodoSettings,
+    problems: &mut DocumentProblems,
+) {
+    let Some(table) = item.as_table() else {
+        problems.push(
+            "field `todos` must be a TOML table",
+            "Use [todos] with supported settings, then restart Kiki.",
+        );
+        return;
+    };
+    for (key, item) in table.iter() {
+        match key {
+            "enabled" => match item.as_bool() {
+                Some(value) => todos.enabled = Some(value),
+                None => problems.push(
+                    "field `todos.enabled` must be a boolean",
+                    "Set it to true or false, then restart Kiki.",
+                ),
+            },
+            "display" => match item.as_str().and_then(TodoDisplay::parse) {
+                Some(value) => todos.display = Some(value),
+                None => problems.push(
+                    "field `todos.display` must be a string: \"all\", \"current\" or \"none\"",
+                    "Set it to \"all\", \"current\" or \"none\", then restart Kiki.",
+                ),
+            },
+            _ => problems.push(
+                "table `todos` contains an unknown key; only `enabled` and `display` are allowed",
+                "Remove the unknown key from table `todos`, then restart Kiki.",
+            ),
+        }
+    }
+}
+
 fn validate_anthropic_table(
     item: &Item,
     cache_ttl: &mut Option<CacheTtl>,
@@ -1135,6 +1256,13 @@ struct FileSettings {
     anthropic_cache_ttl: Option<CacheTtl>,
     cross_provider_reasoning: Option<CrossProviderReasoning>,
     theme: Option<ThemeSetting>,
+    todos: FileTodoSettings,
+}
+
+#[derive(Default)]
+struct FileTodoSettings {
+    enabled: Option<bool>,
+    display: Option<TodoDisplay>,
 }
 
 #[derive(Default)]
@@ -1336,6 +1464,350 @@ mod tests {
     use super::{
         CacheTtl, CrossProviderReasoning, Input, SessionPreferences, SubagentSettings, resolve,
     };
+
+    #[test]
+    fn todo_settings_defaults_and_exact_display_values() {
+        use crate::todos::{TodoDisplay, TodoSettings};
+        assert_eq!(
+            resolve(input(None, None)).context().todos(),
+            TodoSettings::default()
+        );
+        assert_eq!(
+            TodoSettings::default(),
+            TodoSettings {
+                enabled: true,
+                display: TodoDisplay::All
+            }
+        );
+        for (text, mode) in [
+            ("all", TodoDisplay::All),
+            ("current", TodoDisplay::Current),
+            ("none", TodoDisplay::None),
+        ] {
+            assert_eq!(TodoDisplay::parse(text), Some(mode));
+            assert_eq!(mode.as_str(), text);
+        }
+        for text in ["All", "CURRENT", " none", "none ", "", "off"] {
+            assert_eq!(TodoDisplay::parse(text), None);
+        }
+    }
+
+    #[test]
+    fn todo_settings_field_wise_precedence_and_empty_tables() {
+        use crate::todos::{TodoDisplay, TodoSettings};
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        for user_enabled in [None, Some(false), Some(true)] {
+            for user_display in [
+                None,
+                Some(TodoDisplay::All),
+                Some(TodoDisplay::Current),
+                Some(TodoDisplay::None),
+            ] {
+                for project_enabled in [None, Some(false), Some(true)] {
+                    for project_display in [
+                        None,
+                        Some(TodoDisplay::All),
+                        Some(TodoDisplay::Current),
+                        Some(TodoDisplay::None),
+                    ] {
+                        for (root, enabled, display) in [
+                            (home.path(), user_enabled, user_display),
+                            (project.path(), project_enabled, project_display),
+                        ] {
+                            let mut text = String::from("[todos]\n");
+                            if let Some(enabled) = enabled {
+                                text.push_str(&format!("enabled = {enabled}\n"));
+                            }
+                            if let Some(display) = display {
+                                text.push_str(&format!("display = {:?}\n", display.as_str()));
+                            }
+                            write_settings(root, &text);
+                        }
+                        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+                        assert!(
+                            resolution.problems().is_empty(),
+                            "valid TODO tables rejected"
+                        );
+                        assert_eq!(
+                            resolution.context().todos(),
+                            TodoSettings {
+                                enabled: project_enabled.or(user_enabled).unwrap_or(true),
+                                display: project_display.or(user_display).unwrap_or_default(),
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn todo_settings_invalid_values_reject_only_the_invalid_layer() {
+        use crate::todos::{TodoDisplay, TodoSettings};
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let valid = "[todos]\nenabled = false\ndisplay = \"current\"\n";
+        for (invalid, diagnostic, remediation) in [
+            (
+                "todos = true\n",
+                "field `todos` must be a TOML table",
+                "[todos]",
+            ),
+            (
+                "todos = {}\n",
+                "field `todos` must be a TOML table",
+                "[todos]",
+            ),
+            (
+                "[[todos]]\n",
+                "field `todos` must be a TOML table",
+                "[todos]",
+            ),
+            (
+                "[todos]\nenabled = \"false\"\n",
+                "todos.enabled",
+                "true or false",
+            ),
+            ("[todos]\nenabled = 0\n", "todos.enabled", "true or false"),
+            (
+                "[todos]\nenabled = [false]\n",
+                "todos.enabled",
+                "true or false",
+            ),
+            (
+                "[todos]\ndisplay = false\n",
+                "todos.display",
+                "\"all\", \"current\" or \"none\"",
+            ),
+            (
+                "[todos]\ndisplay = 1\n",
+                "todos.display",
+                "\"all\", \"current\" or \"none\"",
+            ),
+            (
+                "[todos]\ndisplay = [\"all\"]\n",
+                "todos.display",
+                "\"all\", \"current\" or \"none\"",
+            ),
+            (
+                "[todos]\ndisplay = \"All\"\n",
+                "todos.display",
+                "\"all\", \"current\" or \"none\"",
+            ),
+            (
+                "[todos]\ndisplay = \"other\"\n",
+                "todos.display",
+                "\"all\", \"current\" or \"none\"",
+            ),
+            (
+                "[todos]\nenabled = true\nother = false\n",
+                "only `enabled` and `display` are allowed",
+                "Remove the unknown key",
+            ),
+        ] {
+            for invalid_project in [false, true] {
+                write_settings(home.path(), if invalid_project { valid } else { invalid });
+                write_settings(
+                    project.path(),
+                    if invalid_project { invalid } else { valid },
+                );
+                let resolution = resolve(input(Some(home.path()), Some(project.path())));
+                assert_eq!(
+                    resolution.context().todos(),
+                    TodoSettings {
+                        enabled: false,
+                        display: TodoDisplay::Current
+                    }
+                );
+                assert_eq!(resolution.problems().len(), 1, "{invalid}");
+                let problem = &resolution.problems()[0];
+                assert_eq!(
+                    problem.kind(),
+                    if invalid_project {
+                        crate::config::StartupProblemKind::ProjectSettingsInvalid
+                    } else {
+                        crate::config::StartupProblemKind::UserSettingsInvalid
+                    }
+                );
+                assert!(
+                    problem.diagnostic().contains(diagnostic),
+                    "{}",
+                    problem.diagnostic()
+                );
+                assert!(
+                    problem.remediation().contains(remediation),
+                    "{}",
+                    problem.remediation()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn todo_settings_saves_preserve_other_fields_keys_and_comments() {
+        use crate::todos::{TodoDisplay, TodoSettings};
+        let home = tempdir().unwrap();
+        let original = "# root comment\ntheme = \"dark\" # unrelated\n\n[todos] # table comment\nenabled = true # enabled comment\ndisplay = \"current\" # display comment\n\n[subagents]\nallow_nested = false # untouched\n";
+        write_settings(home.path(), original);
+        let resolution = resolve(input(Some(home.path()), None));
+        let context = resolution.context();
+        assert_eq!(
+            context.save_todo_enabled(false).unwrap(),
+            super::SaveOutcome::Saved
+        );
+        let path = context.user_path().unwrap();
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            original.replace("enabled = true", "enabled = false")
+        );
+        assert_eq!(
+            resolve(input(Some(home.path()), None)).context().todos(),
+            TodoSettings {
+                enabled: false,
+                display: TodoDisplay::Current
+            }
+        );
+        assert_eq!(
+            context.save_todo_display(TodoDisplay::None).unwrap(),
+            super::SaveOutcome::Saved
+        );
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            original
+                .replace("enabled = true", "enabled = false")
+                .replace("display = \"current\"", "display = \"none\"")
+        );
+        assert_eq!(
+            resolve(input(Some(home.path()), None)).context().todos(),
+            TodoSettings {
+                enabled: false,
+                display: TodoDisplay::None
+            }
+        );
+    }
+
+    #[test]
+    fn todo_settings_saves_create_tables_and_missing_fields() {
+        use crate::todos::{TodoDisplay, TodoSettings};
+        for initial in [
+            None,
+            Some("theme = \"light\"\n"),
+            Some("[todos]\n"),
+            Some("[todos]\nenabled = true\n"),
+            Some("[todos]\ndisplay = \"all\"\n"),
+        ] {
+            for display_first in [false, true] {
+                let home = tempdir().unwrap();
+                if let Some(initial) = initial {
+                    write_settings(home.path(), initial);
+                }
+                let resolution = resolve(input(Some(home.path()), None));
+                let context = resolution.context();
+                if display_first {
+                    context.save_todo_display(TodoDisplay::Current).unwrap();
+                    context.save_todo_enabled(false).unwrap();
+                } else {
+                    context.save_todo_enabled(false).unwrap();
+                    context.save_todo_display(TodoDisplay::Current).unwrap();
+                }
+                let reloaded = resolve(input(Some(home.path()), None));
+                assert!(reloaded.problems().is_empty());
+                assert_eq!(
+                    reloaded.context().todos(),
+                    TodoSettings {
+                        enabled: false,
+                        display: TodoDisplay::Current
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn todo_settings_save_masking_is_per_project_field_and_never_writes_project() {
+        use crate::todos::TodoDisplay;
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        for enabled in [false, true] {
+            for display in [false, true] {
+                let mut text = String::from("# never change this\n[todos]\n");
+                if enabled {
+                    text.push_str("enabled = true\n");
+                }
+                if display {
+                    text.push_str("display = \"all\"\n");
+                }
+                write_settings(project.path(), &text);
+                let resolution = resolve(input(Some(home.path()), Some(project.path())));
+                let outcome = |masked| {
+                    if masked {
+                        super::SaveOutcome::SavedButMasked {
+                            by: super::SettingsOrigin::Project,
+                        }
+                    } else {
+                        super::SaveOutcome::Saved
+                    }
+                };
+                assert_eq!(
+                    resolution.context().save_todo_enabled(false).unwrap(),
+                    outcome(enabled)
+                );
+                assert_eq!(
+                    resolution
+                        .context()
+                        .save_todo_display(TodoDisplay::None)
+                        .unwrap(),
+                    outcome(display)
+                );
+                assert_eq!(
+                    fs::read_to_string(project.path().join(".kiki/config.toml")).unwrap(),
+                    text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn todo_settings_save_failures_are_errors_even_when_masked() {
+        use crate::todos::TodoDisplay;
+        let unavailable = resolve(input(None, None));
+        assert!(matches!(
+            unavailable.context().save_todo_enabled(false),
+            Err(super::SaveError::UserSettingsUnavailable)
+        ));
+        assert!(matches!(
+            unavailable.context().save_todo_display(TodoDisplay::None),
+            Err(super::SaveError::UserSettingsUnavailable)
+        ));
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_settings(
+            project.path(),
+            "[todos]\nenabled = true\ndisplay = \"all\"\n",
+        );
+        write_settings(home.path(), "malformed = [\n");
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        assert!(matches!(
+            resolution.context().save_todo_enabled(false),
+            Err(super::SaveError::InvalidExistingUserSettings)
+        ));
+        assert!(matches!(
+            resolution.context().save_todo_display(TodoDisplay::None),
+            Err(super::SaveError::InvalidExistingUserSettings)
+        ));
+        fs::remove_file(home.path().join(".kiki/config.toml")).unwrap();
+        fs::remove_dir(home.path().join(".kiki")).unwrap();
+        fs::write(home.path().join(".kiki"), "not a directory").unwrap();
+        assert!(matches!(
+            resolution.context().save_todo_enabled(false),
+            Err(super::SaveError::Io(_))
+        ));
+        assert!(matches!(
+            resolution.context().save_todo_display(TodoDisplay::None),
+            Err(super::SaveError::Io(_))
+        ));
+    }
 
     #[test]
     fn astra_uses_low_by_default_and_openai_models_reject_none() {

@@ -1,5 +1,47 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum TodoDisplay {
+    #[default]
+    All,
+    Current,
+    None,
+}
+
+impl TodoDisplay {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Current => "current",
+            Self::None => "none",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "current" => Some(Self::Current),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TodoSettings {
+    pub enabled: bool,
+    pub display: TodoDisplay,
+}
+
+impl Default for TodoSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            display: TodoDisplay::All,
+        }
+    }
+}
+
 pub(crate) const BOOTSTRAP: &str = include_str!("todos.py");
 pub(crate) const STUBS: &str = r#"
 class TodoList:
@@ -20,6 +62,8 @@ pub struct TodoPolicy {
 }
 
 impl TodoPolicy {
+    pub(crate) const ENABLED: Self = Self { enabled: true };
+
     pub fn capture(enabled: bool) -> Self {
         Self { enabled }
     }
@@ -40,7 +84,7 @@ impl TodoPolicy {
 
 impl Default for TodoPolicy {
     fn default() -> Self {
-        Self::capture(true)
+        Self::ENABLED
     }
 }
 

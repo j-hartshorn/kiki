@@ -29,6 +29,7 @@ pub(crate) enum PickerAction<T> {
 pub(crate) enum DynamicPickerRole {
     Direct,
     Context,
+    Searchable,
 }
 
 pub(crate) struct DynamicPickerItem<T> {
@@ -40,7 +41,8 @@ pub(crate) struct DynamicPickerItem<T> {
 
 enum PickerRowRole {
     SearchableLabel(String),
-    Dynamic(DynamicPickerRole),
+    Direct,
+    Context,
 }
 
 struct PickerRow<T> {
@@ -137,6 +139,10 @@ impl<T: Copy + Eq> Picker<T> {
 
     pub(crate) fn filter(&self) -> &str {
         &self.filter
+    }
+
+    pub(crate) fn contains_value(&self, value: T) -> bool {
+        self.items.iter().any(|item| item.value == value)
     }
 
     pub(crate) fn focused_value(&self) -> Option<T> {
@@ -439,18 +445,15 @@ impl<T: Copy + Eq> Picker<T> {
             PickerRowRole::SearchableLabel(canonical_text) => {
                 self.matches_canonical_text(canonical_text).then_some(true)
             }
-            PickerRowRole::Dynamic(DynamicPickerRole::Direct) => Some(true),
-            PickerRowRole::Dynamic(DynamicPickerRole::Context) => Some(false),
+            PickerRowRole::Direct => Some(true),
+            PickerRowRole::Context => Some(false),
         }
     }
 }
 
 impl<T> PickerRow<T> {
     fn is_selectable(&self) -> bool {
-        !matches!(
-            self.role,
-            PickerRowRole::Dynamic(DynamicPickerRole::Context)
-        )
+        !matches!(self.role, PickerRowRole::Context)
     }
 }
 
@@ -468,11 +471,18 @@ impl<T> From<PickerItem<T>> for PickerRow<T> {
 
 impl<T> From<DynamicPickerItem<T>> for PickerRow<T> {
     fn from(item: DynamicPickerItem<T>) -> Self {
+        let role = match item.role {
+            DynamicPickerRole::Direct => PickerRowRole::Direct,
+            DynamicPickerRole::Context => PickerRowRole::Context,
+            DynamicPickerRole::Searchable => {
+                PickerRowRole::SearchableLabel(canonical_search(&item.row.to_string()))
+            }
+        };
         Self {
             group: None,
             row: item.row,
             focused_row: item.focused_row,
-            role: PickerRowRole::Dynamic(item.role),
+            role,
             value: item.value,
         }
     }
@@ -1138,5 +1148,32 @@ mod tests {
             }
         }
         panic!("rendered text: {text}")
+    }
+    #[test]
+    fn searchable_dynamic_items_filter_and_preserve_focus_on_replacement() {
+        let mut picker = Picker::new_dynamic(
+            "Settings",
+            "No match",
+            [
+                dynamic_item("enabled", "Enabled Off", DynamicPickerRole::Searchable),
+                dynamic_item("display", "Display All", DynamicPickerRole::Context),
+            ],
+            "enabled",
+        );
+        picker.set_filter("Display");
+        assert_eq!(picker.focused_value(), None);
+        assert!(picker.contains_value("enabled"));
+        picker.replace_items([
+            dynamic_item("enabled", "Enabled Off", DynamicPickerRole::Searchable),
+            dynamic_item("display", "Display All", DynamicPickerRole::Searchable),
+        ]);
+        assert_eq!(picker.filter(), "Display");
+        assert_eq!(picker.focused_value(), Some("display"));
+        picker.replace_items([
+            dynamic_item("enabled", "Enabled Off", DynamicPickerRole::Searchable),
+            dynamic_item("display", "Display All", DynamicPickerRole::Context),
+        ]);
+        assert_eq!(picker.focused_value(), None);
+        assert_eq!(picker.filter(), "Display");
     }
 }

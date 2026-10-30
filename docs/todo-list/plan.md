@@ -303,3 +303,37 @@ that cannot honor the agreed source contract.
   output.log and matching source.diff. RUST_TEST_THREADS=2 just test passed1816unit
   +5credentialsCLI+17sessionsCLI,8ignored; justlint/fmtcheck/diffcheck passed. Source
   snapshot matched before this documentation-only record was appended.
+
+- Task 6: defaults/field-wise TOML resolution, exact all/current/none parsing,
+  per-field project masks, comment-preserving user saves implemented (7cfg tests,
+  144precedence combinations; 50existing settings tests passed).
+- Runtime initializes coordinator preference from resolved config; new root and
+  manual-compaction operations synchronously capture policy and invalidate a
+  changed-policy checkout for restoration on the worker execution path. No Arena
+  I/O blocks the control loop. ApplyTodoEnabled stores latest preference then
+  emits revisioned acknowledgement, never alters active Agent policy.
+- RunStarted now carries actual immutable policy via WorkerMessage, so a newer
+  preference acknowledgement cannot mislabel a delayed root start. Startup Off
+  versus On+None and live blocked-code/retained-alias tests established behavior
+  red->green; delayed request-persistence test covers both initial policies.
+- Settings menu adds TODO submenu with Enabled/Display and parent-return enum.
+  Confirm applies/saves current choice even on mask/error; focus has no toggle
+  effect. Display changes are local only. Active-owner notices use captured root
+  policy and monitor operational child policy; fully-off Display is unavailable.
+- Menu worker i failed memory while preparing extra tests; no report assumed.
+  Parent inspected partial files, cleared obsolete Arena buffers in a separate
+  execution, and completed tests/implementation. Dynamic menus needed searchable
+  rows, not tree caller-prefiltered Direct rows; added Searchable+contains_value
+  with existing replace_items preserving filter/focus, leaving tree semantics.
+- Parent found valid RunStarted may return no visible transcript change because
+  begin_submission already set starting status. Confirmed oldguard red using
+  real submitting state; active_run_id query accepts current policy and rejects
+  settled/obsolete facts. Live menu root/child rows now refresh without losing
+  search/focus. File masks/save errors/ackordering/drafts/three modes covered.
+- Task 6 review j identified stale Display chooser confirmation after lastenabled
+  owner settled. Added root/child xEnter/CtrlS regression (red modeNone vsAll),
+  rechecked availability before save/mutation, retained oldmode; rereview k CLEAN.
+- Task 6 final evidence: target/todo-verification/full-settings-final.irRpsG exit0
+  and source.diff matched before this documentation-only entry. RUST_TEST_THREADS=2
+  just test passed1835unit+5credentialsCLI+17sessionsCLI,8ignored; justlint/fmtcheck/
+  diffcheck passed. Actual checklist/overflow viewer is task7, not claimed here.

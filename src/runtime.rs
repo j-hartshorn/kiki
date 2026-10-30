@@ -53,6 +53,10 @@ pub(crate) enum RuntimeCommand {
         selection: ModelSelection,
         revision: u64,
     },
+    ApplyTodoEnabled {
+        enabled: bool,
+        revision: u64,
+    },
     SetSessionName {
         name: String,
         revision: u64,
@@ -237,6 +241,7 @@ impl RuntimeInitialState {
 pub(crate) enum RuntimeEvent {
     RunStarted {
         run_id: RunId,
+        todo_policy: crate::todos::TodoPolicy,
     },
     ModelStepStarted {
         run_id: RunId,
@@ -310,6 +315,10 @@ pub(crate) enum RuntimeEvent {
     },
     SettingsAccepted {
         revision: u64,
+    },
+    TodoEnabledAccepted {
+        revision: u64,
+        enabled: bool,
     },
     NameAccepted {
         revision: u64,
@@ -420,6 +429,7 @@ pub(crate) struct RuntimeController<M: Model> {
     subagent_status_revisions: BTreeMap<TaskId, u64>,
     compaction_policy: CompactionSettings,
     cross_provider_reasoning: CrossProviderReasoning,
+    startup_todos_enabled: bool,
     pending_compaction: Option<PendingCompaction>,
     active: Option<ActiveRun<M>>,
     trace: Trace,
@@ -464,6 +474,7 @@ enum WorkerMessage<M: Model> {
         request: String,
         selection: ModelSelection,
         activation: Option<SkillActivation>,
+        todo_policy: crate::todos::TodoPolicy,
     },
     AutomaticCompactionStarted {
         run_id: u64,
@@ -570,6 +581,7 @@ pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand
         RuntimeCommand::Submit { .. }
         | RuntimeCommand::Compact { .. }
         | RuntimeCommand::ApplySettings { .. }
+        | RuntimeCommand::ApplyTodoEnabled { .. }
         | RuntimeCommand::SetSessionName { .. }
         | RuntimeCommand::Navigate { .. }
         | RuntimeCommand::RequestTree { .. } => None,
@@ -658,6 +670,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::RunSettled { .. }
         | RuntimeEvent::AutomaticCompactionStarted { .. }
         | RuntimeEvent::SettingsAccepted { .. }
+        | RuntimeEvent::TodoEnabledAccepted { .. }
         | RuntimeEvent::NameAccepted { .. }
         | RuntimeEvent::NavigationCompleted { .. }
         | RuntimeEvent::CorrectionCompleted { .. }
@@ -816,6 +829,7 @@ impl<M: Model> RuntimeController<M> {
         session: SessionWriter,
     ) -> Self {
         let compaction = persisted_settings.compaction();
+        let startup_todos_enabled = persisted_settings.todos().enabled;
         let cross_provider_reasoning = persisted_settings.cross_provider_reasoning();
         let accepted_thinking = AcceptedThinking::new(selection, persisted_settings, None);
         let subagents = subagents.with_session(session.clone());
@@ -832,6 +846,7 @@ impl<M: Model> RuntimeController<M> {
             subagent_status_revisions: BTreeMap::new(),
             compaction_policy: compaction,
             cross_provider_reasoning,
+            startup_todos_enabled,
             pending_compaction: None,
             active: None,
             trace: Trace::disabled(),
@@ -882,6 +897,7 @@ impl<M: Model> RuntimeController<M> {
             "restoration has no tracked subagent operations"
         );
         let compaction = persisted_settings.compaction();
+        let startup_todos_enabled = persisted_settings.todos().enabled;
         let cross_provider_reasoning = persisted_settings.cross_provider_reasoning();
         let accepted_thinking = AcceptedThinking::new(
             selection,
@@ -965,6 +981,7 @@ impl<M: Model> RuntimeController<M> {
                 subagent_status_revisions: BTreeMap::new(),
                 compaction_policy: compaction,
                 cross_provider_reasoning,
+                startup_todos_enabled,
                 pending_compaction: None,
                 active: None,
                 trace: Trace::disabled(),
@@ -1064,6 +1081,9 @@ impl<M: Model> RuntimeController<M> {
         progress_sender: mpsc::Sender<ProgressEnvelope<RuntimeEvent>>,
     ) -> Vec<StoredRecord> {
         let mut progress = ProgressPublisher::new(progress_sender);
+        self.subagents
+            .set_todos_enabled(self.startup_todos_enabled)
+            .await;
         let mut commands_open = true;
         let mut shutdown_requested = false;
         let mut subagent_updates = self.subagents.subscribe().await;
@@ -1248,6 +1268,13 @@ impl<M: Model> RuntimeController<M> {
                 if accepted {
                     self.start_pending_compaction().await;
                 }
+            }
+            RuntimeCommand::ApplyTodoEnabled { enabled, revision } => {
+                self.subagents.set_todos_enabled(enabled).await;
+                self.emit(
+                    events,
+                    RuntimeEvent::TodoEnabledAccepted { revision, enabled },
+                );
             }
             RuntimeCommand::ApplySettings {
                 selection,
@@ -1602,11 +1629,13 @@ impl<M: Model> RuntimeController<M> {
         else {
             return;
         };
+        let todo_policy = crate::todos::TodoPolicy::capture(self.subagents.todos_enabled().await);
         let caller = self.subagents.root_caller().await;
-        let agent = self
+        let mut agent = self
             .agent
             .take()
             .expect("an idle runtime controller owns its agent");
+        agent.capture_todo_policy(todo_policy);
         let writer = self.session.clone();
         let cancellation_for_worker = cancellation.clone();
         let policy = self.compaction_policy;
@@ -1659,11 +1688,13 @@ impl<M: Model> RuntimeController<M> {
         _events: &mpsc::UnboundedSender<RuntimeEvent>,
         _progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
+        let todo_policy = crate::todos::TodoPolicy::capture(self.subagents.todos_enabled().await);
         let caller = self.subagents.root_caller().await;
         let mut agent = self
             .agent
             .take()
             .expect("an idle runtime controller owns its agent");
+        agent.capture_todo_policy(todo_policy);
         agent.set_invocation_context(
             AgentInvocationContext::new(caller.clone(), self.subagents.clone())
                 .with_accepted_thinking(self.accepted_thinking.clone()),
@@ -1695,6 +1726,7 @@ impl<M: Model> RuntimeController<M> {
                             request,
                             selection,
                             activation,
+                            todo_policy,
                         });
                     }
                     PersistedAgentEvent::CompactionStarted {
@@ -2006,6 +2038,7 @@ impl<M: Model> RuntimeController<M> {
                 request,
                 selection,
                 activation,
+                todo_policy,
             } => {
                 let run_id = RunId(run_id);
                 let pending_busy_submissions = std::mem::take(
@@ -2023,7 +2056,14 @@ impl<M: Model> RuntimeController<M> {
                 active.request_entry = Some(request_entry);
                 self.trace
                     .emit(|| TraceEvent::RootRunStarted { run_id: run_id.0 });
-                self.publish_progress(progress, RuntimeEvent::RunStarted { run_id }, false);
+                self.publish_progress(
+                    progress,
+                    RuntimeEvent::RunStarted {
+                        run_id,
+                        todo_policy,
+                    },
+                    false,
+                );
                 self.append_committed_record(
                     events,
                     run_id,
@@ -4869,7 +4909,10 @@ mod tests {
             if saturated {
                 progress_sender
                     .try_send(ProgressEnvelope {
-                        item: RuntimeEvent::RunStarted { run_id: RunId(99) },
+                        item: RuntimeEvent::RunStarted {
+                            run_id: RunId(99),
+                            todo_policy: crate::todos::TodoPolicy::ENABLED,
+                        },
                         gap_before: false,
                     })
                     .expect("saturate progress channel");
@@ -8085,7 +8128,7 @@ mod tests {
 
     fn event_label(event: &RuntimeEvent) -> String {
         match event {
-            RuntimeEvent::RunStarted { run_id } => format!("run:{}", run_id.0),
+            RuntimeEvent::RunStarted { run_id, .. } => format!("run:{}", run_id.0),
             RuntimeEvent::ModelStepStarted {
                 run_id, step_id, ..
             } => {
@@ -8143,6 +8186,9 @@ mod tests {
                 epoch,
             } => format!("generation-restarted:{}:{}:{epoch}", run_id.0, step_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
+            RuntimeEvent::TodoEnabledAccepted { revision, enabled } => {
+                format!("todo-settings:{enabled}:{revision}")
+            }
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
             RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
             RuntimeEvent::CorrectionCompleted { .. } => "correction-completed".to_owned(),
@@ -9344,11 +9390,10 @@ mod tests {
         allow_first_step.notify_one();
         let settled = events_until_settled(&mut events).await;
         assert_eq!(*observed.lock().unwrap(), [selection_a, selection_a]);
-        assert!(
-            !settled
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::SettingsAccepted { .. }))
-        );
+        assert!(!settled.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SettingsAccepted { .. } | RuntimeEvent::TodoEnabledAccepted { .. }
+        )));
 
         commands
             .send(RuntimeCommand::Submit {
@@ -10676,11 +10721,10 @@ mod tests {
                 },
             ]]
         );
-        assert!(
-            settled
-                .iter()
-                .all(|event| !matches!(event, RuntimeEvent::SettingsAccepted { .. }))
-        );
+        assert!(settled.iter().all(|event| !matches!(
+            event,
+            RuntimeEvent::SettingsAccepted { .. } | RuntimeEvent::TodoEnabledAccepted { .. }
+        )));
         assert!(matches!(
             records.as_slice(),
             [
@@ -12438,7 +12482,7 @@ mod tests {
             second_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::RunStarted { run_id } => Some(*run_id),
+                    RuntimeEvent::RunStarted { run_id, .. } => Some(*run_id),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -18274,7 +18318,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert!(resumed_events.iter().all(|event| match event {
-            RuntimeEvent::RunStarted { run_id } | RuntimeEvent::RunSettled { run_id } => {
+            RuntimeEvent::RunStarted { run_id, .. } | RuntimeEvent::RunSettled { run_id } => {
                 *run_id == resumed_run_id
             }
             RuntimeEvent::ModelStepStarted { run_id, .. }
@@ -20795,5 +20839,352 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RuntimeEvent::ToolUpdated { .. }))
         );
+    }
+    #[tokio::test]
+    async fn todo_settings_startup_preferences_control_capture_not_display() {
+        for (enabled, display) in [(false, "all"), (true, "none")] {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(workspace.path().join(".kiki")).unwrap();
+            std::fs::write(
+                workspace.path().join(".kiki/config.toml"),
+                format!("[todos]\nenabled = {enabled}\ndisplay = \"{display}\"\n"),
+            )
+            .unwrap();
+            let resolved = crate::config::settings::resolve(crate::config::settings::Input {
+                home: Some(home.path().as_os_str().to_owned()),
+                workspace_root: Some(workspace.path().to_path_buf()),
+                session_preferences: None,
+                default_model: DEFAULT_MODEL,
+                model: None,
+                thinking: None,
+            });
+            assert!(resolved.problems().is_empty());
+            assert_eq!(resolved.context().todos().enabled, enabled);
+            let arena = Arena::new(
+                worker_path(),
+                ToolHost::new(workspace.path()).await.unwrap(),
+            )
+            .await
+            .unwrap();
+            let selection =
+                ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+            let session =
+                Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+                    .unwrap();
+            let contexts = Arc::new(Mutex::new(Vec::new()));
+            let snapshot = crate::config::ready_snapshot_for_test();
+            let subagents = SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            );
+            let controller = RuntimeController::with_session(
+                Agent::new(
+                    arena,
+                    ContextCapturingMessageModel {
+                        contexts: contexts.clone(),
+                    },
+                ),
+                selection,
+                resolved.context().clone(),
+                subagents.clone(),
+                session.writer(),
+            );
+            let (commands, mut events, _progress, controller) = start_controller(controller);
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: "inspect preference".to_owned(),
+                    activation: None,
+                })
+                .await
+                .unwrap();
+            events_until_settled(&mut events).await;
+            shutdown_controller(commands, controller).await;
+            let has_context = {
+                let captured = contexts.lock().unwrap();
+                assert_eq!(captured.len(), 1);
+                captured[0]
+                    .iter()
+                    .any(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+            };
+            assert_eq!(has_context, enabled);
+            assert_eq!(subagents.todos_enabled().await, enabled);
+            session.close().unwrap();
+        }
+    }
+    struct TodoPolicyRecordingModel {
+        steps: crate::model::ScriptedModel,
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+    }
+
+    impl Model for TodoPolicyRecordingModel {
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            self.contexts
+                .lock()
+                .unwrap()
+                .push(history.entries().to_vec());
+            self.steps.step(selection, history, cancellation, progress)
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_settings_live_toggle_preserves_active_run_and_gates_retained_alias_next_run() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("gate"), "ready").unwrap();
+        let gate = crate::tools::ReadTestGate::new();
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_test_gate(gate.clone());
+        let arena = Arena::new(worker_path(), host).await.unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let later = "try:\n    retained_add('next')\nexcept RuntimeError:\n    print('disabled')\nelse:\n    print('enabled')";
+        let steps = crate::model::ScriptedModel::new(vec![
+            crate::model::ScriptedAction::Code { source: "retained_add = todos.add\nawait read('gate')\nretained_add('first')\nprint('first')".to_owned() },
+            crate::model::ScriptedAction::Message { text: "done".to_owned() },
+        ]).with_subsequent_first_action(crate::model::ScriptedAction::Code { source: later.to_owned() });
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let subagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(super::UnavailableChildRunner),
+        );
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                TodoPolicyRecordingModel {
+                    steps,
+                    contexts: contexts.clone(),
+                },
+            ),
+            selection,
+            snapshot.settings().clone(),
+            subagents.clone(),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        timeout(TEST_TIMEOUT, gate.wait_until_read_started())
+            .await
+            .unwrap();
+        commands
+            .send(RuntimeCommand::ApplyTodoEnabled {
+                enabled: false,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let acknowledged = timeout(TEST_TIMEOUT, async {
+            while let Some(event) = events.recv().await {
+                if matches!(
+                    event,
+                    RuntimeEvent::TodoEnabledAccepted {
+                        enabled: false,
+                        revision: 1
+                    }
+                ) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        let preference_after_off = subagents.todos_enabled().await;
+        gate.resume_read();
+        gate.resume_driver();
+        events_until_settled(&mut events).await;
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "second".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        commands
+            .send(RuntimeCommand::ApplyTodoEnabled {
+                enabled: true,
+                revision: 2,
+            })
+            .await
+            .unwrap();
+        let second_ack = timeout(TEST_TIMEOUT, async {
+            while let Some(event) = events.recv().await {
+                if matches!(
+                    event,
+                    RuntimeEvent::TodoEnabledAccepted {
+                        enabled: true,
+                        revision: 2
+                    }
+                ) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "third".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, controller).await;
+        assert!(acknowledged.unwrap());
+        assert!(second_ack.unwrap());
+        assert!(!preference_after_off);
+        let flags = contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|history| {
+                history
+                    .iter()
+                    .any(|entry| matches!(entry, ModelContextEntry::TodoContext { .. }))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(flags, [true, true, false, false, true, true]);
+        let executions = records
+            .iter()
+            .filter_map(|record| match &record.record {
+                Record::CompletedExecution { execution, .. } => Some(execution),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(executions.len(), 3);
+        assert!(executions[0].stdout.head.contains("first"));
+        assert!(executions[1].stdout.head.contains("disabled"));
+        assert!(executions[2].stdout.head.contains("enabled"));
+        assert_eq!(
+            executions
+                .iter()
+                .map(|execution| execution.todos.as_ref().unwrap().len())
+                .collect::<Vec<_>>(),
+            [1, 1, 2]
+        );
+        session.close().unwrap();
+    }
+    #[tokio::test]
+    async fn todo_settings_run_started_reports_captured_policy_after_new_preference_ack() {
+        for initial in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(workspace.path().join(".kiki")).unwrap();
+            std::fs::write(
+                workspace.path().join(".kiki/config.toml"),
+                format!("[todos]\nenabled = {initial}\n"),
+            )
+            .unwrap();
+            let resolved = crate::config::settings::resolve(crate::config::settings::Input {
+                home: Some(home.path().as_os_str().to_owned()),
+                workspace_root: Some(workspace.path().to_path_buf()),
+                session_preferences: None,
+                default_model: DEFAULT_MODEL,
+                model: None,
+                thinking: None,
+            });
+            assert!(resolved.problems().is_empty());
+            let gate = SessionWriteGate::new(SessionWriteKind::Request);
+            let arena = Arena::new(
+                worker_path(),
+                ToolHost::new(workspace.path()).await.unwrap(),
+            )
+            .await
+            .unwrap();
+            let selection =
+                ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+            let session = Session::create_with_write_gate(
+                home.path(),
+                workspace.path(),
+                selection,
+                arena.checkpoint(),
+                gate.clone(),
+            )
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider_called = Arc::new(Notify::new());
+            let snapshot = crate::config::ready_snapshot_for_test();
+            let controller = RuntimeController::with_session(
+                Agent::new(
+                    arena,
+                    AdmissionGatedModel {
+                        calls: calls.clone(),
+                        provider_called: provider_called.clone(),
+                    },
+                ),
+                selection,
+                resolved.context().clone(),
+                SubagentCoordinator::new(
+                    SubagentPolicy::from(snapshot.subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                ),
+                session.writer(),
+            );
+            let (commands, mut events, mut progress, controller) = start_controller(controller);
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: "delayed admission".to_owned(),
+                    activation: None,
+                })
+                .await
+                .unwrap();
+            let request_started = timeout(TEST_TIMEOUT, gate.wait_until_started()).await;
+            commands
+                .send(RuntimeCommand::ApplyTodoEnabled {
+                    enabled: !initial,
+                    revision: 1,
+                })
+                .await
+                .unwrap();
+            let acknowledged = timeout(TEST_TIMEOUT, async {
+                while let Some(event) = events.recv().await {
+                    if matches!(event, RuntimeEvent::TodoEnabledAccepted { enabled, revision: 1 } if enabled == !initial) {
+                        return true;
+                    }
+                }
+                false
+            }).await;
+            gate.release();
+            let captured = timeout(TEST_TIMEOUT, async {
+                while let Some(envelope) = progress.recv().await {
+                    if let RuntimeEvent::RunStarted { todo_policy, .. } = envelope.item {
+                        return Some(todo_policy);
+                    }
+                }
+                None
+            })
+            .await;
+            let called = timeout(TEST_TIMEOUT, provider_called.notified()).await;
+            commands
+                .send(RuntimeCommand::Cancel { correction: false })
+                .await
+                .unwrap();
+            events_until_settled(&mut events).await;
+            shutdown_controller(commands, controller).await;
+            assert!(request_started.is_ok());
+            assert!(acknowledged.unwrap());
+            assert!(called.is_ok());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(captured.unwrap().unwrap().enabled(), initial);
+            session.close().unwrap();
+        }
     }
 }

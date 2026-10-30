@@ -632,6 +632,10 @@ impl<M: Model> Agent<M> {
         self.invocation_context = Some(context);
     }
 
+    pub(crate) fn capture_todo_policy(&mut self, policy: crate::todos::TodoPolicy) {
+        self.arena.capture_todo_policy(policy);
+    }
+
     fn capture_todo_context(&self, include_reference: bool) -> Option<String> {
         self.arena
             .todo_policy()

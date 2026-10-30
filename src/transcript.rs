@@ -2535,6 +2535,13 @@ impl Transcript {
         self.run_state != RunState::Idle
     }
 
+    pub(crate) fn active_run_id(&self) -> Option<RunId> {
+        match self.run_state {
+            RunState::Active(run_id) => Some(run_id),
+            RunState::Idle | RunState::Submitting => None,
+        }
+    }
+
     pub(crate) fn is_generating(&self) -> bool {
         self.disabled_reason.is_none()
             && self.automatic_compaction.is_none()
@@ -2576,7 +2583,7 @@ impl Transcript {
 
     pub(crate) fn apply(&mut self, event: RuntimeEvent, gap_before: bool) -> bool {
         match event {
-            RuntimeEvent::RunStarted { run_id } => self.start_run(run_id, gap_before),
+            RuntimeEvent::RunStarted { run_id, .. } => self.start_run(run_id, gap_before),
             RuntimeEvent::ModelStepStarted {
                 run_id,
                 step_id,
@@ -2805,6 +2812,7 @@ impl Transcript {
                 crate::runtime::CompactionLifecycle::Started => false,
             },
             RuntimeEvent::SettingsAccepted { .. }
+            | RuntimeEvent::TodoEnabledAccepted { .. }
             | RuntimeEvent::NameAccepted { .. }
             | RuntimeEvent::NavigationCompleted { .. }
             | RuntimeEvent::CorrectionCompleted { .. }
@@ -4864,7 +4872,13 @@ mod tests {
         assert!(!transcript.begin_submission());
 
         for step_id in [ModelStepId(2), ModelStepId(3)] {
-            assert!(!transcript.apply(RuntimeEvent::RunStarted { run_id }, false));
+            assert!(!transcript.apply(
+                RuntimeEvent::RunStarted {
+                    run_id,
+                    todo_policy: crate::todos::TodoPolicy::ENABLED
+                },
+                false
+            ));
             assert!(!transcript.apply(
                 RuntimeEvent::ModelStepStarted {
                     run_id,
@@ -5197,7 +5211,13 @@ mod tests {
             assert_eq!(footer(&mut transcript), streaming, "{case} terminal");
             assert!(transcript.apply(RuntimeEvent::RunSettled { run_id }, false));
             assert!(transcript.begin_submission());
-            transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+            transcript.apply(
+                RuntimeEvent::RunStarted {
+                    run_id: RunId(2),
+                    todo_policy: crate::todos::TodoPolicy::ENABLED,
+                },
+                false,
+            );
             assert!(transcript.apply(
                 RuntimeEvent::ModelStepStarted {
                     run_id: RunId(2),
@@ -5920,7 +5940,13 @@ mod tests {
         );
 
         let mut no_live = Transcript::default();
-        no_live.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        no_live.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         no_live.apply(
             RuntimeEvent::RuntimeDisabled {
                 reason: RuntimeDisabledReason::SessionStorageWriteFailed,
@@ -5947,7 +5973,13 @@ mod tests {
     #[test]
     fn delayed_generation_progress_keeps_execution_state_and_authoritative_content() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -6061,7 +6093,13 @@ mod tests {
     #[test]
     fn finished_entry_anchor_queues_before_execution_progress_arrives() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::SubagentFinished {
                 record: TaskRecord::for_test(
@@ -7416,7 +7454,13 @@ mod tests {
     }
 
     fn start_live_run(transcript: &mut Transcript) {
-        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED
+            },
+            false
+        ));
         assert!(transcript.apply(
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
@@ -7593,7 +7637,13 @@ mod tests {
         assert!(transcript.toggle_reasoning());
         assert_cached_layout_matches_fresh(&mut transcript, 80);
 
-        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED
+            },
+            false
+        ));
         assert!(transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
@@ -7775,7 +7825,13 @@ mod tests {
         let initial_footer = footer_text(&initial_layout);
         let initial_counts = transcript.construction_counts();
 
-        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED
+            },
+            false
+        ));
         assert!(transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
@@ -7969,7 +8025,13 @@ mod tests {
     #[test]
     fn selection_extracts_standalone_live_accounting() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -8426,7 +8488,13 @@ warning body"
     #[test]
     fn selection_copies_visible_arena_gap_and_code() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, true);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            true,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -8482,7 +8550,13 @@ warning body"
             },
             false,
         );
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(2),
@@ -8521,7 +8595,13 @@ truncated"
     #[test]
     fn projection_reliable_records_beat_lossy_progress() {
         let mut transcript = Transcript::default();
-        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED
+            },
+            false
+        ));
         assert!(transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -8550,7 +8630,13 @@ truncated"
     #[test]
     fn projection_stale_progress_is_a_visible_no_op() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(2),
@@ -8588,7 +8674,13 @@ truncated"
     #[test]
     fn projection_retry_resets_only_live_generated_content() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -8664,7 +8756,13 @@ truncated"
     #[test]
     fn projection_keeps_completed_summary_after_replacing_live_content() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -8702,7 +8800,13 @@ truncated"
             final_message(1, 1, "older result", Vec::new(), false),
             false,
         );
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
@@ -8728,7 +8832,13 @@ truncated"
     #[test]
     fn projection_settles_gaps_with_their_live_or_reliable_content() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, true);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            true,
+        );
         transcript.apply(
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
@@ -8744,7 +8854,13 @@ truncated"
 
         transcript.apply(final_message(1, 2, "settled", Vec::new(), true), false);
         transcript.apply(RuntimeEvent::RunSettled { run_id: RunId(1) }, false);
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(2),
@@ -9436,7 +9552,13 @@ truncated"
         assert!(settled_footer.contains("80.0%/272k"));
         assert!(!settled_footer.contains("CH25.0%"));
 
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(2),
@@ -10015,7 +10137,13 @@ truncated"
         let first = detailed_usage(Some(100), Some(0), Some(0), Some(0), Some(0), Some(100));
         let residual = detailed_usage(Some(0), Some(100), Some(0), Some(0), Some(20), Some(100));
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -10077,7 +10205,13 @@ truncated"
             transcript.status(),
             "OpenAI authentication failed; restart Kiki"
         );
-        assert!(!transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        assert!(!transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED
+            },
+            false
+        ));
     }
 
     #[test]
@@ -10370,7 +10504,13 @@ truncated"
     #[test]
     fn rendering_live_prefixes_converge_on_authoritative_markdown() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         for progress in [
             ModelProgress::ReasoningSummaryChunk {
                 text: "# Live reasoning".to_owned(),
@@ -10434,7 +10574,13 @@ truncated"
     #[test]
     fn rendering_live_arena_owns_live_details() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         for progress in [
             ModelProgress::AttemptStarted { attempt: 1 },
             ModelProgress::ReasoningSummaryChunk {
@@ -10808,7 +10954,13 @@ truncated"
     #[test]
     fn execution_start_replaces_streamed_text_with_authoritative_commentary_before_the_arena() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -10953,7 +11105,13 @@ truncated"
     fn rendering_normalises_every_dynamic_source_before_projection() {
         let hostile = "\x1b]title\x07\r\t\u{009d}";
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(99) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(99),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ToolUpdated {
                 run_id: RunId(99),
@@ -11177,7 +11335,13 @@ truncated"
     #[test]
     fn rendering_attaches_progress_gaps_to_live_and_reliable_blocks() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, true);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            true,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -11200,7 +11364,13 @@ truncated"
     #[test]
     fn code_step_renders_path_free_tool_calls_between_code_and_output() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -12236,7 +12406,13 @@ truncated"
     #[test]
     fn live_run_events_upsert_delayed_and_duplicate_updates() {
         let mut transcript = Transcript::default();
-        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED
+            },
+            false
+        ));
         let token = ToolCallToken::for_test(0);
 
         assert!(apply_run_preview(&mut transcript, token, "first output"));
@@ -12438,7 +12614,13 @@ truncated"
             token,
             ToolCallSummary::Exit(0)
         ));
-        assert!(!transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        assert!(!transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED
+            },
+            false
+        ));
         assert!(!transcript.apply(
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
@@ -12671,7 +12853,13 @@ truncated"
     #[test]
     fn live_code_step_shows_settled_reads_and_stdout_preview() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -12754,7 +12942,13 @@ truncated"
     #[test]
     fn live_tool_updates_target_their_opaque_trace_tokens() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
@@ -12898,7 +13092,13 @@ truncated"
     #[test]
     fn cards_map_live_completed_and_terminal_evidence_to_typed_states() {
         let mut live = Transcript::default();
-        live.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        live.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         live.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -13107,7 +13307,13 @@ truncated"
         );
 
         let mut started = Transcript::default();
-        started.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        started.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         started.apply(
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(2),
@@ -13306,7 +13512,13 @@ truncated"
         assert_eq!(def.bg, DARK.tool_success_bg);
 
         let mut live = Transcript::default();
-        live.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        live.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(2),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         live.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
@@ -13427,7 +13639,13 @@ truncated"
     #[test]
     fn projection_updates_status_through_live_and_settlement_events() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(3) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(3),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         assert_eq!(transcript.status(), "starting run");
 
         transcript.apply(
@@ -13588,7 +13806,13 @@ truncated"
     #[test]
     fn feedback_live_final_text_owns_settled_accounting_once() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -13746,7 +13970,13 @@ truncated"
     #[test]
     fn feedback_hides_identifiers_without_changing_stale_event_authority() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(73) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(73),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(73),

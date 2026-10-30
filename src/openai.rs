@@ -6684,7 +6684,7 @@ pub(crate) mod tests {
             }
 
             match event {
-                RuntimeEvent::RunStarted { run_id } => {
+                RuntimeEvent::RunStarted { run_id, .. } => {
                     self.run_mut(*run_id);
                 }
                 RuntimeEvent::ModelStepStarted {
@@ -6769,6 +6769,7 @@ pub(crate) mod tests {
                 | RuntimeEvent::SubagentFinished { .. }
                 | RuntimeEvent::SubagentOperationSettled { .. }
                 | RuntimeEvent::SettingsAccepted { .. }
+                | RuntimeEvent::TodoEnabledAccepted { .. }
                 | RuntimeEvent::NameAccepted { .. }
                 | RuntimeEvent::NavigationCompleted { .. }
                 | RuntimeEvent::CorrectionCompleted { .. }

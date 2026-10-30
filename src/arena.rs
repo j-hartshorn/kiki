@@ -1221,6 +1221,14 @@ impl Arena {
         &self.todos
     }
 
+    pub(crate) fn capture_todo_policy(&mut self, policy: TodoPolicy) {
+        if self.todo_policy != policy {
+            self.todo_policy = policy;
+            // The next execution restores and reapplies policy to retained aliases.
+            self.checkout.take();
+        }
+    }
+
     pub async fn apply_todo_policy(&mut self, policy: TodoPolicy) -> Result<(), ArenaError> {
         self.todo_policy = policy;
         self.checkout.take();
