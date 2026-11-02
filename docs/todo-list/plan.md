@@ -377,3 +377,32 @@ that cannot honor the agreed source contract.
   then explicitly authorized merge/cleanup/push. Automated terminal tests cover
   modes, local inspection, retained owners, drafts, overflow, Unicode and resizing;
   no claim is made of a separate exhaustive live-provider manual test matrix.
+
+- Final review: whole-branch correctness CLEAN against main3e19848. Simplification
+  identified two valid Clear-now changes; both implemented and independently
+  rechecked CLEAN for correctness and simplification. Child construction now owns
+  in-place empty reset, admitted policy, and a single final dump; runner/proof
+  orchestration and parent-policy carry were removed. Direct-constructor regression
+  observed inherited-parent-list red, then green, while retaining all behavioral
+  coverage for aliases/functions/IDs/parents/siblings/nested/read-only/policy timing.
+- Removed unused TODO next/pending revision state and command/event revision fields;
+  boolean acceptance remains the runtime synchronization barrier. This supersedes
+  task6's TODO revision plumbing only; RunStarted still carries effective policy.
+  Structural removal has no new behavior requiring a red test. Existing save-error,
+  latest-choice/stale-ack, draft, ordering and per-Run policy assertions remain.
+- Borderline proof-suite consolidation retained: bootstrap visibility, hidden
+  mutation, snapshot independence and transferable-data assertions are distinct;
+  no coverage-equivalent deletion was established. Context anchors, shared detail
+  budgets and stable retained owner identity remain earned complexity.
+- Final verification: target/todo-verification/todo-final-review-fixes.7h4MHi exit0;
+  RUST_TEST_THREADS=2 just test passed1937unit+22CLI,8ignored; lint/fmt/diffcheck
+  passed. Exact frozen source snapshot matched before task-sized fix commits.
+  No source/dependency/config/environment changes followed; commit/documentation
+  metadata alone does not invalidate this evidence. Final-review attempts that
+  exhausted reviewer Arena memory supplied no verdict; bounded excerpt retries
+  completed the full review and both substantive-fix rechecks successfully.
+- User accepted the UI and explicitly requested merge/cleanup/push. Local execution
+  evidence and review reports preserved outside the feature worktree at
+  target/todo-list-release.g40x1py1; older root TODO drafts will be preserved there
+  before merge. Unrelated root research files and other worktrees remain untouched.
+  No production rollout command or live-provider test was run or claimed passed.
