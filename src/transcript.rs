@@ -7194,7 +7194,13 @@ mod tests {
     #[test]
     fn responsive_streamed_tables_reflow_then_settle_without_stale_rows() {
         let mut transcript = Transcript::default();
-        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::RunStarted {
+                run_id: RunId(1),
+                todo_policy: crate::todos::TodoPolicy::ENABLED,
+            },
+            false,
+        );
         let mut source = String::new();
         for (index, chunk) in ["| H |", "\n| --- |", "\n| one two", " six", " ten |"]
             .into_iter()
@@ -7411,7 +7417,13 @@ mod tests {
             for live in [false, true] {
                 let mut transcript = Transcript::default();
                 if live {
-                    transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+                    transcript.apply(
+                        RuntimeEvent::RunStarted {
+                            run_id: RunId(1),
+                            todo_policy: crate::todos::TodoPolicy::ENABLED,
+                        },
+                        false,
+                    );
                     assert!(transcript.apply(
                         RuntimeEvent::ModelProgress {
                             run_id: RunId(1),

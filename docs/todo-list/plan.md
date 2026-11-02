@@ -362,3 +362,18 @@ that cannot honor the agreed source contract.
   TODO UI regressions include observed padding red->green. Independent task review
   CLEAN, no must/should findings. User visually accepted the displayed UI; automated
   tests cover additional modes, retention, Unicode, scrolling and small terminals.
+
+- Task 8: integrated current main at3e19848 without conflicts (feature integration
+  commit74488e3). Two newly added table tests needed RunStarted.todo_policy; supplied
+  default Enabled without changing any behavior/assertions. Added README controls,
+  defaults/precedence, object/identity/limits, context timing, child independence,
+  restoration, viewer navigation and pre-v4 read-only compatibility guidance.
+- Integrated verification: target/todo-verification/todo-integrated-main-final.Luh0e1
+  exit0; RUST_TEST_THREADS=2 just test passed1936unit+22CLI,8ignored; justlint,
+  fmtcheck and diffcheck passed. Source diff matched before this documentation-only
+  record. Independent task8 review CLEAN. Reuse this evidence unless code,
+  dependencies, configuration or environment change; commits alone do not invalidate it.
+- User visually exercised and accepted the UI, requested the active-Run spacer,
+  then explicitly authorized merge/cleanup/push. Automated terminal tests cover
+  modes, local inspection, retained owners, drafts, overflow, Unicode and resizing;
+  no claim is made of a separate exhaustive live-provider manual test matrix.

@@ -191,6 +191,77 @@ model = "anthropic/claude-opus-5-5"
 
 `Ctrl-S` in either model or thinking picker writes the user default separately from the active session setting; `/theme` writes the user default on `Enter` or `Ctrl-S`. If project settings or environment variables mask it, Kiki reports that override.
 
+## TODO lists
+
+Each agent has an optional, Arena-owned checklist. TODOs are enabled by default
+with the **All** display. Configure them through `/settings` → **TODO list** or
+user/project settings (project fields override user fields independently):
+
+```toml
+[todos]
+enabled = true
+display = "all" # "all", "current", or "none"
+```
+
+- **All** shows every item in order. **Current** shows only explicitly
+  `in_progress` items, hiding the checklist when there are none. **None** hides
+  all automatic TODO headers, counts, and items without disabling the capability
+  or the explicit viewer. Display changes take effect immediately.
+- **Enabled** controls capability availability for newly started Runs and newly
+  admitted children. Active Runs retain their admitted policy; changing this
+  preference does not cancel them or erase their lists. Idle and terminal-owner
+  inspection follows the current preference. Confirming a menu choice saves the
+  user default; masked settings and save failures are reported.
+
+The foreground checklist is pinned above the prompt. It uses a flat visual tree
+with completed/total progress and `✓`, `◐`, and `○` status markers. Active Runs
+have one blank row above it. Child checklists appear under their existing
+lifecycle rows. Both displays are bounded so prompt and lifecycle information
+retain priority in short terminals; overflow points to `/todos`.
+
+`/todos` opens a local, read-only full-list viewer, including in **None** mode.
+With children, select an owner first; retained terminal children on the selected
+branch remain inspectable after their sticky rows disappear. Use arrows to
+select an owner and `Enter` to inspect; inside a list use `Up`/`Down`,
+`PageUp`/`PageDown`, or `Home`/`End` to scroll. `Esc` returns or closes. The viewer
+starts no model work and does not edit the prompt draft. Disabled owners do not
+expose their lists.
+
+Codemode uses the pre-created synchronous `todos` object:
+
+```python
+item_id = todos.add("Inspect existing code", status="in_progress")
+todos.update(item_id, status="completed")
+items = todos.snapshot()
+todos.remove(item_id)
+todos.replace([])
+```
+
+Statuses are `pending`, `in_progress`, and `completed`. Each list accepts at most
+64 items and each text at most 512 Unicode code points, with no silent truncation.
+Invalid values raise `ValueError`, unknown IDs raise `KeyError`, and disabled
+methods raise `RuntimeError`; failed validation does not mutate the list.
+Snapshots are independent ordinary dictionaries containing `id`, `text`, and
+`status`. `replace` accepts a list of these dictionaries, requires text/status,
+ignores supplied IDs, and allocates fresh IDs. IDs are local to the list and
+are not reused after removal or clear along the selected history.
+
+Lists and their ID allocators restore with Arena checkpoints. Each child,
+including nested children, starts with its own empty list; lists are not copied
+from or automatically merged into the parent. Committed changes survive ordinary
+Python errors; discarded executions publish no uncommitted TODO changes.
+
+The model receives its own full list, including completed items, at foreground
+Run start/child launch and after successful compaction. This capture is independent
+of display mode, represents empty lists explicitly, and is superseded by later
+accepted mutations. It is not refreshed after every step, does not expose child
+lists to the parent automatically, and never schedules automatic continuation.
+
+**Checkpoint compatibility:** this feature upgrades the executable checkpoint
+contract to `type-check-v4`. Older sessions remain history-readable but cannot
+resume execution, even when TODOs are disabled. There is no checkpoint migration;
+start a fresh session for executable work.
+
 ## Subagents
 
 Subagent settings use the same user/project precedence as model settings. Omitted fields use these defaults:
@@ -264,6 +335,7 @@ Returned token usage has a local direct-API estimate, not a provider bill. OpenA
 - Model and thinking changes from `/model`, `/thinking`, `Shift-Tab`, or the picker are saved as soon as they apply. A change made during a run applies from the next run; the active run keeps the selection it started with.
 - When a run's model or thinking differs from the previous run on the branch, a muted `Model selected: <model> · <thinking>` card sits above its request. There is no card for the first run, or when either run was saved without its selection. When the current selection, including a `Shift-Tab` preview, differs from the last run's, the same card sits above the prompt, reading `[pending] Model selected: …` until the change applies, and settles into history when the next run starts.
 - `/model` and `/thinking` open their selectors; exact arguments select immediately. `/settings` and `/theme` open the settings and theme selectors. `/name <name>` gives this session a name, shown in the footer and terminal title. `/compact [instructions]` manually compacts the selected context, optionally focusing its summary. `/tree` opens the session-tree picker; `Ctrl-R` and settled double-`Esc` open it without clearing a draft.
+- `/todos` opens the local read-only TODO viewer; `/settings` → **TODO list** controls availability and All/Current/None display.
 - `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
 - `PageUp` / `PageDown` scroll history ten lines; manual scrolling anchors its numeric document top. New history follows only at the newest page; reaching it or `Ctrl-End` resumes following. `Ctrl-Home` jumps to the oldest history. The mouse wheel scrolls history one line per event.
