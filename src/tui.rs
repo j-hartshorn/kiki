@@ -5494,7 +5494,7 @@ mod tests {
         let buffer = rendered_buffer(&mut app, 80, 8);
         assert_eq!(
             buffer[(0, 7)].fg,
-            super::thinking_rule_colour(&DARK, super::DEFAULT_MODEL.thinking_levels, "high")
+            super::thinking_rule_colour(&DARK, super::DEFAULT_MODEL.thinking_levels, "xhigh")
         );
     }
 
@@ -7305,6 +7305,7 @@ mod tests {
                 "OpenAI",
                 "openai/gpt-6-astra",
                 "openai/gpt-6.1-sol",
+                "openai/gpt-6.1-terra",
                 "openai/gpt-6-sol",
                 "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
@@ -7337,6 +7338,7 @@ mod tests {
                 "OpenAI",
                 "openai/gpt-6-astra",
                 "openai/gpt-6.1-sol",
+                "openai/gpt-6.1-terra",
                 "openai/gpt-6-sol",
                 "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
@@ -7421,6 +7423,7 @@ mod tests {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
         for (id, thinking) in [
             ("openai/gpt-6.1-sol", "medium"),
+            ("openai/gpt-6.1-terra", "high"),
             ("anthropic/claude-sonnet-5-5", "high"),
         ] {
             let update = enter_at(&mut app, &format!("/model {id}"), now);
@@ -8167,7 +8170,7 @@ mod tests {
     fn picker_enter_applies_its_filtered_selection_and_escape_discards_it() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
-        let open = enter_at(&mut app, "/model terra", now);
+        let open = enter_at(&mut app, "/model 5.6-terra", now);
         assert!(open.commands.is_empty());
 
         let update = app.handle_key_at(key(KeyCode::Enter), now);
@@ -13629,7 +13632,7 @@ mod tests {
             footer.contains("↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k"),
             "{footer}"
         );
-        assert!(footer.contains("gpt-6.1-sol • thinking medium"), "{footer}");
+        assert!(footer.contains("gpt-6.1-terra • thinking high"), "{footer}");
     }
 
     #[test]

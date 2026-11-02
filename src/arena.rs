@@ -6408,7 +6408,7 @@ mod tests {
         .await;
         assert_eq!(
             complete(&execution).unwrap().head,
-            "('google/gemini-4-argon', 'medium', 'openai/gpt-5.6-terra', 'high')"
+            "('openai/gpt-6.1-terra', 'high', 'openai/gpt-5.6-terra', 'high')"
         );
         assert_eq!(received.recv().await, Some(invoking));
         assert_eq!(received.recv().await, Some(terra));

@@ -897,7 +897,10 @@ fn prompt_source_path(source: &PromptSource) -> &Path {
 
 #[cfg(test)]
 pub(crate) fn ready_snapshot_for_test() -> StartupSnapshot {
-    ready_snapshot_with_settings_for_test(None, Path::new("/workspace/project"))
+    let mut snapshot = ready_snapshot_with_settings_for_test(None, Path::new("/workspace/project"));
+    snapshot.model = &models::GPT6_1_SOL;
+    snapshot.thinking = models::GPT6_1_SOL.default_thinking;
+    snapshot
 }
 
 #[cfg(test)]
@@ -965,7 +968,7 @@ mod tests {
     use crate::config::{
         ModelSelection, SessionPreferences,
         models::{
-            ASTRA, GEMINI_3_8_FLASH, GEMINI_4_ARGON, GPT6_1_SOL, LUNA, OPUS_5_5, Provider, SOL,
+            ASTRA, GEMINI_3_8_FLASH, GEMINI_4_ARGON, GPT6_1_TERRA, LUNA, OPUS_5_5, Provider, SOL,
             TERRA,
         },
     };
@@ -1056,7 +1059,7 @@ mod tests {
 
         assert_eq!(snapshot.worker_path().unwrap().as_str(), WORKER_PATH);
         assert_eq!(snapshot.workspace_root().unwrap().as_str(), WORKSPACE_ROOT);
-        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_TERRA));
         assert_eq!(
             snapshot.prompt_source(),
             &PromptProvenance::Bundled { name: "system" }
@@ -1162,7 +1165,7 @@ mod tests {
     fn default_model_selection_follows_authenticated_provider_priority() {
         let openai_only = resolve_startup(ready_input("sk-openai"));
         assert!(openai_only.snapshot().problems().is_empty());
-        assert!(std::ptr::eq(openai_only.snapshot().model(), &GPT6_1_SOL));
+        assert!(std::ptr::eq(openai_only.snapshot().model(), &GPT6_1_TERRA));
 
         let anthropic_only = resolve_startup(anthropic_only_input("sk-ant"));
         assert!(anthropic_only.snapshot().problems().is_empty());
@@ -1195,7 +1198,7 @@ mod tests {
         assert!(google_and_openai.snapshot().problems().is_empty());
         assert!(std::ptr::eq(
             google_and_openai.snapshot().model(),
-            &GEMINI_4_ARGON
+            &GPT6_1_TERRA
         ));
 
         let mut openai_and_anthropic = ready_input("sk-openai");
@@ -1204,7 +1207,7 @@ mod tests {
         assert!(openai_and_anthropic.snapshot().problems().is_empty());
         assert!(std::ptr::eq(
             openai_and_anthropic.snapshot().model(),
-            &GPT6_1_SOL
+            &GPT6_1_TERRA
         ));
 
         let mut all_three = ready_input("sk-openai");
@@ -1212,12 +1215,12 @@ mod tests {
         all_three.gemini_api_key = Some(OsString::from("AIza-google"));
         let all_three = resolve_startup(all_three);
         assert!(all_three.snapshot().problems().is_empty());
-        assert!(std::ptr::eq(all_three.snapshot().model(), &GEMINI_4_ARGON));
+        assert!(std::ptr::eq(all_three.snapshot().model(), &GPT6_1_TERRA));
 
         let mut no_keys = ready_input("");
         no_keys.openai_api_key = None;
         let no_keys = resolve_startup(no_keys);
-        assert!(std::ptr::eq(no_keys.snapshot().model(), &GEMINI_4_ARGON));
+        assert!(std::ptr::eq(no_keys.snapshot().model(), &GPT6_1_TERRA));
         assert!(no_keys.ready().is_none());
         let [problem] = no_keys.snapshot().problems() else {
             panic!(
@@ -1226,10 +1229,10 @@ mod tests {
             );
         };
         assert_eq!(problem.kind(), StartupProblemKind::ApiKeyMissing);
-        assert_eq!(problem.diagnostic(), "GEMINI_API_KEY is missing or empty.");
+        assert_eq!(problem.diagnostic(), "OPENAI_API_KEY is missing or empty.");
         assert_eq!(
             problem.remediation(),
-            "Set GEMINI_API_KEY to a non-empty Google API key or run `kiki login google`, then restart Kiki."
+            "Set OPENAI_API_KEY to a non-empty OpenAI API key or run `kiki login openai`, then restart Kiki."
         );
     }
 
@@ -1262,7 +1265,7 @@ mod tests {
         let mut invalid_env = ready_input("sk-openai");
         invalid_env.model = Some(OsString::from("openai/unknown"));
         let invalid_env = resolve_startup(invalid_env);
-        assert!(std::ptr::eq(invalid_env.snapshot().model(), &GPT6_1_SOL));
+        assert!(std::ptr::eq(invalid_env.snapshot().model(), &GPT6_1_TERRA));
     }
 
     #[test]
@@ -1298,7 +1301,7 @@ mod tests {
         let snapshot = configuration.snapshot();
 
         assert!(snapshot.problems().is_empty());
-        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_TERRA));
         assert_eq!(
             snapshot.api_key_presence(Provider::OpenAi),
             ApiKeyPresence::Present
@@ -1425,8 +1428,8 @@ mod tests {
                 .remediation()
                 .contains("chmod 600 ~/.kiki/auth.toml")
         );
-        assert!(problems[1].remediation().contains("Set GEMINI_API_KEY"));
-        assert!(problems[1].remediation().contains("kiki login google"));
+        assert!(problems[1].remediation().contains("Set OPENAI_API_KEY"));
+        assert!(problems[1].remediation().contains("kiki login openai"));
 
         let mut input = ready_input("sk-environment");
         input.stored_api_keys = Err(crate::config::auth::AuthError::Malformed);
@@ -1606,12 +1609,13 @@ mod tests {
     }
 
     #[test]
-    fn unset_model_uses_sol_and_keeps_submission_available() {
+    fn unset_model_uses_terra_with_high_thinking_and_keeps_submission_available() {
         let configuration = resolve_startup(ready_input("key"));
         let snapshot = configuration.snapshot();
 
-        assert_eq!(snapshot.model().id, "openai/gpt-6.1-sol");
-        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
+        assert_eq!(snapshot.model().id, "openai/gpt-6.1-terra");
+        assert_eq!(snapshot.thinking(), "high");
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_TERRA));
         assert_eq!(
             snapshot.submission_availability(),
             SubmissionAvailability::Available
@@ -1621,7 +1625,7 @@ mod tests {
                 .ready()
                 .expect("configuration should be ready")
                 .model(),
-            &GPT6_1_SOL
+            &GPT6_1_TERRA
         ));
     }
 
@@ -1654,6 +1658,7 @@ mod tests {
     fn new_models_are_selectable_from_the_environment() {
         for (id, thinking) in [
             ("openai/gpt-6.1-sol", "medium"),
+            ("openai/gpt-6.1-terra", "high"),
             ("anthropic/claude-sonnet-5-5", "high"),
         ] {
             let mut input = ready_input("openai-key");
@@ -1795,9 +1800,9 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6.1-terra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
             );
-            assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
+            assert!(std::ptr::eq(snapshot.model(), &GPT6_1_TERRA));
             assert_eq!(
                 snapshot.submission_availability(),
                 SubmissionAvailability::Unavailable
@@ -1831,9 +1836,9 @@ mod tests {
         );
         assert_eq!(
             snapshot.problems()[0].remediation(),
-            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
+            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6.1-sol, openai/gpt-6.1-terra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, anthropic/claude-fable-5-1, google/gemini-4-argon, google/gemini-3.8-flash) or leave it unset, then restart Kiki."
         );
-        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_SOL));
+        assert!(std::ptr::eq(snapshot.model(), &GPT6_1_TERRA));
         assert_eq!(
             snapshot.submission_availability(),
             SubmissionAvailability::Unavailable
@@ -2315,7 +2320,9 @@ mod tests {
 
         assert!(rendered.contains("Worker: /worker/[redacted]/monty    \\x1B"));
         assert!(rendered.contains("Workspace: /workspace/[redacted]/project\\x0D"));
-        assert!(rendered.contains("Model: openai/gpt-6.1-sol (context: 1.05m, max output: 128k)"));
+        assert!(
+            rendered.contains("Model: openai/gpt-6.1-terra (context: 1.05m, max output: 128k)")
+        );
         assert!(rendered.contains("Prompt: override /prompts/[redacted]/agent    \\x1B.md"));
         assert!(rendered.contains("OpenAI API key: present"));
         assert!(rendered.contains("Anthropic API key: missing"));
