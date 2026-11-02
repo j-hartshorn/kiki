@@ -143,7 +143,7 @@ impl CardId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowBreak {
+pub(crate) enum RowBreak {
     Hard,
     Soft,
     SoftWord,
@@ -156,6 +156,13 @@ pub(crate) struct RowBreaks {
 }
 
 impl RowBreaks {
+    pub(crate) fn single(break_before: RowBreak) -> Self {
+        Self {
+            start: 0,
+            breaks: vec![break_before],
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_text(text: &Text<'_>, width: u16) -> Self {
         let mut breaks = Vec::new();
@@ -446,7 +453,13 @@ fn extract_row(buffer: &Buffer, area: Rect, y: u16, columns: Range<u16>) -> Stri
         }
         x = end;
     }
-    text.truncate(text.trim_end().len());
+    // Non-breaking spaces are source content, including on emergency token wraps.
+    text.truncate(
+        text.trim_end_matches(|ch: char| {
+            ch.is_whitespace() && !matches!(ch, '\u{00a0}' | '\u{2007}' | '\u{202f}')
+        })
+        .len(),
+    );
     text
 }
 

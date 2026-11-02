@@ -32,12 +32,14 @@ use crate::runtime::{
     RuntimeInitialState, StoredRecord, TerminalDetails,
 };
 use crate::selection::{
-    CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
+    CardId, Extraction, RowBreak, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
 use crate::session::{CompactionOutcome, CompactionReason};
 use crate::skills::SkillOrigin;
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 use crate::theme::{DARK, LIGHT, Theme};
+
+mod markdown;
 
 #[derive(Clone, Copy)]
 struct MarkdownStyleSheet {
@@ -179,6 +181,7 @@ fn markdown_options(theme: &'static Theme) -> &'static MarkdownOptions {
     }
 }
 
+#[cfg(test)]
 fn markdown<'a>(
     source: &'a str,
     theme: &'static Theme,
@@ -189,6 +192,19 @@ fn markdown<'a>(
         construction_counts.markdown += 1;
     }
     from_str_with_options(source, markdown_options(theme))
+}
+
+fn markdown_layout(
+    source: &str,
+    theme: &'static Theme,
+    width: u16,
+    #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
+) -> markdown::MarkdownLayout {
+    #[cfg(test)]
+    if let Some(counts) = construction_counts {
+        counts.markdown += 1;
+    }
+    markdown::render(source, width, theme)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -581,6 +597,11 @@ fn effective_padding(width: u16, wanted: u16) -> (u16, u16) {
     let total = wanted.saturating_mul(2).min(width.saturating_sub(1));
     let left = wanted.min(total.saturating_add(1) / 2);
     (left, total.saturating_sub(left))
+}
+
+fn effective_content_width(width: u16, wanted: u16) -> u16 {
+    let (left, right) = effective_padding(width, wanted);
+    width.saturating_sub(left.saturating_add(right))
 }
 
 fn logical_lines(text: &str) -> Vec<&str> {
@@ -1018,25 +1039,24 @@ fn assistant_text(
     theme: &'static Theme,
     markdown_source: &str,
     accounting: Option<String>,
+    width: u16,
     #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
-) -> Text<'static> {
-    let mut text = own_styled_text(
-        markdown(
-            markdown_source,
-            theme,
-            #[cfg(test)]
-            construction_counts,
-        ),
-        page_style(theme),
+) -> markdown::MarkdownLayout {
+    let mut layout = markdown_layout(
+        markdown_source,
+        theme,
+        width,
+        #[cfg(test)]
+        construction_counts,
     );
+    layout.text = own_styled_text(layout.text, page_style(theme).fg(Color::Reset));
     if let Some(accounting) = accounting {
         if !markdown_source.is_empty() {
-            text.lines.push(Line::raw(""));
+            layout.push_original(Line::raw(""));
         }
-        text.lines
-            .push(accounting_line(accounting, muted_page_style(theme)));
+        layout.push_original(accounting_line(accounting, muted_page_style(theme)));
     }
-    text
+    layout
 }
 
 fn literal_text(text: &str, style: Style) -> Text<'static> {
@@ -1180,6 +1200,7 @@ fn selectable_text_regions(
     placement: TextPlacement,
     card: CardId,
     buffer: &Buffer,
+    rows: Option<&MarkdownRows>,
 ) -> Vec<SelectableRegion> {
     if placement.width == 0 {
         return Vec::new();
@@ -1187,31 +1208,57 @@ fn selectable_text_regions(
 
     let mut regions = Vec::new();
     let mut line_top = placement.text_top;
-    for line in &text.lines {
+    for (index, line) in text.lines.iter().enumerate() {
         let line_text = Text::from(line.clone());
-        let line_height = Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(placement.width);
+        let kind = rows
+            .and_then(|rows| rows.breaks.get(index))
+            .copied()
+            .unwrap_or(markdown::LineBreak::Original);
+        let prepared = kind != markdown::LineBreak::Original;
+        let line_height = if prepared {
+            1
+        } else {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(placement.width)
+        };
         if let Some(clip) = vertical_clip(
             line_top,
             line_height,
             placement.top,
             placement.viewport.height,
         ) {
-            let breaks = RowBreaks::for_rows(
-                &line_text,
-                placement.width,
-                clip.top.saturating_sub(line_top),
-                clip.bottom.saturating_sub(clip.top),
-            );
+            let breaks = if prepared {
+                RowBreaks::single(match kind {
+                    markdown::LineBreak::Word => RowBreak::SoftWord,
+                    markdown::LineBreak::Token => RowBreak::Soft,
+                    _ => RowBreak::Hard,
+                })
+            } else {
+                RowBreaks::for_rows(
+                    &line_text,
+                    placement.width,
+                    clip.top.saturating_sub(line_top),
+                    clip.bottom.saturating_sub(clip.top),
+                )
+            };
+            let skip = rows
+                .and_then(|rows| rows.prefixes.get(index))
+                .copied()
+                .unwrap_or(0)
+                .min(usize::from(placement.width)) as u16;
             let y = placement.viewport.y.saturating_add(
                 u16::try_from(clip.top.saturating_sub(placement.top)).unwrap_or(u16::MAX),
             );
             let height = u16::try_from(clip.bottom.saturating_sub(clip.top)).unwrap_or(u16::MAX);
             let area = Rect::new(
-                placement.viewport.x.saturating_add(placement.x),
+                placement
+                    .viewport
+                    .x
+                    .saturating_add(placement.x)
+                    .saturating_add(skip),
                 y,
-                placement.width,
+                placement.width.saturating_sub(skip),
                 height,
             );
             if matches!(line.alignment.or(text.alignment), Some(Alignment::Right)) {
@@ -1290,6 +1337,7 @@ impl ArenaText {
             },
             card,
             buffer,
+            None,
         )
     }
 
@@ -1500,7 +1548,16 @@ impl NormalisedBlock {
             Self::Assistant {
                 markdown: source,
                 accounting,
-            } => assistant_text(&crate::theme::DARK, source, accounting.clone(), None),
+            } => {
+                assistant_text(
+                    &crate::theme::DARK,
+                    source,
+                    accounting.clone(),
+                    u16::MAX,
+                    None,
+                )
+                .text
+            }
             _ => Text::raw(self.plain_text()),
         };
         Paragraph::new(text).wrap(Wrap { trim: false })
@@ -1577,25 +1634,80 @@ impl RenderBlock {
         horizontal_padding: u16,
         vertical_padding: u16,
     ) -> Self {
-        let (left_padding, right_padding) = effective_padding(width, horizontal_padding);
-        let content_width = width.saturating_sub(left_padding.saturating_add(right_padding));
-        let content_height = if content_width > 0 {
-            Paragraph::new(text.clone())
-                .style(style)
-                .wrap(Wrap { trim: false })
-                .line_count(content_width)
-        } else {
-            0
-        };
-        Self::Card(CardRenderBlock {
+        Self::card_with_rows(
             text,
+            None,
+            style,
+            width,
+            horizontal_padding,
+            vertical_padding,
+        )
+    }
+
+    fn markdown_card(
+        layout: markdown::MarkdownLayout,
+        style: Style,
+        width: u16,
+        horizontal_padding: u16,
+        vertical_padding: u16,
+    ) -> Self {
+        let rows = if layout
+            .breaks
+            .iter()
+            .any(|kind| *kind != markdown::LineBreak::Original)
+        {
+            Some(MarkdownRows {
+                breaks: layout.breaks,
+                prefixes: layout.prefixes,
+            })
+        } else {
+            None
+        };
+        Self::card_with_rows(
+            layout.text,
+            rows,
+            style,
+            width,
+            horizontal_padding,
+            vertical_padding,
+        )
+    }
+
+    fn card_with_rows(
+        text: Text<'static>,
+        rows: Option<MarkdownRows>,
+        style: Style,
+        width: u16,
+        horizontal_padding: u16,
+        vertical_padding: u16,
+    ) -> Self {
+        let (left_padding, right_padding) = effective_padding(width, horizontal_padding);
+        let content_width = effective_content_width(width, horizontal_padding);
+        let mut card = CardRenderBlock {
+            text,
+            rows: rows.map(Box::new),
             style,
             left_padding,
             right_padding,
             top_padding: vertical_padding,
             bottom_padding: vertical_padding,
-            height: content_height.saturating_add(usize::from(vertical_padding).saturating_mul(2)),
-        })
+            height: 0,
+        };
+        let content_height = if content_width == 0 {
+            0
+        } else if card.rows.is_some() {
+            (0..card.text.lines.len())
+                .map(|index| card.line_paragraph(index).line_count(content_width))
+                .fold(0usize, usize::saturating_add)
+        } else {
+            Paragraph::new(card.text.clone())
+                .style(style)
+                .wrap(Wrap { trim: false })
+                .line_count(content_width)
+        };
+        card.height =
+            content_height.saturating_add(usize::from(vertical_padding).saturating_mul(2));
+        Self::Card(card)
     }
 
     fn height(&self) -> usize {
@@ -1627,7 +1739,13 @@ impl RenderBlock {
     }
 }
 
+struct MarkdownRows {
+    breaks: Vec<markdown::LineBreak>,
+    prefixes: Vec<usize>,
+}
+
 struct CardRenderBlock {
+    rows: Option<Box<MarkdownRows>>,
     text: Text<'static>,
     style: Style,
     left_padding: u16,
@@ -1638,6 +1756,23 @@ struct CardRenderBlock {
 }
 
 impl CardRenderBlock {
+    fn line_paragraph(&self, index: usize) -> Paragraph<'static> {
+        let mut text = Text::from(self.text.lines[index].clone());
+        text.style = self.text.style;
+        text.alignment = self.text.alignment;
+        let paragraph = Paragraph::new(text).style(self.style);
+        if self
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.breaks.get(index))
+            .is_some_and(|kind| *kind != markdown::LineBreak::Original)
+        {
+            paragraph
+        } else {
+            paragraph.wrap(Wrap { trim: false })
+        }
+    }
+
     fn selectable_regions(
         &self,
         viewport: Rect,
@@ -1660,6 +1795,7 @@ impl CardRenderBlock {
             },
             card,
             buffer,
+            self.rows.as_deref(),
         )
     }
 
@@ -1691,6 +1827,36 @@ impl CardRenderBlock {
             .width
             .saturating_sub(self.left_padding.saturating_add(self.right_padding));
         if text_width == 0 {
+            return;
+        }
+        if self.rows.is_some() {
+            let mut line_top = text_top;
+            for index in 0..self.text.lines.len() {
+                let paragraph = self.line_paragraph(index);
+                let line_height = paragraph.line_count(text_width);
+                if let Some(clip) = vertical_clip(line_top, line_height, top, viewport.height) {
+                    let y = viewport.y.saturating_add(
+                        u16::try_from(clip.top.saturating_sub(top)).unwrap_or(u16::MAX),
+                    );
+                    let height =
+                        u16::try_from(clip.bottom.saturating_sub(clip.top)).unwrap_or(u16::MAX);
+                    paragraph
+                        .scroll((
+                            u16::try_from(clip.top.saturating_sub(line_top)).unwrap_or(u16::MAX),
+                            0,
+                        ))
+                        .render(
+                            Rect::new(
+                                viewport.x.saturating_add(self.left_padding),
+                                y,
+                                text_width,
+                                height,
+                            ),
+                            buffer,
+                        );
+                }
+                line_top = line_top.saturating_add(line_height);
+            }
             return;
         }
         Paragraph::new(self.text.clone())
@@ -3641,27 +3807,31 @@ fn build_render_block(
         NormalisedBlock::Compaction(card) => {
             let background = card.state.background(theme);
             let style = card_style(theme, background);
-            let mut text = if expand_arenas {
+            let mut layout = if expand_arenas {
                 match &card.expanded {
-                    CompactionContent::Markdown(source) => markdown(
+                    CompactionContent::Markdown(source) => markdown_layout(
                         source,
                         theme,
+                        effective_content_width(width, 1),
                         #[cfg(test)]
                         construction_counts,
                     ),
-                    CompactionContent::Plain(source) => literal_text(source, style),
+                    CompactionContent::Plain(source) => {
+                        markdown::MarkdownLayout::original(literal_text(source, style))
+                    }
                 }
             } else {
-                Text::raw(card.collapsed.clone())
+                markdown::MarkdownLayout::original(Text::raw(card.collapsed.clone()))
             };
-            text.lines.insert(0, Line::raw(card.heading.clone()));
+            layout.prepend_original(Line::raw(card.heading.clone()));
             if expand_arenas && let Some(accounting) = &card.accounting {
-                text.lines.push(accounting_line(
+                layout.push_original(accounting_line(
                     accounting.clone(),
                     muted_card_style(theme, background),
                 ));
             }
-            RenderBlock::card(own_styled_text(text, style), style, width, 1, 1)
+            layout.text = own_styled_text(layout.text, style);
+            RenderBlock::markdown_card(layout, style, width, 1, 1)
         }
         NormalisedBlock::SkillActivation(card) => {
             let style = card_style(theme, theme.tool_success_bg);
@@ -3684,23 +3854,24 @@ fn build_render_block(
             let style = card_style(theme, theme.card_bg)
                 .fg(theme.thinking_text)
                 .add_modifier(Modifier::ITALIC);
-            let text = if show_reasoning {
-                own_styled_text(
-                    markdown(
-                        source,
-                        theme,
-                        #[cfg(test)]
-                        construction_counts,
-                    ),
-                    style,
+            let mut layout = if show_reasoning {
+                markdown_layout(
+                    source,
+                    theme,
+                    effective_content_width(width, 2),
+                    #[cfg(test)]
+                    construction_counts,
                 )
             } else {
-                own_styled_text(
+                markdown::MarkdownLayout::original(own_styled_text(
                     Text::raw("thinking hidden · Ctrl-T to show"),
                     dim_card_style(theme, theme.card_bg).add_modifier(Modifier::ITALIC),
-                )
+                ))
             };
-            RenderBlock::card(text, style, width, 2, 1)
+            if show_reasoning {
+                layout.text = own_styled_text(layout.text, style);
+            }
+            RenderBlock::markdown_card(layout, style, width, 2, 1)
         }
         NormalisedBlock::Arena(arena) => RenderBlock::Arena(ArenaRenderBlock::new(
             theme,
@@ -3714,11 +3885,12 @@ fn build_render_block(
         NormalisedBlock::Assistant {
             markdown: source,
             accounting,
-        } => RenderBlock::card(
+        } => RenderBlock::markdown_card(
             assistant_text(
                 theme,
                 source,
                 accounting.clone(),
+                width,
                 #[cfg(test)]
                 construction_counts,
             ),
@@ -6761,6 +6933,653 @@ mod tests {
     }
 
     #[test]
+    fn responsive_markdown_tables_use_each_cards_usable_width() {
+        let source = "| H |\n| --- |\n| one two six ten |".to_owned();
+        let blocks = [
+            (
+                NormalisedBlock::Assistant {
+                    markdown: source.clone(),
+                    accounting: None,
+                },
+                false,
+            ),
+            (
+                NormalisedBlock::Reasoning {
+                    markdown: source.clone(),
+                },
+                true,
+            ),
+            (
+                NormalisedBlock::Compaction(super::CompactionCard {
+                    state: super::ArenaState::Complete,
+                    heading: "summary".into(),
+                    collapsed: "collapsed".into(),
+                    expanded: super::CompactionContent::Markdown(source),
+                    accounting: None,
+                }),
+                true,
+            ),
+        ];
+        let mut highlighter = PythonHighlighter::new();
+        for (source, expects_records) in blocks {
+            let block =
+                super::build_render_block(&DARK, &source, true, true, 11, &mut highlighter, None);
+            let super::RenderBlock::Card(card) = block else {
+                panic!("expected card")
+            };
+            assert_eq!(
+                card.text.to_string().contains("- H:"),
+                expects_records,
+                "{:?}",
+                card.text
+            );
+        }
+    }
+
+    #[test]
+    fn responsive_record_copy_rejoins_tokens_inside_quote_context() {
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+            markdown: "> | H |\n> | --- |\n> | [guide](https://example.com/a_long_path) |".into(),
+            accounting: None,
+        }]);
+        let layout = transcript.layout(&DARK, 18);
+        let copied = layout.extract_selection(Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(layout.total_height(), 0),
+        ));
+        assert_eq!(copied, "> - H: guide (https://example.com/a_long_path)");
+    }
+
+    #[test]
+    fn responsive_markdown_respects_tiny_padding_without_rewrapping_prepared_rows() {
+        let source = NormalisedBlock::Reasoning {
+            markdown: "| H |\n| --- |\n| one two six ten |".into(),
+        };
+        let mut highlighter = PythonHighlighter::new();
+        for width in 0..=12 {
+            let block = super::build_render_block(
+                &DARK,
+                &source,
+                true,
+                true,
+                width,
+                &mut highlighter,
+                None,
+            );
+            let super::RenderBlock::Card(card) = &block else {
+                panic!("expected card")
+            };
+            let (left, right) = super::effective_padding(width, 2);
+            assert_eq!((card.left_padding, card.right_padding), (left, right));
+            let area = Rect::new(0, 0, width, u16::try_from(block.height()).unwrap());
+            let mut buffer = Buffer::empty(area);
+            block.render(area, 0, 0, &mut buffer);
+            if width > 0 {
+                assert!(card.rows.is_some());
+                for (index, kind) in card.rows.as_ref().unwrap().breaks.iter().enumerate() {
+                    if *kind != super::markdown::LineBreak::Original {
+                        assert_eq!(
+                            card.line_paragraph(index)
+                                .line_count(super::effective_content_width(width, 2)),
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_record_copy_never_loses_an_overwide_protected_url_unit() {
+        for (value, expected) in [
+            (
+                "[guide](https://example.com/a)",
+                "- H: guide (https://example.com/a)",
+            ),
+            (
+                "[guide](https://%65xample.com/a)",
+                "- H: guide (https://%65xample.com/a)",
+            ),
+            ("%2F0123456789abcdef", "- H: \"%2F0123456789abcdef\""),
+            (
+                r"C:\some_long_folder\foo a: b",
+                r#"- H: "C:\\some_long_folder\\foo a: b""#,
+            ),
+        ] {
+            for width in [1, 2, 3, 8, 9, 10, 16] {
+                let mut transcript = Transcript::default();
+                transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                    markdown: format!("| H |\n| --- |\n| {value} |"),
+                    accounting: None,
+                }]);
+                let layout = transcript.layout(&DARK, width);
+                let copied = layout.extract_selection(Selection::new(
+                    DocumentPosition::new(0, 0),
+                    DocumentPosition::new(layout.total_height(), 0),
+                ));
+                assert_eq!(copied, expected, "{value} at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_markdown_leaves_literal_user_skill_and_fenced_tables_literal() {
+        let table = "| H |\n| --- |\n| value |";
+        let blocks = [
+            NormalisedBlock::User {
+                request: table.into(),
+            },
+            NormalisedBlock::SkillActivation(super::SkillActivationCard {
+                heading: "skill".into(),
+                source_text: table.into(),
+            }),
+        ];
+        let mut highlighter = PythonHighlighter::new();
+        for source in blocks {
+            let block =
+                super::build_render_block(&DARK, &source, true, true, 10, &mut highlighter, None);
+            let super::RenderBlock::Card(card) = block else {
+                panic!("expected card")
+            };
+            assert!(card.rows.is_none());
+            assert!(card.text.to_string().contains("| H |"));
+        }
+        let source = NormalisedBlock::Assistant {
+            markdown: format!("```text\n{table}\n```"),
+            accounting: None,
+        };
+        let block =
+            super::build_render_block(&DARK, &source, true, true, 10, &mut highlighter, None);
+        let super::RenderBlock::Card(card) = block else {
+            panic!("expected card")
+        };
+        assert!(card.text.to_string().contains("| H |"));
+        assert!(card.rows.is_none());
+    }
+
+    #[test]
+    fn responsive_reflow_reuses_rasters_and_matches_fresh_layouts() {
+        let source = "| H |\n| --- |\n| one two six ten |".to_owned();
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+            markdown: source.clone(),
+            accounting: None,
+        }]);
+        for theme in [&DARK, &LIGHT] {
+            for width in [24, 11, 7, 24] {
+                let before = transcript.construction_counts();
+                let cached = transcript.layout(theme, width);
+                let built = transcript.construction_counts();
+                assert_eq!(built.rasterisations, before.rasterisations + 1);
+                let selection = Selection::new(
+                    DocumentPosition::new(0, 0),
+                    DocumentPosition::new(cached.total_height(), 0),
+                );
+                let copied = cached.extract_selection(selection);
+                if width == 7 {
+                    assert_eq!(copied, "- H: one two six ten");
+                } else {
+                    assert!(copied.contains('┌'));
+                    assert!(!copied.contains("- H:"));
+                }
+                transcript.layout(theme, width);
+                assert_eq!(transcript.construction_counts(), built);
+                let fresh = transcript.layout_fresh(theme, width);
+                assert_eq!(cached.total_height(), fresh.total_height());
+                for top in [0, 1, cached.total_height().saturating_sub(2)] {
+                    let area = Rect::new(3, 2, width, 4);
+                    assert_eq!(
+                        layout_buffer(&cached, area, top, Some(selection)),
+                        layout_buffer(&fresh, area, top, Some(selection))
+                    );
+                }
+                assert_eq!(copied, fresh.extract_selection(selection));
+            }
+        }
+        assert_eq!(
+            transcript.settled_blocks[0].source,
+            NormalisedBlock::Assistant {
+                markdown: source,
+                accounting: None
+            }
+        );
+    }
+
+    #[test]
+    fn responsive_streamed_tables_reflow_then_settle_without_stale_rows() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        let mut source = String::new();
+        for (index, chunk) in ["| H |", "\n| --- |", "\n| one two", " six", " ten |"]
+            .into_iter()
+            .enumerate()
+        {
+            source.push_str(chunk);
+            assert!(transcript.apply(
+                RuntimeEvent::ModelProgress {
+                    run_id: RunId(1),
+                    step_id: ModelStepId(1),
+                    epoch: 0,
+                    progress: ModelProgress::AssistantTextChunk {
+                        text: chunk.to_owned()
+                    },
+                },
+                false
+            ));
+            assert_cached_layout_matches_fresh(&mut transcript, 7);
+            let copied = copied_text(&mut transcript, 7);
+            if index == 0 {
+                assert!(!copied.contains('┌'));
+            } else if index < 4 {
+                assert!(copied.contains('┌'), "{copied}");
+            } else {
+                assert_eq!(copied, "- H: one two six ten");
+            }
+            assert_eq!(
+                transcript.live_step.as_ref().unwrap().assistant_text,
+                source
+            );
+        }
+        for width in [24, 11, 7, 24] {
+            assert_cached_layout_matches_fresh(&mut transcript, width);
+        }
+        let before = transcript.layout(&DARK, 7);
+        let before_area = Rect::new(0, 0, 7, before.total_height() as u16);
+        let before_buffer = layout_buffer(&before, before_area, 0, None);
+        transcript.apply(final_message(1, 1, &source, Vec::new(), false), false);
+        assert!(transcript.live_step.is_none());
+        let after = transcript.layout(&DARK, 7);
+        assert_eq!(before.total_height(), after.total_height());
+        assert_eq!(before_buffer, layout_buffer(&after, before_area, 0, None));
+        assert_eq!(copied_text(&mut transcript, 7), "- H: one two six ten");
+        assert_cached_layout_matches_fresh(&mut transcript, 7);
+    }
+
+    #[test]
+    fn responsive_long_records_copy_across_clipped_raster_chunks() {
+        let mut source = "| H |\n| --- |".to_owned();
+        let mut expected = Vec::new();
+        for index in 0..48 {
+            let value = format!("item_{index}_long_identifier_suffix");
+            source.push_str(&format!("\n| {value} |"));
+            expected.push(format!("- H: {value}"));
+        }
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+            markdown: source,
+            accounting: None,
+        }]);
+        let cached = transcript.layout(&DARK, 17);
+        let fresh = transcript.layout_fresh(&DARK, 17);
+        assert!(cached.total_height() > 128);
+        let selection = Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(cached.total_height(), 0),
+        );
+        assert_eq!(cached.extract_selection(selection), expected.join("\n\n"));
+        assert_eq!(fresh.extract_selection(selection), expected.join("\n\n"));
+        for top in [0, 1, 63, 64, 65, cached.total_height().saturating_sub(3)] {
+            let area = Rect::new(2, 1, 17, 4);
+            assert_eq!(
+                layout_buffer(&cached, area, top, Some(selection)),
+                layout_buffer(&fresh, area, top, Some(selection))
+            );
+        }
+    }
+
+    #[test]
+    fn feedback_table_borders_have_uniform_weight_in_rendered_buffers() {
+        for theme in [&DARK, &LIGHT] {
+            for source in [
+                "| |\n|-|\n|a b|",
+                "| H |\n| --- |\n| one two six |",
+                "| **A** | B |\n| :--- | ---: |\n| **one** *two* `six` | 東京 |\n| plain words | 12 |",
+                "> | H |\n> | --- |\n> | **one** *two* `six` |",
+                "- | H |\n  | --- |\n  | **one** *two* `six` |",
+            ] {
+                for width in [80, 24, 20, 11, 8, 5] {
+                    let mut transcript = Transcript::default();
+                    transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                        markdown: source.into(),
+                        accounting: None,
+                    }]);
+                    let layout = transcript.layout(theme, width);
+                    let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                    let buffer = layout_buffer(&layout, area, 0, None);
+                    let borders = buffer
+                        .content()
+                        .iter()
+                        .filter(|cell| {
+                            cell.symbol()
+                                .chars()
+                                .all(|ch| ('\u{2500}'..='\u{257f}').contains(&ch))
+                        })
+                        .collect::<Vec<_>>();
+                    if width == 80 || source == "| |\n|-|\n|a b|" {
+                        assert!(
+                            !borders.is_empty(),
+                            "expected a grid at width {width}: {source}"
+                        );
+                    }
+                    if let Some(first) = borders.first() {
+                        assert_eq!(
+                            first.fg, theme.border_muted,
+                            "border colour at width {width}: {source}"
+                        );
+                        assert!(
+                            borders.iter().all(|cell| cell.style() == first.style()),
+                            "border styles differ at width {width} for {source}: {borders:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_original_only_markdown_uses_the_ordinary_card_path() {
+        let table = "| H |\n| --- |\n| value |".to_owned();
+        let plain = super::CompactionCard {
+            state: super::ArenaState::Complete,
+            heading: "summary".into(),
+            collapsed: "collapsed".into(),
+            expanded: super::CompactionContent::Plain("plain text".into()),
+            accounting: None,
+        };
+        let cases = [
+            (
+                NormalisedBlock::Assistant {
+                    markdown: "ordinary prose".into(),
+                    accounting: None,
+                },
+                true,
+                true,
+            ),
+            (
+                NormalisedBlock::Assistant {
+                    markdown: table.clone(),
+                    accounting: None,
+                },
+                true,
+                true,
+            ),
+            (
+                NormalisedBlock::Reasoning {
+                    markdown: table.clone(),
+                },
+                false,
+                true,
+            ),
+            (NormalisedBlock::Compaction(plain.clone()), true, true),
+            (NormalisedBlock::Compaction(plain), true, false),
+        ];
+        let mut highlighter = PythonHighlighter::new();
+        for (source, reasoning, expand) in cases {
+            let block = super::build_render_block(
+                &DARK,
+                &source,
+                reasoning,
+                expand,
+                80,
+                &mut highlighter,
+                None,
+            );
+            let super::RenderBlock::Card(card) = block else {
+                panic!("expected card")
+            };
+            assert!(card.rows.is_none(), "{:?}", card.text);
+        }
+        let mixed = NormalisedBlock::Assistant {
+            markdown: "before\n\n| H |\n| --- |\n| one two six ten |".into(),
+            accounting: None,
+        };
+        let block =
+            super::build_render_block(&DARK, &mixed, true, true, 11, &mut highlighter, None);
+        let super::RenderBlock::Card(card) = block else {
+            panic!("expected card")
+        };
+        assert!(card.rows.is_some());
+    }
+
+    fn drawn_ascii_word_cell<'a>(buffer: &'a Buffer, word: &str) -> &'a ratatui::buffer::Cell {
+        assert!(!word.is_empty() && word.is_ascii());
+        let cells = buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .flat_map(|row| row.windows(word.len()))
+            .find(|cells| {
+                cells
+                    .iter()
+                    .zip(word.bytes())
+                    .all(|(cell, byte)| cell.symbol().as_bytes() == [byte])
+            })
+            .unwrap_or_else(|| panic!("rendered word {word}"));
+        &cells[0]
+    }
+
+    #[test]
+    fn assistant_prose_uses_terminal_foreground_in_live_and_settled_buffers() {
+        let source =
+            "prose **bold** *italics* `code` [link](u)\n\n| Header |\n| --- |\n| one two six ten |";
+        for theme in [&DARK, &LIGHT] {
+            for live in [false, true] {
+                let mut transcript = Transcript::default();
+                if live {
+                    transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+                    assert!(transcript.apply(
+                        RuntimeEvent::ModelProgress {
+                            run_id: RunId(1),
+                            step_id: ModelStepId(1),
+                            epoch: 0,
+                            progress: ModelProgress::AssistantTextChunk {
+                                text: source.into()
+                            }
+                        },
+                        false
+                    ));
+                } else {
+                    transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                        markdown: source.into(),
+                        accounting: None,
+                    }]);
+                }
+                for width in [120, 11, 7] {
+                    let layout = transcript.layout(theme, width);
+                    let fresh = transcript.layout_fresh(theme, width);
+                    let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                    let screen = layout_buffer(&layout, area, 0, None);
+                    assert_eq!(screen, layout_buffer(&fresh, area, 0, None));
+                    let prose = drawn_ascii_word_cell(&screen, "prose");
+                    assert_eq!(prose.fg, Color::Reset, "live={live} width={width}");
+                    assert!(!prose.modifier.contains(Modifier::BOLD));
+                    let bold = drawn_ascii_word_cell(&screen, "bold");
+                    assert_eq!(bold.fg, Color::Reset);
+                    assert!(bold.modifier.contains(Modifier::BOLD));
+                    let italic = drawn_ascii_word_cell(&screen, "italics");
+                    assert_eq!(italic.fg, Color::Reset);
+                    assert!(italic.modifier.contains(Modifier::ITALIC));
+                    assert_eq!(drawn_ascii_word_cell(&screen, "code").fg, theme.md_code);
+                    assert_eq!(drawn_ascii_word_cell(&screen, "link").fg, theme.md_link);
+                    let header = drawn_ascii_word_cell(&screen, "Header");
+                    if screen.content().iter().any(|cell| cell.symbol() == "┌") {
+                        assert_eq!(header.fg, theme.text);
+                        assert!(header.modifier.contains(Modifier::BOLD));
+                        assert_eq!(drawn_ascii_word_cell(&screen, "one").fg, Color::Reset);
+                    } else {
+                        assert_eq!(header.fg, theme.syntax_variable);
+                        assert!(!header.modifier.contains(Modifier::BOLD));
+                        assert_eq!(
+                            drawn_ascii_word_cell(&screen, "one").fg,
+                            theme.syntax_string
+                        );
+                    }
+                    let selection = Selection::new(
+                        DocumentPosition::new(0, 0),
+                        DocumentPosition::new(layout.total_height(), 0),
+                    );
+                    assert_eq!(
+                        layout.extract_selection(selection),
+                        fresh.extract_selection(selection)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_foreground_keeps_fixed_card_and_accounting_styles() {
+        for theme in [&DARK, &LIGHT] {
+            let mut highlighter = PythonHighlighter::new();
+            let sources = [
+                (
+                    NormalisedBlock::Reasoning {
+                        markdown: "steady".into(),
+                    },
+                    theme.thinking_text,
+                    true,
+                ),
+                (
+                    NormalisedBlock::Compaction(super::CompactionCard {
+                        state: super::ArenaState::Complete,
+                        heading: "summary".into(),
+                        collapsed: "hidden".into(),
+                        expanded: super::CompactionContent::Markdown("steady".into()),
+                        accounting: None,
+                    }),
+                    theme.text,
+                    false,
+                ),
+            ];
+            for (source, foreground, italic) in sources {
+                let block = super::build_render_block(
+                    theme,
+                    &source,
+                    true,
+                    true,
+                    80,
+                    &mut highlighter,
+                    None,
+                );
+                let area = Rect::new(0, 0, 80, block.height() as u16);
+                let mut screen = Buffer::empty(area);
+                block.render(area, 0, 0, &mut screen);
+                let cell = drawn_ascii_word_cell(&screen, "steady");
+                assert_eq!(cell.fg, foreground);
+                assert_eq!(cell.modifier.contains(Modifier::ITALIC), italic);
+                assert_ne!(cell.bg, Color::Reset);
+            }
+            let source = NormalisedBlock::Assistant {
+                markdown: "prose".into(),
+                accounting: Some("accounting".into()),
+            };
+            let block =
+                super::build_render_block(theme, &source, true, true, 80, &mut highlighter, None);
+            let area = Rect::new(0, 0, 80, block.height() as u16);
+            let mut screen = Buffer::empty(area);
+            block.render(area, 0, 0, &mut screen);
+            assert_eq!(drawn_ascii_word_cell(&screen, "accounting").fg, theme.muted);
+        }
+    }
+
+    #[test]
+    fn responsive_record_scalar_display_and_colours_survive_rendered_copy() {
+        for theme in [&DARK, &LIGHT] {
+            for (value, expected) in [
+                ("-1.25e-3", "-1.25e-3"),
+                ("007", "007"),
+                ("2026-10-29", "2026-10-29"),
+                ("NaN", "NaN"),
+                ("--flag", "--flag"),
+                ("a: b", "\"a: b\""),
+            ] {
+                for width in 1..=12 {
+                    let mut transcript = Transcript::default();
+                    transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                        markdown: format!("| NumberValue |\n| --- |\n| {value} |"),
+                        accounting: None,
+                    }]);
+                    let layout = transcript.layout(theme, width);
+                    let copied = layout.extract_selection(Selection::new(
+                        DocumentPosition::new(0, 0),
+                        DocumentPosition::new(layout.total_height(), 0),
+                    ));
+                    assert_eq!(
+                        copied,
+                        format!("- NumberValue: {expected}"),
+                        "{value} at {width}"
+                    );
+                    if value == "007" {
+                        let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                        let screen = layout_buffer(&layout, area, 0, None);
+                        let seven = screen
+                            .content()
+                            .iter()
+                            .find(|cell| cell.symbol() == "7")
+                            .expect("number drawn");
+                        assert_eq!(seven.fg, theme.syntax_number);
+                        assert!(!seven.modifier.contains(Modifier::BOLD));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_records_preserve_non_breaking_spaces_in_rendered_copy() {
+        for space in ['\u{00a0}', '\u{2007}', '\u{202f}'] {
+            let value = format!("10{space}MB");
+            for width in 1..=8 {
+                let mut transcript = Transcript::default();
+                transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                    markdown: format!("| H |\n| --- |\n| {value} |"),
+                    accounting: None,
+                }]);
+                let layout = transcript.layout(&DARK, width);
+                let copied = layout.extract_selection(Selection::new(
+                    DocumentPosition::new(0, 0),
+                    DocumentPosition::new(layout.total_height(), 0),
+                ));
+                assert_eq!(
+                    copied,
+                    format!("- H: {value}"),
+                    "{space:?} at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_unicode_records_measure_the_graphemes_the_terminal_draws() {
+        let value = "abⵏ⵿ⴾ";
+        for width in [2, 8, 40] {
+            let mut transcript = Transcript::default();
+            transcript.append_settled_blocks(vec![TranscriptBlock::Assistant {
+                markdown: format!("| H |\n| --- |\n| `{value}` |"),
+                accounting: None,
+            }]);
+            let layout = transcript.layout(&DARK, width);
+            let copied = layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            ));
+            if width < 40 {
+                assert_eq!(copied, format!("- H: {value}"));
+            } else {
+                assert!(copied.contains(value));
+                let area = Rect::new(0, 0, width, layout.total_height() as u16);
+                let screen = layout_buffer(&layout, area, 0, None);
+                for row in 0..area.height {
+                    let right = (0..width)
+                        .rev()
+                        .find(|column| !screen[(*column, row)].symbol().trim().is_empty());
+                    assert_eq!(right, Some(8));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn markdown_compatibility() {
         let heading = markdown("# Heading", &DARK, None);
         assert_eq!(heading.to_string(), "# Heading");
@@ -7136,7 +7955,9 @@ mod tests {
                 NormalisedBlock::Assistant {
                     markdown: source,
                     accounting,
-                } => assistant_text(&DARK, source, accounting.clone(), None).to_string(),
+                } => assistant_text(&DARK, source, accounting.clone(), u16::MAX, None)
+                    .text
+                    .to_string(),
                 block => block.plain_text(),
             })
             .collect::<Vec<_>>()
