@@ -57,10 +57,14 @@ async fn child_for_run(
     read_only: bool,
     enabled: bool,
 ) -> Arena {
-    let mut child = parent.child(checkpoint, read_only).await.unwrap();
-    child.reset_todos().await.unwrap();
-    apply_run_policy(&mut child, enabled).await;
-    child
+    parent
+        .child(
+            checkpoint,
+            read_only,
+            crate::todos::TodoPolicy::capture(enabled),
+        )
+        .await
+        .unwrap()
 }
 
 fn items(texts: &[&str]) -> ToolValue {
@@ -218,6 +222,28 @@ async fn todo_proof_restored_branches_keep_independent_state_and_allocator() {
         matches!(invalid.outcome, ExecutionOutcome::TypeCheckError(_)),
         "{invalid:?}"
     );
+}
+
+#[tokio::test]
+async fn todo_child_constructor_resets_canonical_object_in_place() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut parent = proof_arena(&workspace).await;
+    checked(&mut parent, "retained = todos\nretained_add = todos.add\nother = [40]\ndef inherited():\n    return other[0]\ntodos.add('parent')\nresult_values = {'parent': 'kept'}").await;
+    let checkpoint = parent.checkpoint();
+    let mut child = parent
+        .child(&checkpoint, false, crate::todos::TodoPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(projection(&child).await, items(&[]));
+    assert_eq!(
+        child.collect_result_values().await.unwrap(),
+        BTreeMap::new()
+    );
+    checked(&mut child, "assert retained is todos\nassert retained.snapshot() == []\nassert inherited() == 40\nother[0] = 42\nassert inherited() == 42\nassert retained_add('child') == 1\nassert todos.snapshot() == retained.snapshot()").await;
+    assert_eq!(projection(&child).await, items(&["child"]));
+    assert_eq!(parent.checkpoint(), checkpoint);
+    assert_eq!(projection(&parent).await, items(&["parent"]));
+    checked(&mut parent, "assert retained is todos\nassert inherited() == 40\nassert result_values == {'parent': 'kept'}\nassert retained_add('parent second') == 2").await;
 }
 
 #[tokio::test]

@@ -1382,12 +1382,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                             "subagent {id} was cancelled before arena construction"
                         )));
                     }
-                    result = async {
-                        let mut arena = payload.source.child(&payload.checkpoint, read_only, &mut construction_progress).await?;
-                        arena.reset_todos().await?;
-                        arena.apply_todo_policy(todo_policy).await?;
-                        Ok::<_, crate::arena::ArenaError>(arena)
-                    } => result,
+                    result = payload.source.child(&payload.checkpoint, read_only, todo_policy, &mut construction_progress) => result,
                 }
             };
             let arena = match arena_result {

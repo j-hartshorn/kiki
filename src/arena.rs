@@ -770,7 +770,6 @@ pub(crate) struct ArenaChildSource {
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     model_type_check_disabled: bool,
-    todo_policy: TodoPolicy,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
@@ -784,6 +783,7 @@ impl ArenaChildSource {
         &self,
         checkpoint: &Checkpoint,
         requested_read_only: bool,
+        todo_policy: TodoPolicy,
         progress: &mut impl FnMut(ChildArenaConstructionPhase),
     ) -> Result<Arena, ArenaError> {
         #[cfg(test)]
@@ -811,12 +811,12 @@ impl ArenaChildSource {
         progress(ChildArenaConstructionPhase::CheckedOut);
         Arena::restore_checkout(&mut checkout, checkpoint).await?;
         progress(ChildArenaConstructionPhase::CheckpointRestored);
-        let todos = timeout(self.execution_timeout, async {
-            apply_todo_policy_checkout(&mut checkout, self.todo_policy).await?;
-            read_todos(&mut checkout).await
+        timeout(self.execution_timeout, async {
+            trusted_todo_feed(&mut checkout, "_kiki_todos._reset()").await?;
+            apply_todo_policy_checkout(&mut checkout, todo_policy).await
         })
         .await
-        .map_err(|_| todo_failure("child collection timed out"))??;
+        .map_err(|_| todo_failure("child initialization timed out"))??;
         reset_result_values(&mut checkout).await?;
         progress(ChildArenaConstructionPhase::ResultValuesReset);
         let state = checkout.dump().await.map_err(pool_failure)?;
@@ -836,8 +836,8 @@ impl ArenaChildSource {
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
             model_type_check_disabled: self.model_type_check_disabled,
-            todo_policy: self.todo_policy,
-            todos,
+            todo_policy,
+            todos: Vec::new(),
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -1021,7 +1021,6 @@ impl Arena {
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
             model_type_check_disabled: self.model_type_check_disabled,
-            todo_policy: self.todo_policy,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -1040,10 +1039,11 @@ impl Arena {
         &self,
         checkpoint: &Checkpoint,
         requested_read_only: bool,
+        todo_policy: TodoPolicy,
     ) -> Result<Self, ArenaError> {
         let mut progress = |_| {};
         self.child_source()
-            .child(checkpoint, requested_read_only, &mut progress)
+            .child(checkpoint, requested_read_only, todo_policy, &mut progress)
             .await
     }
 
@@ -1233,21 +1233,6 @@ impl Arena {
         self.todo_policy = policy;
         self.checkout.take();
         self.restore_current_checkpoint_if_needed().await
-    }
-
-    pub async fn reset_todos(&mut self) -> Result<(), ArenaError> {
-        self.restore_current_checkpoint_if_needed().await?;
-        let mut checkout = self.checkout.take().expect("restored checkout");
-        let state = timeout(self.execution_timeout, async {
-            trusted_todo_feed(&mut checkout, "_kiki_todos._reset()").await?;
-            checkout.dump().await.map_err(pool_failure)
-        })
-        .await
-        .map_err(|_| todo_failure("reset timed out"))??;
-        self.checkpoint.state = state;
-        self.todos.clear();
-        self.checkout = Some(checkout);
-        Ok(())
     }
 
     pub fn checkpoint(&self) -> Checkpoint {
@@ -3340,6 +3325,7 @@ mod todo_proof;
 
 #[cfg(test)]
 mod tests {
+    use crate::todos::TodoPolicy;
     use std::collections::{BTreeMap, VecDeque};
     use std::env;
     use std::fs;
@@ -3467,7 +3453,10 @@ mod tests {
         assert_eq!(parent.checkpoint().authorisations, initial_authorisations);
 
         let checkpoint = parent.checkpoint();
-        let mut child = parent.child(&checkpoint, true).await.unwrap();
+        let mut child = parent
+            .child(&checkpoint, true, TodoPolicy::default())
+            .await
+            .unwrap();
         let execution = execute_without_cancellation(
             &mut child,
             "note = await read('skill://review/references/note.md')\nnote == 'live note' and (await list_dir('skill://review/references'))[0].path == 'skill://review/references/note.md'",
@@ -3893,7 +3882,10 @@ mod tests {
             ExecutionOutcome::Complete { .. }
         ));
 
-        let mut child = arena.child(&checkpoint, false).await.unwrap();
+        let mut child = arena
+            .child(&checkpoint, false, TodoPolicy::default())
+            .await
+            .unwrap();
         let inherited = execute_checked(&mut child, "child: int = 'text'")
             .await
             .unwrap();
@@ -5038,7 +5030,10 @@ mod tests {
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
         parent.worker_path = worker;
 
-        let Err(error) = parent.child(&checkpoint, false).await else {
+        let Err(error) = parent
+            .child(&checkpoint, false, TodoPolicy::default())
+            .await
+        else {
             panic!("a replaced worker with another runtime unexpectedly created a child");
         };
 
@@ -5109,7 +5104,10 @@ mod tests {
         .unwrap();
         let checkpoint = parent.checkpoint();
 
-        let mut child = parent.child(&checkpoint, false).await.unwrap();
+        let mut child = parent
+            .child(&checkpoint, false, TodoPolicy::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             child.collect_result_values().await.unwrap(),
@@ -5155,7 +5153,10 @@ mod tests {
         let parent = arena(&workspace)
             .await
             .with_collection_test_gate(collection_gate.clone());
-        let mut child = parent.child(&parent.checkpoint(), false).await.unwrap();
+        let mut child = parent
+            .child(&parent.checkpoint(), false, TodoPolicy::default())
+            .await
+            .unwrap();
         let cancellation = CancellationToken::new();
         let mut collection = Box::pin(child.collect_result_values_with_cancellation(&cancellation));
 
@@ -5189,7 +5190,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut child = parent.child(&checkpoint, false).await.unwrap();
+        let mut child = parent
+            .child(&checkpoint, false, TodoPolicy::default())
+            .await
+            .unwrap();
         assert_eq!(
             child.tool_host.prompt_reference(true),
             format!(
@@ -6634,8 +6638,14 @@ mod tests {
             .unwrap();
         let checkpoint = parent.checkpoint();
 
-        let mut first = parent.child(&checkpoint, false).await.unwrap();
-        let mut second = parent.child(&checkpoint, false).await.unwrap();
+        let mut first = parent
+            .child(&checkpoint, false, TodoPolicy::default())
+            .await
+            .unwrap();
+        let mut second = parent
+            .child(&checkpoint, false, TodoPolicy::default())
+            .await
+            .unwrap();
         execute_without_cancellation(&mut first, "value = 2")
             .await
             .unwrap();
@@ -6665,7 +6675,7 @@ mod tests {
 
         let mut foreign = checkpoint;
         foreign.identity = RuntimeIdentity("monty-runtime 9.9.9".to_owned());
-        let Err(error) = parent.child(&foreign, false).await else {
+        let Err(error) = parent.child(&foreign, false, TodoPolicy::default()).await else {
             panic!("foreign checkpoint unexpectedly created a child");
         };
         assert!(matches!(error, ArenaError::IncompatibleCheckpoint { .. }));
@@ -6680,7 +6690,10 @@ mod tests {
             .await
             .unwrap();
         let checkpoint = parent.checkpoint();
-        let mut child = parent.child(&checkpoint, true).await.unwrap();
+        let mut child = parent
+            .child(&checkpoint, true, TodoPolicy::default())
+            .await
+            .unwrap();
         let authorisations = child.checkpoint().authorisations.clone();
 
         for code in [
@@ -6719,7 +6732,10 @@ mod tests {
         assert!(!workspace.path().join("created").exists());
         assert!(!workspace.path().join("command-effect").exists());
 
-        let mut grandchild = child.child(&child.checkpoint(), false).await.unwrap();
+        let mut grandchild = child
+            .child(&child.checkpoint(), false, TodoPolicy::default())
+            .await
+            .unwrap();
         assert!(
             python_error(
                 &execute_without_cancellation(&mut grandchild, "await write('created', 'child')")
@@ -6755,7 +6771,10 @@ mod tests {
             .await
             .unwrap();
         let checkpoint = parent.checkpoint();
-        let mut child = parent.child(&checkpoint, false).await.unwrap();
+        let mut child = parent
+            .child(&checkpoint, false, TodoPolicy::default())
+            .await
+            .unwrap();
         execute_without_cancellation(
             &mut child,
             "result_values = {'none': None, 'bool': True, 'integer': -1, 'float': 1.5, 'string': 'value', 'list': [1, {'nested': 'value'}]}",
