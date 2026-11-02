@@ -5,6 +5,7 @@ use crate::pricing::RunCostEstimate;
 use crate::runtime::{Record, RestoredTimelineItem, RuntimeEvent};
 use crate::subagents::{TaskId, TaskObservation, TaskRecord, TaskState};
 use crate::theme::Theme;
+use crate::todos::{TodoPolicy, TodoSettings, TodoSnapshot};
 use crate::transcript::{
     format_subagent_cost, format_subagent_elapsed, format_subagent_steps, muted_page_style,
     normalise_terminal_text, subagent_glyph, subagent_retry_count, subagent_state_label,
@@ -40,6 +41,8 @@ struct Entry {
     prompt: String,
     model: String,
     retry_count: u64,
+    todo_policy: TodoPolicy,
+    todos: Option<TodoSnapshot>,
     record_revision: u64,
     observation_revision: u64,
     observation: Observation,
@@ -53,6 +56,11 @@ impl Entry {
             prompt: record.parameters().prompt().to_owned(),
             model: record.parameters().selection().model().id.to_owned(),
             retry_count: subagent_retry_count(record),
+            todo_policy: record.parameters().todo_policy(),
+            todos: record
+                .executions()
+                .last()
+                .and_then(|execution| execution.execution().todos.clone()),
             record_revision: record.revision(),
             observation_revision: record.revision(),
             observation: Observation::from(record.observation()),
@@ -181,6 +189,10 @@ impl SubagentMonitor {
         entry.prompt = record.parameters().prompt().to_owned();
         entry.model = record.parameters().selection().model().id.to_owned();
         entry.retry_count = subagent_retry_count(record);
+        entry.todos = record
+            .executions()
+            .last()
+            .and_then(|execution| execution.execution().todos.clone());
         entry.record_revision = record.revision();
         if record.revision() >= entry.observation_revision {
             entry.observation_revision = record.revision();
@@ -256,24 +268,60 @@ impl SubagentMonitor {
         available_rows: u16,
         now: Instant,
     ) -> MonitorLayout {
+        self.layout_with_todos(
+            theme,
+            width,
+            available_rows,
+            now,
+            TodoSettings::default(),
+            0,
+        )
+    }
+
+    pub(super) fn layout_with_todos(
+        &mut self,
+        theme: &Theme,
+        width: u16,
+        available_rows: u16,
+        now: Instant,
+        settings: TodoSettings,
+        todo_rows: u16,
+    ) -> MonitorLayout {
         self.visible_elapsed.clear();
         if self.entries.is_empty() || available_rows == 0 {
             return MonitorLayout { lines: Vec::new() };
         }
-
         let forest = self.forest();
         let selected_path = selected_path(&forest);
         let available_rows = usize::from(available_rows);
         let (projection, padding) = self.fit_projection(&forest, selected_path, available_rows);
-
+        let base_rows = projection
+            .line_count()
+            .saturating_add(if padding { 2 } else { 0 });
+        let mut todos = TodoBudget {
+            settings,
+            remaining: usize::from(todo_rows).min(available_rows.saturating_sub(base_rows)),
+        };
         let (mut lines, visible_elapsed) =
-            self.render_projection(theme, &forest, &projection, width, now);
+            self.render_projection(theme, &forest, &projection, width, now, &mut todos);
         if padding {
             lines.insert(0, Line::raw(""));
             lines.push(Line::raw(""));
         }
         self.visible_elapsed.extend(visible_elapsed);
         MonitorLayout { lines }
+    }
+
+    pub(super) fn task_is_active(&self, id: &TaskId) -> bool {
+        self.entries
+            .get(id.as_str())
+            .is_some_and(|entry| self.is_operationally_active(id.as_str(), entry))
+    }
+
+    pub(super) fn has_active_todo_policy(&self, policy: TodoPolicy) -> bool {
+        self.entries.iter().any(|(id, entry)| {
+            self.is_operationally_active(id, entry) && entry.todo_policy == policy
+        })
     }
 
     pub(super) fn has_active_entries(&self) -> bool {
@@ -308,6 +356,8 @@ impl SubagentMonitor {
                 prompt: "test child".to_owned(),
                 model: "openai/gpt-5.6-sol".to_owned(),
                 retry_count: 0,
+                todo_policy: TodoPolicy::ENABLED,
+                todos: None,
                 record_revision: 1,
                 observation_revision: 1,
                 observation: Observation {
@@ -419,6 +469,44 @@ impl SubagentMonitor {
         (projection, false)
     }
 
+    fn render_todos(
+        &self,
+        theme: &Theme,
+        lines: &mut Vec<Line<'static>>,
+        node: (&str, &Entry),
+        depth: usize,
+        width: u16,
+        budget: &mut TodoBudget,
+    ) {
+        let (id, entry) = node;
+        let Some(items) = entry.todos.as_ref() else {
+            return;
+        };
+        if budget.remaining == 0 {
+            return;
+        }
+        let policy = if self.is_operationally_active(id, entry) {
+            entry.todo_policy
+        } else {
+            TodoPolicy::capture(budget.settings.enabled)
+        };
+        let indent = "  ".repeat(depth.saturating_add(2));
+        let indent_width = u16::try_from(Line::raw(&indent).width()).unwrap_or(u16::MAX);
+        let rows = super::todos::checklist_lines(
+            theme,
+            items,
+            policy,
+            budget.settings.display,
+            width.saturating_sub(indent_width),
+            u16::try_from(budget.remaining.min(6)).unwrap(),
+        );
+        budget.remaining = budget.remaining.saturating_sub(rows.len());
+        for mut row in rows {
+            row.spans.insert(0, Span::raw(indent.clone()));
+            lines.push(row);
+        }
+    }
+
     fn render_projection(
         &self,
         theme: &Theme,
@@ -426,6 +514,7 @@ impl SubagentMonitor {
         projection: &Projection,
         width: u16,
         now: Instant,
+        todos: &mut TodoBudget,
     ) -> (Vec<Line<'static>>, Vec<(String, u64)>) {
         let mut lines = Vec::new();
         let mut visible_elapsed = Vec::new();
@@ -443,6 +532,14 @@ impl SubagentMonitor {
                 depth,
                 width,
                 now,
+            );
+            self.render_todos(
+                theme,
+                &mut lines,
+                (id, &self.entries[id]),
+                depth,
+                width,
+                todos,
             );
         }
 
@@ -486,6 +583,14 @@ impl SubagentMonitor {
                 width,
                 now,
             );
+            self.render_todos(
+                theme,
+                &mut lines,
+                (root, &self.entries[root]),
+                0,
+                width,
+                todos,
+            );
             if projection.collapsed_root_summaries.contains(root) {
                 lines.push(summary_line(
                     1,
@@ -506,6 +611,11 @@ impl SubagentMonitor {
 
         (lines, visible_elapsed)
     }
+}
+
+struct TodoBudget {
+    settings: TodoSettings,
+    remaining: usize,
 }
 
 #[derive(Default)]
@@ -854,6 +964,8 @@ mod tests {
             prompt: "Review the cancellation paths and identify every missing edge case".to_owned(),
             model: "openai/gpt-5.6-luna".to_owned(),
             retry_count: 0,
+            todo_policy: crate::todos::TodoPolicy::ENABLED,
+            todos: None,
             record_revision: 1,
             observation_revision: 1,
             observation: Observation {
