@@ -259,8 +259,6 @@ struct App {
     root_todos: Option<TodoSnapshot>,
     todo_viewer: Option<todos::TodoViewer>,
     root_todo_policy: Option<(RunId, TodoPolicy)>,
-    next_todo_revision: u64,
-    pending_todo_revision: Option<u64>,
     tree_navigator: Option<TreeNavigator>,
     manual_navigation_pending: bool,
     next_tree_revision: u64,
@@ -325,8 +323,6 @@ impl Default for App {
             root_todos: None,
             todo_viewer: None,
             root_todo_policy: None,
-            next_todo_revision: 0,
-            pending_todo_revision: None,
             tree_navigator: None,
             manual_navigation_pending: false,
             next_tree_revision: 0,
@@ -1174,16 +1170,10 @@ impl App {
             PickerValue::Theme(setting) => self.select_theme(setting),
             PickerValue::TodoEnabled(enabled) => {
                 self.todo_settings.enabled = enabled;
-                self.next_todo_revision = self
-                    .next_todo_revision
-                    .checked_add(1)
-                    .expect("TODO revision overflowed");
-                let revision = self.next_todo_revision;
-                self.pending_todo_revision = Some(revision);
                 self.save_user_default(|settings| settings.save_todo_enabled(enabled));
                 self.open_todo_picker();
                 Update {
-                    commands: vec![RuntimeCommand::ApplyTodoEnabled { enabled, revision }],
+                    commands: vec![RuntimeCommand::ApplyTodoEnabled { enabled }],
                     visible_changed: true,
                     quit: false,
                 }
@@ -2309,14 +2299,6 @@ impl App {
             return self.handle_navigation_completed(outcome);
         }
         let metadata_changed = match &event {
-            RuntimeEvent::TodoEnabledAccepted { revision, .. } => {
-                if self.pending_todo_revision == Some(*revision) {
-                    self.pending_todo_revision = None;
-                    true
-                } else {
-                    false
-                }
-            }
             RuntimeEvent::SettingsAccepted { revision } => self.reconcile_settings(*revision),
             RuntimeEvent::NameAccepted { revision, name } => self.reconcile_name(*revision, name),
             _ => false,
@@ -14605,7 +14587,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_settings_save_failure_keeps_choice_draft_and_newer_pending_revision() {
+    fn todo_settings_save_failure_keeps_choice_draft_and_ignores_old_acknowledgements() {
         let now = Instant::now();
         let home = tempdir().unwrap();
         let workspace = tempdir().unwrap();
@@ -14618,10 +14600,7 @@ mod tests {
         let off = app.apply_picker_value(PickerValue::TodoEnabled(false));
         assert!(matches!(
             off.commands.as_slice(),
-            [RuntimeCommand::ApplyTodoEnabled {
-                enabled: false,
-                revision: 1
-            }]
+            [RuntimeCommand::ApplyTodoEnabled { enabled: false }]
         ));
         assert!(!app.todo_settings.enabled);
         assert_eq!(app.todo_settings.display, TodoDisplay::All);
@@ -14631,22 +14610,12 @@ mod tests {
         let on = app.apply_picker_value(PickerValue::TodoEnabled(true));
         assert!(matches!(
             on.commands.as_slice(),
-            [RuntimeCommand::ApplyTodoEnabled {
-                enabled: true,
-                revision: 2
-            }]
+            [RuntimeCommand::ApplyTodoEnabled { enabled: true }]
         ));
-        app.handle_event(RuntimeEvent::TodoEnabledAccepted {
-            enabled: false,
-            revision: 1,
-        });
+        app.handle_event(RuntimeEvent::TodoEnabledAccepted { enabled: false });
         assert!(app.todo_settings.enabled);
-        assert_eq!(app.pending_todo_revision, Some(2));
-        app.handle_event(RuntimeEvent::TodoEnabledAccepted {
-            enabled: true,
-            revision: 2,
-        });
-        assert_eq!(app.pending_todo_revision, None);
+        app.handle_event(RuntimeEvent::TodoEnabledAccepted { enabled: true });
+        assert!(app.todo_settings.enabled);
         app.handle_key_at(key(KeyCode::Esc), now);
         app.handle_key_at(key(KeyCode::Esc), now);
         assert!(app.picker.is_none());

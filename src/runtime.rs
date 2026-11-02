@@ -55,7 +55,6 @@ pub(crate) enum RuntimeCommand {
     },
     ApplyTodoEnabled {
         enabled: bool,
-        revision: u64,
     },
     SetSessionName {
         name: String,
@@ -318,8 +317,8 @@ pub(crate) enum RuntimeEvent {
     SettingsAccepted {
         revision: u64,
     },
+    // Preference acceptance only; RunStarted carries the Run's effective policy.
     TodoEnabledAccepted {
-        revision: u64,
         enabled: bool,
     },
     NameAccepted {
@@ -1273,12 +1272,9 @@ impl<M: Model> RuntimeController<M> {
                     self.start_pending_compaction().await;
                 }
             }
-            RuntimeCommand::ApplyTodoEnabled { enabled, revision } => {
+            RuntimeCommand::ApplyTodoEnabled { enabled } => {
                 self.subagents.set_todos_enabled(enabled).await;
-                self.emit(
-                    events,
-                    RuntimeEvent::TodoEnabledAccepted { revision, enabled },
-                );
+                self.emit(events, RuntimeEvent::TodoEnabledAccepted { enabled });
             }
             RuntimeCommand::ApplySettings {
                 selection,
@@ -8194,8 +8190,8 @@ mod tests {
                 epoch,
             } => format!("generation-restarted:{}:{}:{epoch}", run_id.0, step_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
-            RuntimeEvent::TodoEnabledAccepted { revision, enabled } => {
-                format!("todo-settings:{enabled}:{revision}")
+            RuntimeEvent::TodoEnabledAccepted { enabled } => {
+                format!("todo-settings:{enabled}")
             }
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
             RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
@@ -20993,21 +20989,12 @@ mod tests {
             .await
             .unwrap();
         commands
-            .send(RuntimeCommand::ApplyTodoEnabled {
-                enabled: false,
-                revision: 1,
-            })
+            .send(RuntimeCommand::ApplyTodoEnabled { enabled: false })
             .await
             .unwrap();
         let acknowledged = timeout(TEST_TIMEOUT, async {
             while let Some(event) = events.recv().await {
-                if matches!(
-                    event,
-                    RuntimeEvent::TodoEnabledAccepted {
-                        enabled: false,
-                        revision: 1
-                    }
-                ) {
+                if matches!(event, RuntimeEvent::TodoEnabledAccepted { enabled: false }) {
                     return true;
                 }
             }
@@ -21027,21 +21014,12 @@ mod tests {
             .unwrap();
         events_until_settled(&mut events).await;
         commands
-            .send(RuntimeCommand::ApplyTodoEnabled {
-                enabled: true,
-                revision: 2,
-            })
+            .send(RuntimeCommand::ApplyTodoEnabled { enabled: true })
             .await
             .unwrap();
         let second_ack = timeout(TEST_TIMEOUT, async {
             while let Some(event) = events.recv().await {
-                if matches!(
-                    event,
-                    RuntimeEvent::TodoEnabledAccepted {
-                        enabled: true,
-                        revision: 2
-                    }
-                ) {
+                if matches!(event, RuntimeEvent::TodoEnabledAccepted { enabled: true }) {
                     return true;
                 }
             }
@@ -21157,15 +21135,12 @@ mod tests {
                 .unwrap();
             let request_started = timeout(TEST_TIMEOUT, gate.wait_until_started()).await;
             commands
-                .send(RuntimeCommand::ApplyTodoEnabled {
-                    enabled: !initial,
-                    revision: 1,
-                })
+                .send(RuntimeCommand::ApplyTodoEnabled { enabled: !initial })
                 .await
                 .unwrap();
             let acknowledged = timeout(TEST_TIMEOUT, async {
                 while let Some(event) = events.recv().await {
-                    if matches!(event, RuntimeEvent::TodoEnabledAccepted { enabled, revision: 1 } if enabled == !initial) {
+                    if matches!(event, RuntimeEvent::TodoEnabledAccepted { enabled } if enabled == !initial) {
                         return true;
                     }
                 }
