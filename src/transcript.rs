@@ -2535,6 +2535,10 @@ impl Transcript {
         self.run_state != RunState::Idle
     }
 
+    pub(crate) fn subagent_records(&self) -> impl Iterator<Item = &TaskRecord> {
+        self.subagent_records.values()
+    }
+
     pub(crate) fn active_run_id(&self) -> Option<RunId> {
         match self.run_state {
             RunState::Active(run_id) => Some(run_id),
@@ -5413,6 +5417,7 @@ mod tests {
         transcript.toggle_reasoning();
         transcript.toggle_arena_expansion();
         let state = RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: vec![RestoredTimelineItem::Record(StoredRecord {
                 run_id: RunId(1),
@@ -5493,6 +5498,7 @@ mod tests {
             Vec::new(),
         );
         let state = RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: vec![
                 RestoredTimelineItem::Record(StoredRecord {
@@ -5688,6 +5694,7 @@ mod tests {
         let mut live = Transcript::default();
         append_records(&mut live, records.clone());
         let state = RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: records
                 .into_iter()

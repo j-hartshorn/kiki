@@ -159,6 +159,9 @@ count the owner's full list, and keep the in-progress glyph static. All includes
 Current includes only explicitly in-progress items; None/disabled show no TODO
 items/counts and preserve existing subagent lifecycle rows. Keep independent
 owner labels and prevent child items appearing in the foreground list.
+User UI feedback: reserve one blank row above a visible foreground checklist
+during an active Run, inside the existing detail budget; preserve idle and
+hidden-list spacing and prioritize prompt/lifecycle rows in short terminals.
 
 Implement bounded overflow plus the agreed explicit read-only viewer for root
 and branch-accessible child lists. Support terminal child inspection, scrolling,
@@ -337,3 +340,25 @@ that cannot honor the agreed source contract.
   and source.diff matched before this documentation-only entry. RUST_TEST_THREADS=2
   just test passed1835unit+5credentialsCLI+17sessionsCLI,8ignored; justlint/fmtcheck/
   diffcheck passed. Actual checklist/overflow viewer is task7, not claimed here.
+
+- Task 7: committed Arena projections seed root restoration (including canonical
+  empty state); accepted execution records update derived UI state. Added bounded
+  root/child trees and a local read-only `/todos` viewer with stable owner identity,
+  branch-scoped retained children, keyboard scrolling, wrapping and modal draft
+  protection. All/Current/None and captured active/current terminal policy apply.
+- User UI feedback accepted: one blank row above the root checklist during an
+  active Run, charged inside its existing detail budget; idle/hidden lists retain
+  their spacing. User subsequently requested merge, cleanup, and push.
+- Full verification exposed a real recovery issue: trusted TODO policy application
+  reused the model-code timeout. With a zero budget it intermittently produced
+  RecoveryFailed instead of the intended cancelled timeout. A four-lane reproducer
+  captured that exact terminal; policy reapplication now follows trusted checkpoint
+  restoration outside the model-code budget. No configured/harness timeout changed.
+  The original cancellation assertion remains and now reports unexpected terminals.
+- Task 7 verification: target/todo-verification/todo-release-ui-fixed.7lAm6m exit0;
+  RUST_TEST_THREADS=1 just test passed1852unit+22CLI,8ignored; lint/fmt/diffcheck
+  passed. Matching source diff inspected before this record. Four-lane/40-attempt
+  timeout recovery rerun exit0 (todo-timeout-recovery-green.AfOTy6). Eight focused
+  TODO UI regressions include observed padding red->green. Independent task review
+  CLEAN, no must/should findings. User visually accepted the displayed UI; automated
+  tests cover additional modes, retention, Unicode, scrolling and small terminals.

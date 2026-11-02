@@ -1455,12 +1455,10 @@ impl Arena {
             .await
             .map_err(pool_failure)?;
         Self::restore_checkout(&mut checkout, checkpoint).await?;
-        timeout(
-            self.execution_timeout,
-            apply_todo_policy_checkout(&mut checkout, self.todo_policy),
-        )
-        .await
-        .map_err(|_| todo_failure("policy application timed out"))??;
+        // Trusted restoration, like restoring the checkpoint itself, is outside
+        // the model-code budget. A zero/expired execution budget must not make
+        // recovery fail while reapplying the admitted policy.
+        apply_todo_policy_checkout(&mut checkout, self.todo_policy).await?;
         Ok(checkout)
     }
 

@@ -632,6 +632,10 @@ impl<M: Model> Agent<M> {
         self.invocation_context = Some(context);
     }
 
+    pub(crate) fn todo_snapshot(&self) -> &crate::todos::TodoSnapshot {
+        self.arena.todos()
+    }
+
     pub(crate) fn capture_todo_policy(&mut self, policy: crate::todos::TodoPolicy) {
         self.arena.capture_todo_policy(policy);
     }
@@ -5940,10 +5944,14 @@ mod tests {
             let (outcome, ()) = tokio::join!(run, cancel_at_closure);
             outcome.unwrap()
         };
-        assert!(matches!(
-            outcome.terminal,
-            crate::session::PersistedTerminal::Cancelled { .. }
-        ));
+        assert!(
+            matches!(
+                outcome.terminal,
+                crate::session::PersistedTerminal::Cancelled { .. }
+            ),
+            "unexpected terminal: {:?}",
+            outcome.terminal
+        );
         assert!(matches!(
             writer
                 .model_history()

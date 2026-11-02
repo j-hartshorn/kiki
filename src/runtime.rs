@@ -191,6 +191,7 @@ pub(crate) struct RuntimeInitialState {
     pub(crate) timeline: Vec<RestoredTimelineItem>,
     pub(crate) footer_adjustment: Vec<AttemptAccounting>,
     pub(crate) disabled_reason: Option<RuntimeDisabledReason>,
+    pub(crate) root_todos: Option<crate::todos::TodoSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -232,6 +233,7 @@ impl RuntimeInitialState {
             timeline: Vec::new(),
             footer_adjustment: Vec::new(),
             disabled_reason: None,
+            root_todos: None,
         }
     }
 }
@@ -742,6 +744,7 @@ fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
         (*revision, *shifted, *original_revision)
     });
     RuntimeInitialState {
+        root_todos: None,
         metadata: restore.metadata.clone(),
         timeline: ordered.into_iter().map(|(_, _, _, item)| item).collect(),
         footer_adjustment: restore.footer_adjustment.clone(),
@@ -966,6 +969,7 @@ impl<M: Model> RuntimeController<M> {
         if agent.is_none() && initial.disabled_reason.is_none() {
             initial.disabled_reason = Some(RuntimeDisabledReason::SessionRestoreFailed);
         }
+        initial.root_todos = agent.as_ref().map(|agent| agent.todo_snapshot().clone());
         let subagent_events = subagents.take_event_receiver();
         Ok((
             Self {
@@ -1387,7 +1391,7 @@ impl<M: Model> RuntimeController<M> {
         {
             return (NavigationOutcome::Failed, None);
         }
-        let initial = restored_initial_state(&restore);
+        let mut initial = restored_initial_state(&restore);
         let executable = restore
             .executable
             .expect("navigation validated executable state");
@@ -1439,6 +1443,10 @@ impl<M: Model> RuntimeController<M> {
             );
         }
 
+        initial.root_todos = self
+            .agent
+            .as_ref()
+            .map(|agent| agent.todo_snapshot().clone());
         let selected_origins = restore
             .tasks
             .iter()
@@ -18563,10 +18571,10 @@ mod tests {
         )
         .await
         .expect("restore navigation runtime");
-        assert_eq!(
-            initial,
-            restored_initial_state(&session.restore().expect("restore original"))
-        );
+        let mut expected = restored_initial_state(&session.restore().expect("restore original"));
+        // Executable restoration includes the selected Arena's canonical empty list.
+        expected.root_todos = Some(Vec::new());
+        assert_eq!(initial, expected);
         let (commands, mut events, _progress, controller) = start_controller(controller);
         commands
             .send(RuntimeCommand::Navigate { entry: root })
@@ -18613,8 +18621,9 @@ mod tests {
             } => state,
             outcome => panic!("unexpected original-branch outcome: {outcome:?}"),
         };
-        let expected_returned_state =
+        let mut expected_returned_state =
             restored_initial_state(&session.restore().expect("restore returned original branch"));
+        expected_returned_state.root_todos = Some(Vec::new());
         assert_eq!(returned_state, expected_returned_state);
         assert_eq!(active_entry_id(&session), fixture.selected_leaf.0 as i64);
         let visible_task_ids = returned_state
@@ -21186,5 +21195,66 @@ mod tests {
             assert_eq!(captured.unwrap().unwrap().enabled(), initial);
             session.close().unwrap();
         }
+    }
+    #[tokio::test]
+    async fn todo_projection_restore_reads_selected_arena_without_execution_records() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let mut seeded = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let setup = seeded
+            .execute_model_code(
+                "todos.add('canonical checkpoint', 'in_progress')",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            setup.0.outcome,
+            crate::arena::ExecutionOutcome::Complete { .. }
+        ));
+        let expected = seeded.todos().clone();
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            selection,
+            seeded.checkpoint(),
+        )
+        .unwrap();
+        drop(seeded);
+        let fresh = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            fresh,
+            CountingMessageModel { calls },
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            ResumeOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(initial.timeline.is_empty());
+        assert_eq!(initial.root_todos, Some(expected));
+        drop(controller);
+        session.close().unwrap();
     }
 }

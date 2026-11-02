@@ -8,6 +8,7 @@ pub(super) enum Action {
     Settings,
     Skill,
     Theme,
+    Todos,
     Tree,
     Thinking,
 }
@@ -20,7 +21,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const CATALOGUE: [Command; 7] = [
+const CATALOGUE: [Command; 8] = [
     Command {
         token: "/compact",
         purpose: "Compact context",
@@ -56,6 +57,12 @@ const CATALOGUE: [Command; 7] = [
         purpose: "Choose thinking level",
         action: Action::Thinking,
         takes_argument: true,
+    },
+    Command {
+        token: "/todos",
+        purpose: "Inspect TODO lists",
+        action: Action::Todos,
+        takes_argument: false,
     },
     Command {
         token: "/tree",
@@ -404,6 +411,7 @@ mod tests {
                 ("/settings", "Open settings"),
                 ("/theme", "Choose theme"),
                 ("/thinking", "Choose thinking level"),
+                ("/todos", "Inspect TODO lists"),
                 ("/tree", "Navigate session history"),
             ]
         );
@@ -473,6 +481,7 @@ mod tests {
                     "/settings",
                     "/theme",
                     "/thinking",
+                    "/todos",
                     "/tree",
                 ],
             ),

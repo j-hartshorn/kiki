@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 mod picker;
 mod slash;
 mod subagents;
+mod todos;
 mod tree;
 
 use ratatui::backend::Backend;
@@ -42,7 +43,7 @@ use crate::selection::{DocumentPosition, Selection};
 use crate::skills::{SkillCatalog, SkillDiagnostic, SkillLookupError};
 use crate::telemetry::{Trace, TraceEvent};
 use crate::theme::{self, Appearance, Theme, ThemeSetting};
-use crate::todos::{TodoDisplay, TodoPolicy, TodoSettings};
+use crate::todos::{TodoDisplay, TodoPolicy, TodoSettings, TodoSnapshot};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
@@ -255,6 +256,8 @@ struct App {
     picker: Option<Picker<PickerValue>>,
     settings_return: SettingsReturn,
     todo_settings: TodoSettings,
+    root_todos: Option<TodoSnapshot>,
+    todo_viewer: Option<todos::TodoViewer>,
     root_todo_policy: Option<(RunId, TodoPolicy)>,
     next_todo_revision: u64,
     pending_todo_revision: Option<u64>,
@@ -319,6 +322,8 @@ impl Default for App {
             picker: None,
             settings_return: SettingsReturn::Close,
             todo_settings: TodoSettings::default(),
+            root_todos: None,
+            todo_viewer: None,
             root_todo_policy: None,
             next_todo_revision: 0,
             pending_todo_revision: None,
@@ -451,6 +456,7 @@ impl App {
         }
         app.transcript = Transcript::restored(startup, initial);
         app.subagent_monitor = subagents::SubagentMonitor::restored(&initial.timeline);
+        app.root_todos = Self::restored_todos(initial);
         app
     }
 
@@ -469,6 +475,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        if self.todo_viewer.is_some() {
+            return Update::default();
+        }
         if self.is_tree_loading() {
             return Update::default();
         }
@@ -624,6 +633,7 @@ impl App {
             || self.compact_acknowledgement_pending
             || self.picker.is_some()
             || self.tree_navigator.is_some()
+            || self.todo_viewer.is_some()
         {
             false
         } else {
@@ -643,6 +653,9 @@ impl App {
     fn handle_key_inner(&mut self, key: KeyEvent, now: Instant) -> Update {
         if key.is_release() {
             return Update::default();
+        }
+        if self.todo_viewer.is_some() {
+            return self.handle_todo_viewer_key(key);
         }
         if self.tree_navigator.is_some() {
             return self.handle_tree_navigator_key(key);
@@ -1002,6 +1015,7 @@ impl App {
                     quit: false,
                 }
             }
+            slash::Action::Todos => self.open_todo_viewer(),
             slash::Action::Tree => self.open_session_tree(command.argument),
             slash::Action::Thinking => {
                 let argument = command.argument;
@@ -1357,6 +1371,77 @@ impl App {
             ],
             PickerValue::OpenThemePicker,
         ));
+    }
+
+    fn restored_todos(state: &RuntimeInitialState) -> Option<TodoSnapshot> {
+        state.root_todos.clone().or_else(|| {
+            state.timeline.iter().rev().find_map(|item| match item {
+                crate::runtime::RestoredTimelineItem::Record(crate::runtime::StoredRecord {
+                    record: crate::runtime::Record::CompletedExecution { execution, .. },
+                    ..
+                }) => execution.todos.clone(),
+                _ => None,
+            })
+        })
+    }
+    fn todo_owners(&self) -> Vec<todos::TodoOwner<'_>> {
+        let mut owners = vec![todos::TodoOwner {
+            id: todos::TodoOwnerId::Root,
+            label: "Main agent".to_owned(),
+            status: None,
+            policy: self.effective_root_todo_policy(),
+            items: self.root_todos.as_ref(),
+        }];
+        owners.extend(self.transcript.subagent_records().map(|record| {
+            todos::TodoOwner {
+                id: todos::TodoOwnerId::Child(record.storage_id()),
+                label: format!("{} · {}", record.id(), record.parameters().prompt()),
+                status: Some(record.observation().state().as_str()),
+                policy: if self.subagent_monitor.task_is_active(record.id()) {
+                    record.parameters().todo_policy()
+                } else {
+                    TodoPolicy::capture(self.todo_settings.enabled)
+                },
+                items: record
+                    .executions()
+                    .last()
+                    .and_then(|execution| execution.execution().todos.as_ref()),
+            }
+        }));
+        owners
+    }
+    fn open_todo_viewer(&mut self) -> Update {
+        let owners = self.todo_owners();
+        let viewer = todos::TodoViewer::open(&owners);
+        drop(owners);
+        if let Some(viewer) = viewer {
+            self.todo_viewer = Some(viewer);
+            self.picker = None;
+            self.tree_navigator = None;
+            self.settings_return = SettingsReturn::Close;
+            self.theme = self.theme_setting.resolve(self.appearance);
+            self.invalidate_selection();
+        } else {
+            self.set_notice("TODO list is off.".to_owned());
+        }
+        Update {
+            visible_changed: true,
+            ..Update::default()
+        }
+    }
+    fn handle_todo_viewer_key(&mut self, key: KeyEvent) -> Update {
+        let mut viewer = self.todo_viewer.take().expect("viewer is open");
+        let owners = self.todo_owners();
+        let action = viewer.handle_key(key, &owners);
+        drop(owners);
+        let visible_changed = action != todos::TodoViewerAction::None;
+        if action != todos::TodoViewerAction::Close {
+            self.todo_viewer = Some(viewer);
+        }
+        Update {
+            visible_changed,
+            ..Update::default()
+        }
     }
 
     fn effective_root_todo_policy(&self) -> TodoPolicy {
@@ -2254,7 +2339,21 @@ impl App {
             RuntimeEvent::RuntimeDisabled { .. } => true,
             _ => false,
         };
+        let incoming_todos = match &event {
+            RuntimeEvent::RecordAppended {
+                record:
+                    crate::runtime::StoredRecord {
+                        record: crate::runtime::Record::CompletedExecution { execution, .. },
+                        ..
+                    },
+                ..
+            } => execution.todos.clone(),
+            _ => None,
+        };
         let transcript_changed = self.transcript.apply(event, gap_before);
+        if transcript_changed && let Some(items) = incoming_todos {
+            self.root_todos = Some(items);
+        }
         if clear_policy {
             self.root_todo_policy = None;
         }
@@ -2404,6 +2503,8 @@ impl App {
         self.transcript = transcript;
         self.root_todo_policy = None;
         self.subagent_monitor = subagents::SubagentMonitor::restored(&state.timeline);
+        self.root_todos = Self::restored_todos(state);
+        self.todo_viewer = None;
         self.history_position = HistoryPosition::FollowingBottom;
         self.history_height = 0;
         self.history_rows = 0;
@@ -3436,18 +3537,50 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         })
         .filter(|card| card.height() < history_height.saturating_sub(throbber_height));
     let card_height = pending_card.as_ref().map_or(0, ModelChangeCard::height);
-    let monitor = app.subagent_monitor.layout(
+    let dock_rows = history_height
+        .saturating_sub(throbber_height)
+        .saturating_sub(card_height)
+        .saturating_sub(1);
+    let base_monitor = app
+        .subagent_monitor
+        .layout(app.theme, area.width, dock_rows, now);
+    let detail_rows = dock_rows
+        .saturating_sub(base_monitor.height())
+        .min(dock_rows / 2)
+        .min(16);
+    let root_budget = if base_monitor.height() > 0 {
+        detail_rows.div_ceil(2)
+    } else {
+        detail_rows
+    }
+    .min(8);
+    let todo_padding = u16::from(app.transcript.has_active_run());
+    let mut todo_lines = app.root_todos.as_ref().map_or_else(Vec::new, |items| {
+        todos::checklist_lines(
+            app.theme,
+            items,
+            app.effective_root_todo_policy(),
+            app.todo_settings.display,
+            area.width,
+            root_budget.saturating_sub(todo_padding),
+        )
+    });
+    if todo_padding > 0 && !todo_lines.is_empty() {
+        todo_lines.insert(0, Line::default());
+    }
+    let todo_height = u16::try_from(todo_lines.len()).unwrap_or(u16::MAX);
+    let monitor = app.subagent_monitor.layout_with_todos(
         app.theme,
         area.width,
-        history_height
-            .saturating_sub(throbber_height)
-            .saturating_sub(card_height)
-            .saturating_sub(1),
+        dock_rows.saturating_sub(todo_height),
         now,
+        app.todo_settings,
+        detail_rows.saturating_sub(todo_height),
     );
     let throbber_top = prompt_top.saturating_sub(throbber_height);
     let card_top = throbber_top.saturating_sub(card_height);
-    let monitor_top = card_top.saturating_sub(monitor.height());
+    let todo_top = card_top.saturating_sub(todo_height);
+    let monitor_top = todo_top.saturating_sub(monitor.height());
     let history = Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -3465,6 +3598,12 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         frame,
         Rect::new(area.x, monitor_top, area.width, monitor.height()),
     );
+    if todo_height > 0 {
+        frame.render_widget(
+            Paragraph::new(todo_lines),
+            Rect::new(area.x, todo_top, area.width, todo_height),
+        );
+    }
     if let Some(card) = &pending_card {
         card.render(
             Rect::new(area.x, card_top, area.width, card_height),
@@ -3505,7 +3644,8 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         !app.is_submission_disabled()
             && !app.compact_acknowledgement_pending
             && app.picker.is_none()
-            && app.tree_navigator.is_none(),
+            && app.tree_navigator.is_none()
+            && app.todo_viewer.is_none(),
         slash::recognised_token_range(app.prompt.text()),
         app.prompt_selection
             .as_ref()
@@ -3526,6 +3666,12 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     );
     if let Some(picker) = &mut app.picker {
         picker.render(app.theme, frame, area);
+    }
+    if let Some(mut viewer) = app.todo_viewer.take() {
+        let owners = app.todo_owners();
+        viewer.render(app.theme, frame, area, &owners);
+        drop(owners);
+        app.todo_viewer = Some(viewer);
     }
 }
 
@@ -4206,6 +4352,7 @@ mod tests {
 
     fn restored_state(request: &str) -> RuntimeInitialState {
         RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: vec![RestoredTimelineItem::Record(StoredRecord {
                 run_id: RunId(4),
@@ -4865,6 +5012,7 @@ mod tests {
 
     fn branch_state(selections: &[ModelSelection]) -> RuntimeInitialState {
         RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: selections
                 .iter()
@@ -5186,6 +5334,7 @@ mod tests {
         let metadata =
             SessionMetadata::new(Some("Saved name".to_owned()), preferences.clone(), false);
         let initial = RuntimeInitialState {
+            root_todos: None,
             metadata: Some(metadata.clone()),
             timeline: Vec::new(),
             footer_adjustment: Vec::new(),
@@ -5222,6 +5371,7 @@ mod tests {
         let snapshot = crate::config::ready_snapshot_for_test();
         let selection = ModelSelection::new(&SOL, "low").unwrap();
         let initial = RuntimeInitialState {
+            root_todos: None,
             metadata: Some(SessionMetadata::new(
                 None,
                 SessionPreferences::initial(selection),
@@ -5850,6 +6000,7 @@ mod tests {
         let (settings_column, settings_row) = cell_start(&initial, "/settings");
         let (theme_column, theme_row) = cell_start(&initial, "/theme");
         let (thinking_column, thinking_row) = cell_start(&initial, "/thinking");
+        let (todos_column, todos_row) = cell_start(&initial, "/todos");
         let (tree_column, tree_row) = cell_start(&initial, "/tree");
 
         assert_eq!(compact_column, overlay.x);
@@ -5859,7 +6010,8 @@ mod tests {
                 && name_row < settings_row
                 && settings_row < theme_row
                 && theme_row < thinking_row
-                && thinking_row < tree_row
+                && thinking_row < todos_row
+                && todos_row < tree_row
         );
         assert_slash_selection(&initial[(compact_column, compact_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
@@ -5877,6 +6029,9 @@ mod tests {
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         let thinking = rendered_buffer(&mut app, 40, 12);
         assert_slash_selection(&thinking[(thinking_column, thinking_row)]);
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let todos = rendered_buffer(&mut app, 40, 12);
+        assert_slash_selection(&todos[(todos_column, todos_row)]);
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(
@@ -6123,7 +6278,7 @@ mod tests {
     #[test]
     fn slash_overlay_shields_primary_mouse_events_but_not_history_outside_it() {
         let mut app = app_with_history(app_with_prompt("/"));
-        rendered_buffer(&mut app, 40, 12);
+        rendered_buffer(&mut app, 40, 16);
         let overlay = app.slash_overlay.expect("slash overlay");
         let viewport = app.history_viewport.expect("history viewport");
         let now = Instant::now();
@@ -6144,6 +6299,7 @@ mod tests {
 
         let outside_column = viewport.area.x + 1;
         let outside_row = viewport.area.y;
+        assert!(!overlay.contains(Position::new(outside_column, outside_row)));
         app.handle_mouse(
             mouse_event(
                 MouseEventKind::Down(MouseButton::Left),
@@ -6198,7 +6354,7 @@ mod tests {
         assert!(app.selection.is_none());
         assert!(app.drag.is_none());
         assert!(!app.pending_copy);
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         let mut clipboard = FakeClipboard::available();
         assert!(!super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
         assert!(clipboard.writes.is_empty());
@@ -10312,6 +10468,7 @@ mod tests {
             },
         });
         let initial = RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: records
                 .into_iter()
@@ -10367,6 +10524,7 @@ mod tests {
             Vec::new(),
         );
         let initial = RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: vec![
                 RestoredTimelineItem::Record(request),
@@ -10392,6 +10550,7 @@ mod tests {
     #[test]
     fn restored_failed_run_shows_unmeasured_retries_in_the_tui() {
         let initial = RuntimeInitialState {
+            root_todos: None,
             metadata: None,
             timeline: vec![
                 RestoredTimelineItem::Record(StoredRecord {
@@ -14521,5 +14680,355 @@ mod tests {
                 );
             }
         }
+    }
+    fn todo_display_items() -> crate::todos::TodoSnapshot {
+        use crate::todos::{TodoItem, TodoStatus};
+        [
+            ("completed display item", TodoStatus::Completed),
+            ("pending display item", TodoStatus::Pending),
+            ("active display item", TodoStatus::InProgress),
+            ("second active display item", TodoStatus::InProgress),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (text, status))| TodoItem {
+            id: index as i64 + 1,
+            text: text.to_owned(),
+            status,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn todo_display_restored_root_all_current_none_and_off_are_independent() {
+        let items = todo_display_items();
+        let mut initial = RuntimeInitialState::empty();
+        initial.root_todos = Some(items.clone());
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+        let all = rendered(&mut app, 120, 45);
+        assert!(all.contains("● Todos (1/4)"), "{all}");
+        for item in &items {
+            assert!(all.contains(&item.text), "missing {}", item.text);
+        }
+        app.todo_settings.display = TodoDisplay::Current;
+        let current = rendered(&mut app, 120, 45);
+        assert!(current.contains("● Todos (1/4)"));
+        assert!(current.contains("active display item"));
+        assert!(current.contains("second active display item"));
+        assert!(!current.contains("completed display item"));
+        assert!(!current.contains("pending display item"));
+        app.todo_settings.display = TodoDisplay::None;
+        let hidden = rendered(&mut app, 120, 45);
+        assert!(!hidden.contains("● Todos"));
+        assert!(!hidden.contains("active display item"));
+        app.todo_settings.display = TodoDisplay::All;
+        app.todo_settings.enabled = false;
+        assert!(!rendered(&mut app, 120, 45).contains("● Todos"));
+        app.todo_settings.enabled = true;
+        assert!(rendered(&mut app, 120, 45).contains("completed display item"));
+        assert_eq!(initial.root_todos, Some(items));
+    }
+
+    #[test]
+    fn todo_display_root_has_one_top_padding_row_only_during_an_active_run() {
+        let mut initial = RuntimeInitialState::empty();
+        initial.root_todos = Some(todo_display_items());
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+        for phase in 0..4 {
+            match phase {
+                1 => {
+                    app.handle_event(RuntimeEvent::RunStarted {
+                        run_id: RunId(1),
+                        todo_policy: crate::todos::TodoPolicy::ENABLED,
+                    });
+                }
+                2 => {
+                    app.handle_event(RuntimeEvent::ModelStepStarted {
+                        run_id: RunId(1),
+                        step_id: ModelStepId(1),
+                        epoch: 0,
+                    });
+                }
+                3 => {
+                    app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) });
+                }
+                _ => {}
+            }
+            let screen = rendered(&mut app, 120, 45);
+            let header = screen
+                .lines()
+                .position(|line| line.contains("● Todos"))
+                .unwrap();
+            let history_bottom = usize::from(app.history_viewport.unwrap().area.bottom());
+            let expected_padding = usize::from(matches!(phase, 1 | 2));
+            assert_eq!(
+                header - history_bottom,
+                expected_padding,
+                "phase {phase}: {screen}"
+            );
+            if expected_padding == 1 {
+                assert!(screen.lines().nth(header - 1).unwrap().trim().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn todo_display_explicit_viewer_is_local_and_full_even_in_none_mode() {
+        let mut initial = RuntimeInitialState::empty();
+        initial.root_todos = Some(todo_display_items());
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+        app.todo_settings.display = TodoDisplay::None;
+        assert!(!rendered(&mut app, 120, 45).contains("completed display item"));
+        let open = enter_at(&mut app, "/todos", Instant::now());
+        assert!(open.commands.is_empty(), "viewer submitted model work");
+        let view = rendered(&mut app, 120, 45);
+        assert!(view.contains("completed display item"), "{view}");
+        assert!(view.contains("pending display item"));
+        assert!(view.contains("second active display item"));
+        let close = app.handle_key_at(key(KeyCode::Esc), Instant::now());
+        assert!(close.commands.is_empty());
+        assert!(!rendered(&mut app, 120, 45).contains("completed display item"));
+    }
+    fn todo_child_projection_record(
+        id: &str,
+        revision: u64,
+        state: crate::subagents::TaskState,
+        items: crate::todos::TodoSnapshot,
+    ) -> crate::subagents::TaskRecord {
+        let SessionCatalogueKind::Execution { execution, .. } = tree_execution("todo projection")
+        else {
+            unreachable!()
+        };
+        let mut execution = *execution;
+        execution.todos = Some(items);
+        let model = crate::config::DEFAULT_MODEL;
+        let selection = ModelSelection::new(model, model.default_thinking).unwrap();
+        crate::subagents::TaskRecord::for_test(id, revision, selection, None, 1, Vec::new())
+            .with_persisted_details_for_test(crate::subagents::TaskPersistedDetails {
+                admitted_at_ms: 0,
+                terminal_at_ms: state.is_terminal().then_some(10),
+                state,
+                step_count: 1,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 0,
+                attempt_evidence: Vec::new(),
+                executions: vec![crate::subagents::TaskExecution::for_test(
+                    1,
+                    "todo update".to_owned(),
+                    String::new(),
+                    execution,
+                    Vec::new(),
+                )],
+                outcome: None,
+            })
+    }
+
+    fn todo_child_display_items() -> crate::todos::TodoSnapshot {
+        let mut items = todo_display_items();
+        for item in &mut items {
+            item.text = item.text.replace("display", "child");
+        }
+        items
+    }
+
+    #[test]
+    fn todo_display_child_inline_filters_and_captured_policy_follow_settlement() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::SubagentSpawned {
+            record: todo_child_projection_record(
+                "0",
+                1,
+                crate::subagents::TaskState::Running,
+                todo_child_display_items(),
+            ),
+        });
+        let all = rendered(&mut app, 120, 50);
+        assert!(all.contains("test child"));
+        assert!(all.contains("● Todos (1/4)"), "{all}");
+        assert!(all.contains("completed child item"));
+        assert!(all.contains("active child item"));
+        app.todo_settings.display = TodoDisplay::Current;
+        let current = rendered(&mut app, 120, 50);
+        assert!(current.contains("active child item"));
+        assert!(current.contains("second active child item"));
+        assert!(!current.contains("completed child item"));
+        assert!(!current.contains("pending child item"));
+        app.todo_settings.display = TodoDisplay::None;
+        let none = rendered(&mut app, 120, 50);
+        assert!(none.contains("test child"));
+        assert!(!none.contains("● Todos"));
+        app.todo_settings.display = TodoDisplay::All;
+        app.todo_settings.enabled = false;
+        assert!(rendered(&mut app, 120, 50).contains("● Todos"));
+        app.handle_event(RuntimeEvent::SubagentFinished {
+            record: todo_child_projection_record(
+                "0",
+                2,
+                crate::subagents::TaskState::Completed,
+                todo_child_display_items(),
+            ),
+        });
+        assert!(rendered(&mut app, 120, 50).contains("● Todos"));
+        app.handle_event(RuntimeEvent::SubagentOperationSettled {
+            id: crate::subagents::TaskId::parse("0").unwrap(),
+        });
+        let finished = rendered(&mut app, 120, 50);
+        assert!(finished.contains("test child"));
+        assert!(!finished.contains("● Todos"));
+    }
+
+    #[test]
+    fn todo_display_retained_child_viewer_outlives_inline_row_and_preserves_draft() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::SubagentFinished {
+            record: todo_child_projection_record(
+                "0",
+                1,
+                crate::subagents::TaskState::Completed,
+                todo_child_display_items(),
+            ),
+        });
+        app.handle_event(RuntimeEvent::SubagentOperationSettled {
+            id: crate::subagents::TaskId::parse("0").unwrap(),
+        });
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(5),
+                record: Record::UserRequest {
+                    request: "next request clears inline terminals".to_owned(),
+                    selection: None,
+                },
+            },
+            progress_gap: false,
+        });
+        app.todo_settings.display = TodoDisplay::None;
+        set_prompt(&mut app, "unsent draft");
+        let opened = app.open_todo_viewer();
+        assert!(opened.commands.is_empty());
+        let selector = rendered(&mut app, 120, 45);
+        assert!(selector.contains("Main agent"));
+        assert!(selector.contains("test child"));
+        app.handle_key_at(key(KeyCode::Down), Instant::now());
+        app.handle_key_at(key(KeyCode::Enter), Instant::now());
+        let child = rendered(&mut app, 120, 45);
+        assert!(child.contains("completed child item"), "{child}");
+        assert!(child.contains("pending child item"));
+        assert!(child.contains("second active child item"));
+        app.handle_paste("do not edit the draft");
+        app.handle_key_at(key(KeyCode::Esc), Instant::now());
+        app.handle_key_at(key(KeyCode::Esc), Instant::now());
+        assert_eq!(app.prompt.text(), "unsent draft");
+    }
+    fn todo_root_execution_event(step: u64, items: crate::todos::TodoSnapshot) -> RuntimeEvent {
+        let SessionCatalogueKind::Execution { execution, .. } = tree_execution("todo root update")
+        else {
+            unreachable!()
+        };
+        let mut execution = *execution;
+        execution.todos = Some(items);
+        RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::CompletedExecution {
+                    step_id: ModelStepId(step),
+                    source: "pass".to_owned(),
+                    commentary: None,
+                    reasoning_summary: String::new(),
+                    execution,
+                    attempts: Vec::new(),
+                },
+            },
+            progress_gap: false,
+        }
+    }
+    #[test]
+    fn todo_display_live_root_updates_clear_current_without_resetting_data() {
+        let mut app = App::default();
+        let items = todo_display_items();
+        app.handle_event(todo_root_execution_event(1, items.clone()));
+        assert_eq!(app.root_todos, Some(items));
+        assert!(rendered(&mut app, 120, 45).contains("active display item"));
+        let completed = vec![crate::todos::TodoItem {
+            id: 9,
+            text: "last completed TODO".to_owned(),
+            status: crate::todos::TodoStatus::Completed,
+        }];
+        app.handle_event(todo_root_execution_event(2, completed.clone()));
+        app.todo_settings.display = TodoDisplay::Current;
+        assert!(!rendered(&mut app, 120, 45).contains("● Todos"));
+        app.todo_settings.display = TodoDisplay::All;
+        assert!(rendered(&mut app, 120, 45).contains("last completed TODO"));
+        assert_eq!(app.root_todos, Some(completed));
+        app.handle_event(todo_root_execution_event(3, Vec::new()));
+        assert_eq!(app.root_todos, Some(Vec::new()));
+        assert!(!rendered(&mut app, 120, 45).contains("● Todos"));
+    }
+    #[test]
+    fn todo_display_navigation_prefers_canonical_projection_and_closes_stale_viewer() {
+        let mut initial = RuntimeInitialState::empty();
+        initial.root_todos = Some(todo_display_items());
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+        set_prompt(&mut app, "preserved branch draft");
+        app.open_todo_viewer();
+        assert!(app.todo_viewer.is_some());
+        let mut replacement = RuntimeInitialState::empty();
+        replacement.root_todos = Some(Vec::new());
+        let RuntimeEvent::RecordAppended { record, .. } =
+            todo_root_execution_event(1, todo_display_items())
+        else {
+            unreachable!()
+        };
+        replacement
+            .timeline
+            .push(crate::runtime::RestoredTimelineItem::Record(record));
+        app.manual_navigation_pending = true;
+        app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: crate::runtime::NavigationOutcome::Replaced {
+                state: replacement,
+                request_prefill: None,
+            },
+        });
+        assert_eq!(app.root_todos, Some(Vec::new()));
+        assert!(app.todo_viewer.is_none());
+        assert!(!rendered(&mut app, 120, 45).contains("active display item"));
+        assert_eq!(app.prompt.text(), "preserved branch draft");
+    }
+    #[test]
+    fn todo_display_many_items_and_children_preserve_prompt_and_lifecycle_rows() {
+        let items = (0..64)
+            .map(|index| crate::todos::TodoItem {
+                id: index + 1,
+                text: format!("wide task {index} 界🦀"),
+                status: crate::todos::TodoStatus::InProgress,
+            })
+            .collect::<Vec<_>>();
+        let mut initial = RuntimeInitialState::empty();
+        initial.root_todos = Some(items.clone());
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+        for id in ["0", "1", "2", "3"] {
+            app.handle_event(RuntimeEvent::SubagentSpawned {
+                record: todo_child_projection_record(
+                    id,
+                    1,
+                    crate::subagents::TaskState::Running,
+                    items.clone(),
+                ),
+            });
+        }
+        let normal = rendered(&mut app, 120, 24);
+        assert!(normal.contains('>'), "{normal}");
+        for id in ["0", "1", "2", "3"] {
+            assert!(normal.contains(&format!("subagent:{id}")), "{normal}");
+        }
+        app.handle_event(RuntimeEvent::RunStarted {
+            run_id: RunId(1),
+            todo_policy: crate::todos::TodoPolicy::ENABLED,
+        });
+        for width in [1, 2, 10, 20, 80] {
+            for height in [1, 2, 3, 8, 16, 24] {
+                let _ = rendered(&mut app, width, height);
+            }
+        }
+        assert_eq!(app.root_todos, Some(items));
     }
 }

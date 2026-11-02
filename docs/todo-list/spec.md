@@ -18,7 +18,11 @@ planning mode, approval gate, or restriction on other tools.
 
 Use a full-width pinned checklist above the prompt, alongside the existing
 bottom-area activity displays. It does not scroll away with session text or
-steal prompt focus. Use existing theme roles: completed items are muted,
+steal prompt focus. While a Run is in progress, reserve one blank row above
+a visible foreground checklist within its existing height budget. Do not add
+this padding while idle or when the checklist is hidden. Prompt and lifecycle
+rows retain priority in short terminals. Use existing theme roles: completed
+items are muted,
 in-progress items accented, and pending items neutral. Status is also conveyed
 by markers, never colour alone.
 
