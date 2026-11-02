@@ -165,6 +165,41 @@ pub static GPT6_1_SOL: ModelConfiguration = ModelConfiguration {
     },
 };
 
+pub static GPT6_1_TERRA: ModelConfiguration = ModelConfiguration {
+    id: "openai/gpt-6.1-terra",
+    thinking_levels: THINKING_LEVELS,
+    default_thinking: "high",
+    service_tier: "default",
+    context_window_tokens: 1_050_000,
+    context_window_display: "1.05m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "openai/gpt-6.1-terra",
+            service_tier: "default",
+            version: "2026-10-26",
+            source: "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+        },
+        long_context_threshold: 272_000,
+        long_context_threshold_display: "272k",
+        short_context: Rates {
+            uncached_input_nanos: 1_000,
+            cached_input_nanos: 50,
+            cache_write_nanos: 1_250,
+            cache_write_1h_nanos: 1_250,
+            output_nanos: 5_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 2_000,
+            cached_input_nanos: 100,
+            cache_write_nanos: 2_500,
+            cache_write_1h_nanos: 2_500,
+            output_nanos: 7_500,
+        },
+    },
+};
+
 pub static GPT6_SOL: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-6-sol",
     thinking_levels: THINKING_LEVELS,
@@ -515,9 +550,10 @@ pub static GEMINI_3_8_FLASH: ModelConfiguration = ModelConfiguration {
     },
 };
 
-pub static CATALOGUE: [&ModelConfiguration; 12] = [
+pub static CATALOGUE: [&ModelConfiguration; 13] = [
     &ASTRA,
     &GPT6_1_SOL,
+    &GPT6_1_TERRA,
     &GPT6_SOL,
     &GPT6_LUNA,
     &SOL,
@@ -529,8 +565,8 @@ pub static CATALOGUE: [&ModelConfiguration; 12] = [
     &GEMINI_4_ARGON,
     &GEMINI_3_8_FLASH,
 ];
-pub static DEFAULT_MODEL: &ModelConfiguration = &GEMINI_4_ARGON;
-pub static DEFAULT_MODELS: [&ModelConfiguration; 3] = [&GEMINI_4_ARGON, &GPT6_1_SOL, &OPUS_5_5];
+pub static DEFAULT_MODEL: &ModelConfiguration = &GPT6_1_TERRA;
+pub static DEFAULT_MODELS: [&ModelConfiguration; 3] = [&GPT6_1_TERRA, &GEMINI_4_ARGON, &OPUS_5_5];
 
 pub fn default_model_for_providers(providers: &[Provider]) -> &'static ModelConfiguration {
     DEFAULT_MODELS
@@ -572,12 +608,51 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn gpt_6_1_terra_is_the_high_thinking_default_with_published_rates() {
+        let model = model_by_id("openai/gpt-6.1-terra").expect("Terra is in the catalogue");
+        assert!(std::ptr::eq(DEFAULT_MODEL, model));
+        assert_eq!(model.default_thinking, "high");
+        assert_eq!(model.provider(), Provider::OpenAi);
+        assert_eq!(model.wire_id(), "gpt-6.1-terra");
+        assert_eq!(
+            model.pricing.identity,
+            PricingIdentity {
+                model: model.id,
+                service_tier: "default",
+                version: "2026-10-26",
+                source: "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+            }
+        );
+        assert_eq!(
+            model.pricing.short_context,
+            Rates {
+                uncached_input_nanos: 1_000,
+                cached_input_nanos: 50,
+                cache_write_nanos: 1_250,
+                cache_write_1h_nanos: 1_250,
+                output_nanos: 5_000,
+            }
+        );
+        assert_eq!(
+            model.pricing.long_context,
+            Rates {
+                uncached_input_nanos: 2_000,
+                cached_input_nanos: 100,
+                cache_write_nanos: 2_500,
+                cache_write_1h_nanos: 2_500,
+                output_nanos: 7_500,
+            }
+        );
+    }
+
+    #[test]
     fn catalogue_identity_order_and_default_are_exact() {
         assert_eq!(
             CATALOGUE.iter().map(|m| m.id).collect::<Vec<_>>(),
             [
                 "openai/gpt-6-astra",
                 "openai/gpt-6.1-sol",
+                "openai/gpt-6.1-terra",
                 "openai/gpt-6-sol",
                 "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
@@ -592,26 +667,23 @@ mod tests {
         );
         assert_eq!(
             CATALOGUE.iter().map(|m| m.id).collect::<HashSet<_>>().len(),
-            12
+            13
         );
-        assert!(std::ptr::eq(DEFAULT_MODEL, &GEMINI_4_ARGON));
+        assert!(std::ptr::eq(DEFAULT_MODEL, &GPT6_1_TERRA));
     }
 
     #[test]
-    fn default_model_for_providers_follows_google_openai_anthropic_priority() {
+    fn default_model_for_providers_follows_openai_google_anthropic_priority() {
         assert_eq!(
             DEFAULT_MODELS.map(|model| model.id),
             [
+                "openai/gpt-6.1-terra",
                 "google/gemini-4-argon",
-                "openai/gpt-6.1-sol",
                 "anthropic/claude-opus-5-5",
             ]
         );
         for providers in [
             &[Provider::Google][..],
-            &[Provider::Google, Provider::OpenAi, Provider::Anthropic],
-            &[Provider::Anthropic, Provider::OpenAi, Provider::Google],
-            &[Provider::OpenAi, Provider::Google],
             &[Provider::Anthropic, Provider::Google],
         ] {
             assert!(
@@ -621,11 +693,14 @@ mod tests {
         }
         for providers in [
             &[Provider::OpenAi][..],
+            &[Provider::Google, Provider::OpenAi, Provider::Anthropic],
+            &[Provider::Anthropic, Provider::OpenAi, Provider::Google],
+            &[Provider::OpenAi, Provider::Google],
             &[Provider::OpenAi, Provider::Anthropic],
             &[Provider::Anthropic, Provider::OpenAi],
         ] {
             assert!(
-                std::ptr::eq(default_model_for_providers(providers), &GPT6_1_SOL),
+                std::ptr::eq(default_model_for_providers(providers), &GPT6_1_TERRA),
                 "{providers:?}"
             );
         }
@@ -635,7 +710,7 @@ mod tests {
         ));
         assert!(std::ptr::eq(
             default_model_for_providers(&[]),
-            &GEMINI_4_ARGON
+            &GPT6_1_TERRA
         ));
     }
 
@@ -649,6 +724,7 @@ mod tests {
             [
                 ("openai/gpt-6-astra", Provider::OpenAi, "gpt-6-astra"),
                 ("openai/gpt-6.1-sol", Provider::OpenAi, "gpt-6.1-sol"),
+                ("openai/gpt-6.1-terra", Provider::OpenAi, "gpt-6.1-terra"),
                 ("openai/gpt-6-sol", Provider::OpenAi, "gpt-6-sol"),
                 ("openai/gpt-6-luna", Provider::OpenAi, "gpt-6-luna"),
                 ("openai/gpt-5.6-sol", Provider::OpenAi, "gpt-5.6-sol"),

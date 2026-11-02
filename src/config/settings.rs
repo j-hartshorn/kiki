@@ -1882,7 +1882,11 @@ mod tests {
     fn new_models_are_selectable_in_settings_and_favourites() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
-        for id in ["openai/gpt-6.1-sol", "anthropic/claude-sonnet-5-5"] {
+        for id in [
+            "openai/gpt-6.1-sol",
+            "openai/gpt-6.1-terra",
+            "anthropic/claude-sonnet-5-5",
+        ] {
             write_settings(
                 project.path(),
                 &format!(
