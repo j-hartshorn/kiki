@@ -38,7 +38,7 @@ use crate::config::constants::{
 };
 use crate::model::{ActiveSkills, SkillActivation, SkillActivationError};
 use crate::skills::{
-    SkillCatalog, SkillLookupError, model_visible_path, valid_name as valid_skill_name,
+    Skill, SkillCatalog, SkillLookupError, model_visible_path, valid_name as valid_skill_name,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -608,7 +608,7 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::Read,
         parameters: READ_PARAMETERS,
         result: ToolResultShape::String,
-        description: "Read one complete UTF-8 workspace file or skill:// resource.",
+        description: "Read one complete UTF-8 workspace file, skill:// resource, or file under a skill root.",
     },
     ToolDefinition {
         name: ToolName::Write,
@@ -626,7 +626,7 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::ListDir,
         parameters: LIST_DIR_PARAMETERS,
         result: ToolResultShape::RecordList(&DIRECTORY_ENTRY),
-        description: "List immediate workspace or skill:// directory entries.",
+        description: "List immediate workspace, skill://, or skill root directory entries.",
     },
     ToolDefinition {
         name: ToolName::Glob,
@@ -2192,7 +2192,7 @@ impl ToolHost {
         let ResolvedResource {
             directory,
             path,
-            skill_name,
+            skill_prefix,
         } = self.resolve_resource_path(target, active_skills)?;
         let limits = self.limits;
         let effect_path = path.clone();
@@ -2212,7 +2212,7 @@ impl ToolHost {
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
-        if skill_name.is_some() {
+        if skill_prefix.is_some() {
             Ok(ToolOutput::without_effect(ToolValue::String(read.contents)))
         } else {
             Ok(ToolOutput {
@@ -2233,9 +2233,9 @@ impl ToolHost {
         let ResolvedResource {
             directory,
             path,
-            skill_name,
+            skill_prefix,
         } = self.resolve_resource_path(list_dir_path(arguments)?, active_skills)?;
-        let prefix = skill_name.map_or_else(String::new, |name| format!("skill://{name}"));
+        let prefix = skill_prefix.unwrap_or_default();
         let limits = self.limits;
         #[cfg(test)]
         let test_gate = self.list_dir_test_gate.clone();
@@ -2261,32 +2261,61 @@ impl ToolHost {
             ResourcePath::Workspace(path) => Ok(ResolvedResource {
                 directory: Arc::clone(&self.workspace),
                 path,
-                skill_name: None,
+                skill_prefix: None,
             }),
             ResourcePath::Skill { name, path } => {
-                let skill = self
-                    .skill_catalog
-                    .lookup_model_invocable(&name)
-                    .or_else(|error| {
-                        self.skill_catalog
-                            .lookup(&name)
-                            .ok()
-                            .filter(|skill| {
-                                active_skills.iter().any(|active| {
-                                    active.name() == name
-                                        && active.canonical_root() == skill.canonical_root()
-                                })
-                            })
-                            .ok_or(error)
-                    })
-                    .map_err(|error| map_skill_lookup_error(&name, error))?;
+                let skill = self.available_skill(&name, active_skills)?;
                 Ok(ResolvedResource {
                     directory: skill.directory(),
                     path,
-                    skill_name: Some(name),
+                    skill_prefix: Some(format!("skill://{name}")),
+                })
+            }
+            ResourcePath::Absolute(path) => {
+                let containing = self
+                    .skill_catalog
+                    .entries()
+                    .filter(|skill| path.starts_with(skill.canonical_root()))
+                    .max_by_key(|skill| skill.canonical_root().components().count())
+                    .ok_or_else(|| {
+                        ToolError::permission(
+                            "absolute paths must be inside an available skill directory",
+                        )
+                    })?;
+                let skill = self.available_skill(containing.name(), active_skills)?;
+                let root = skill.canonical_root();
+                Ok(ResolvedResource {
+                    directory: skill.directory(),
+                    path: path
+                        .strip_prefix(root)
+                        .expect("matched skill root")
+                        .to_owned(),
+                    skill_prefix: Some(root.to_string_lossy().into_owned()),
                 })
             }
         }
+    }
+
+    fn available_skill(
+        &self,
+        name: &str,
+        active_skills: &[SkillActivation],
+    ) -> Result<&Skill, ToolError> {
+        self.skill_catalog
+            .lookup_model_invocable(name)
+            .or_else(|error| {
+                self.skill_catalog
+                    .lookup(name)
+                    .ok()
+                    .filter(|skill| {
+                        active_skills.iter().any(|active| {
+                            active.name() == name
+                                && active.canonical_root() == skill.canonical_root()
+                        })
+                    })
+                    .ok_or(error)
+            })
+            .map_err(|error| map_skill_lookup_error(name, error))
     }
 
     async fn glob(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
@@ -2500,15 +2529,19 @@ fn map_skill_lookup_error(name: &str, error: SkillLookupError) -> ToolError {
 enum ResourcePath {
     Workspace(PathBuf),
     Skill { name: String, path: PathBuf },
+    Absolute(PathBuf),
 }
 
 struct ResolvedResource {
     directory: Arc<Dir>,
     path: PathBuf,
-    skill_name: Option<String>,
+    skill_prefix: Option<String>,
 }
 
 fn parse_resource_path(path: &str) -> Result<ResourcePath, ToolError> {
+    if Path::new(path).is_absolute() {
+        return normalise_absolute_path(path).map(ResourcePath::Absolute);
+    }
     let Some(locator) = path.strip_prefix("skill://") else {
         return normalise_path(path).map(ResourcePath::Workspace);
     };
@@ -2623,6 +2656,25 @@ fn normalise_path(path: &str) -> Result<PathBuf, ToolError> {
             }
             Component::Prefix(_) | Component::RootDir => {
                 return Err(ToolError::permission("workspace paths must be relative"));
+            }
+        }
+    }
+    Ok(normalised)
+}
+
+fn normalise_absolute_path(path: &str) -> Result<PathBuf, ToolError> {
+    let mut normalised = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::RootDir | Component::Normal(_) => normalised.push(component),
+            Component::ParentDir => {
+                if !normalised.pop() {
+                    return Err(ToolError::permission("path escapes the filesystem root"));
+                }
+            }
+            Component::Prefix(_) => {
+                return Err(ToolError::permission("path prefixes are not supported"));
             }
         }
     }
@@ -4268,6 +4320,93 @@ mod tests {
                 .unwrap(),
             "old directory"
         );
+    }
+
+    #[tokio::test]
+    async fn absolute_skill_paths_read_and_list_through_catalogued_directory() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let skills = home.path().join(".agents/skills");
+        let review = write_skill(&skills, "review", "description: Review\n", "Body\n");
+        fs::create_dir(review.join("references")).unwrap();
+        fs::write(review.join("references/note.md"), "review note").unwrap();
+        let explore = write_skill(&skills, "explore", "description: Explore\n", "Body\n");
+        fs::write(explore.join("brief.md"), "explore brief").unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let root = catalog
+            .lookup("review")
+            .unwrap()
+            .canonical_root()
+            .to_owned();
+        let root = root.to_str().unwrap();
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+
+        assert_eq!(
+            read(&host, &format!("{root}/references/note.md"))
+                .await
+                .unwrap(),
+            "review note"
+        );
+        assert_eq!(
+            read(
+                &host,
+                &format!("{root}/./references/../../explore/brief.md")
+            )
+            .await
+            .unwrap(),
+            "explore brief"
+        );
+        assert_eq!(
+            list_dir_path(&host, &format!("{root}/references"))
+                .await
+                .unwrap(),
+            [directory_entry(
+                &format!("{root}/references/note.md"),
+                "file",
+                Some(11)
+            )]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absolute_paths_outside_catalogued_skills_are_denied() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret"), "outside").unwrap();
+        let skills = home.path().join(".agents/skills");
+        let review = write_skill(&skills, "review", "description: Review\n", "Body\n");
+        std::os::unix::fs::symlink(outside.path().join("secret"), review.join("link")).unwrap();
+        fs::create_dir(skills.join("not-a-skill")).unwrap();
+        fs::write(skills.join("not-a-skill/file"), "uncatalogued").unwrap();
+        fs::write(workspace.path().join("file"), "workspace").unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let root = catalog
+            .lookup("review")
+            .unwrap()
+            .canonical_root()
+            .to_owned();
+        let root = root.to_str().unwrap();
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        let workspace_file = fs::canonicalize(workspace.path()).unwrap().join("file");
+
+        for path in [
+            format!("{root}/../not-a-skill/file"),
+            format!("{root}/link"),
+            format!("{root}x/SKILL.md"),
+            outside.path().join("secret").to_str().unwrap().to_owned(),
+            workspace_file.to_str().unwrap().to_owned(),
+            "/../../etc/passwd".to_owned(),
+        ] {
+            assert_eq!(
+                read_error(&host, &path).await,
+                ToolErrorKind::Permission,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7903,7 +8042,7 @@ mod tests {
                     "    stdout: str\n",
                     "    stderr: str\n\n",
                     "async def read(path: str) -> str:\n",
-                    "    \"\"\"Read one complete UTF-8 workspace file or skill:// resource.\"\"\"\n",
+                    "    \"\"\"Read one complete UTF-8 workspace file, skill:// resource, or file under a skill root.\"\"\"\n",
                     "    return await _kiki_read(path)\n\n",
                     "async def write(path: str, content: str) -> None:\n",
                     "    \"\"\"Create or replace one complete UTF-8 workspace file. Replacing an existing file requires reading its current contents first.\"\"\"\n",
@@ -7912,7 +8051,7 @@ mod tests {
                     "    \"\"\"Replace text that occurs exactly once in a UTF-8 workspace file.\"\"\"\n",
                     "    await _kiki_edit(path, old, new)\n\n",
                     "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
-                    "    \"\"\"List immediate workspace or skill:// directory entries.\"\"\"\n",
+                    "    \"\"\"List immediate workspace, skill://, or skill root directory entries.\"\"\"\n",
                     "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
                     "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:\n",
                     "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",

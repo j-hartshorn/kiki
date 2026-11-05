@@ -3462,6 +3462,15 @@ mod tests {
             "note = await read('skill://review/references/note.md')\nnote == 'live note' and (await list_dir('skill://review/references'))[0].path == 'skill://review/references/note.md'",
         ).await.unwrap();
         assert_eq!(complete(&execution).unwrap().head, "True");
+        let absolute = fs::canonicalize(&references).unwrap().join("note.md");
+        let execution = execute_without_cancellation(
+            &mut child,
+            &format!("(await read({absolute:?})) == 'live note'"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert!(execution.read_paths.is_empty());
         assert!(execution.read_paths.is_empty());
         assert_eq!(child.checkpoint().authorisations, initial_authorisations);
     }
