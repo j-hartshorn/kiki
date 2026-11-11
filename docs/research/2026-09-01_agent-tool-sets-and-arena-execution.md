@@ -144,7 +144,7 @@ The current Kiki tree passes its credential-free all-target suite when invoked w
 env -u OPENAI_API_KEY MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty cargo test --all-targets -- --test-threads=1
 ```
 
-Result: 357 passed, 0 failed, 1 ignored. The required worker setup is documented in [`README.md:10`](../../README.md#L10) and [`README.md:85`](../../README.md#L85). The passing suite verifies existing single-read async behaviour; the current driver path itself shows that gathered multi-read suspension is not accepted ([`arena.rs:797`](../../src/arena.rs#L797), [`arena.rs:889`](../../src/arena.rs#L889)).
+Result: 357 passed, 0 failed, 1 ignored. The required worker setup is documented in the [setup guide](../usage.md#setup) and [verification instructions](../usage.md#deterministic-verification). The passing suite verifies existing single-read async behaviour; the current driver path itself shows that gathered multi-read suspension is not accepted ([`arena.rs:797`](../../src/arena.rs#L797), [`arena.rs:889`](../../src/arena.rs#L889)).
 
 ## Key references
 

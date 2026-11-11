@@ -61,7 +61,7 @@ Kiki's tree derives from a fixed, dark-oriented palette:
 
 The palette and tree style are defined in [`src/transcript.rs`](../../src/transcript.rs#L366-L382) and [`src/tui/tree.rs`](../../src/tui/tree.rs#L200-L259). The entire row receives one base style, so role names, connectors, tool counts, success, and failure do not have independent colours. The selection modifier is applied later by the generic picker ([source](../../src/tui/picker.rs#L249-L260)).
 
-Kiki has no theme setting or theme resource format. Its user and project configuration covers [model and thinking](../../README.md#model-and-thinking-settings) and [subagents](../../README.md#subagents).
+Kiki has no theme setting or theme resource format. Its user and project configuration covers [model and thinking](../usage.md#model-and-thinking-settings) and [subagents](../usage.md#subagents).
 
 #### Pi
 
@@ -125,7 +125,7 @@ The restored state differs materially:
 
 Kiki rejects tree catalogue requests and navigation while foreground or background operations remain active and reports the rejection as a status notice ([runtime](../../src/runtime.rs#L1045-L1095), [TUI](../../src/tui.rs#L1436-L1474)). Pi's tree flow can stop an active response when the user commits to navigation, although double Escape itself first aborts streaming rather than opening the tree ([source](../../../../../../../opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js#L2253-L2284, ../../../../../../../opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js#L4403-L4407)).
 
-Kiki additionally treats an Escape within two seconds of request submission as correction intent: it cancels first, then restores the request's parent if all foreground and background work settles ([source](../../src/tui.rs#L500-L518), [README](../../README.md#session-tree-navigation)). Pi aborts active work and retains the aborted path for later tree navigation; it has no matching automatic correction gesture in its documented tree workflow ([usage](../../../../../../../opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/docs/usage.md#message-queue)).
+Kiki additionally treats an Escape within two seconds of request submission as correction intent: it cancels first, then restores the request's parent if all foreground and background work settles ([source](../../src/tui.rs#L500-L518), [user guide](../usage.md#session-tree-navigation)). Pi aborts active work and retains the aborted path for later tree navigation; it has no matching automatic correction gesture in its documented tree workflow ([usage](../../../../../../../opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/docs/usage.md#message-queue)).
 
 ### Adjacent user-facing functionality
 
