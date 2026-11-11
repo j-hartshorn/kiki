@@ -92,7 +92,7 @@ The numeric defaults match. Kiki layers positive TOML `reserve_tokens` and `keep
 
 Pi exposes `session_before_compact`, success, and failure extension events. A hook may cancel compaction or provide an entirely custom summary, usage record, retained boundary, and details; extensions can also trigger compaction programmatically (`dist/core/agent-session.js:1496`; `examples/extensions/custom-compaction.ts`; `examples/extensions/trigger-compact.ts`). Kiki Phase 2 has no equivalent extension seam.
 
-Pi 0.85.1 uses the same machinery for manual, threshold, and overflow compaction. Kiki Phase 2 exposes manual compaction only: there are no threshold checks, overflow compact-and-retry, or `enabled` behaviour. The `AutomaticThreshold` and `ContextOverflow` reason values exist in the durable vocabulary for later phases but are not production triggers in Phase 2 ([`src/transcript.rs:3659`](../../src/transcript.rs#L3659), [`README.md:58`](../../README.md#L58)).
+Pi 0.85.1 uses the same machinery for manual, threshold, and overflow compaction. Kiki Phase 2 exposes manual compaction only: there are no threshold checks, overflow compact-and-retry, or `enabled` behaviour. The `AutomaticThreshold` and `ContextOverflow` reason values exist in the durable vocabulary for later phases but are not production triggers in Phase 2 ([`src/transcript.rs:3659`](../../src/transcript.rs#L3659), [user guide](../usage.md#context-compaction)).
 
 ## Key references
 
